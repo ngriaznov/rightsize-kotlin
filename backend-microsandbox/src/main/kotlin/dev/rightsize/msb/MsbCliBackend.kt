@@ -54,7 +54,11 @@ class MsbCliBackend(internal val msb: Path) : SandboxBackend {
         awaitRunning(handle, proc, tail)               // readiness = name Running in `msb ls`
     }
 
-    /** Spawns `msb run`, draining its combined output to a tail kept for diagnostics. */
+    /**
+     * Spawns `msb run`, draining its combined output to a tail kept for diagnostics only —
+     * msb's own boot output (registry/pull errors, a crash before the sandbox exists), never
+     * the workload's. [logs] never reads from this tail; it always shells out to `msb logs`.
+     */
     private fun spawnAttachedRun(handle: Handle): Pair<Process, ConcurrentLinkedDeque<String>> {
         val proc = ProcessBuilder(listOf(msb.toString()) + MsbCommands.run(handle.spec))
             .redirectErrorStream(true).start()
@@ -119,6 +123,15 @@ class MsbCliBackend(internal val msb: Path) : SandboxBackend {
     override fun exec(handle: SandboxHandle, cmd: List<String>): ExecResult =
         invoke(MsbCommands.exec(handle.id, cmd), timeoutSec = EXEC_TIMEOUT_SEC)
 
+    /**
+     * A fresh `msb logs <name> --tail 1000` invocation, same on every platform. This is the
+     * workload's own output, as distinct from the attached `msb run` child's pipe (drained in
+     * [spawnAttachedRun] into a tail kept only for pre-Running crash diagnostics): on Windows the
+     * attached process does not relay guest stdout at all, while `msb logs` does everywhere, so
+     * this is the only channel this method can source from. Never throws on a missing/removed
+     * sandbox — [invoke] only enforces the timeout, not the exit code, so a failing `msb logs`
+     * call yields whatever (possibly empty) stdout it produced rather than an exception.
+     */
     override fun logs(handle: SandboxHandle): String =
         invoke(MsbCommands.logs(handle.id), LOGS_TIMEOUT_SEC).stdout
 
