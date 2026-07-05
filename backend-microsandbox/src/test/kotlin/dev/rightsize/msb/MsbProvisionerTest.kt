@@ -32,7 +32,7 @@ class MsbProvisionerTest {
         val msb = MsbProvisioner.ensureInstalled(baseUrl, cache, emptyMap())
         assertTrue(Files.isExecutable(msb))
         assertEquals("bin", msb.parent.fileName.toString())
-        assertTrue(Files.exists(msb.parent.parent.resolve("lib").resolve(Platform.current()!!.krunAsset)))
+        assertTrue(Files.exists(msb.parent.parent.resolve("lib").resolve(Platform.current()!!.krunInstallName)))
         // second call: no re-download (server can be stopped)
         http.stop(0)
         assertEquals(msb, MsbProvisioner.ensureInstalled(baseUrl, cache, emptyMap()))
@@ -59,7 +59,7 @@ class MsbProvisionerTest {
         val staleMsb = binDir.resolve("msb")
         Files.write(staleMsb, "#!/bin/sh\necho stale".toByteArray())
         staleMsb.toFile().setExecutable(true)
-        val krun = installDir.resolve("lib").resolve(p.krunAsset)
+        val krun = installDir.resolve("lib").resolve(p.krunInstallName)
         assertTrue(Files.isExecutable(staleMsb))
         assertFalse(Files.exists(krun))
 
