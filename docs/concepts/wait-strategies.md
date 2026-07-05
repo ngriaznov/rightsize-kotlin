@@ -43,7 +43,7 @@ don't need to `.*`-wrap your pattern on both ends, though the shipped modules do
 anyway for clarity.
 
 ```kotlin
-GenericContainer("docker.redpanda.com/redpandadata/redpanda:v24.2.4")
+GenericContainer("redpandadata/redpanda:v24.2.4")
     .waitingFor(Wait.forLogMessage(".*Successfully started Redpanda.*"))
 ```
 

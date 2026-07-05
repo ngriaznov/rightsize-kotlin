@@ -7,7 +7,7 @@
 
 | | |
 |---|---|
-| Default image | `docker.redpanda.com/redpandadata/redpanda:v24.2.4` |
+| Default image | `redpandadata/redpanda:v24.2.4` |
 | Exposed ports | `9092` (Kafka API), `9093` (internal listener), `8081` (schema registry) |
 | Wait strategy | `Wait.forLogMessage(".*Successfully started Redpanda.*")` |
 
@@ -100,8 +100,9 @@ for a broker with the same "advertises its own address" behavior, `customizeSpec
 the extension point to reach for; see the class's own KDoc
 (`RedpandaContainer.customizeSpec`) for the exact command line it constructs.
 
-Registry availability is worth knowing about separately: `docker.redpanda.com` is a
-Docker Hub proxy that rate-limits anonymous pulls, and it's been observed to block CI
-runs. If you hit persistent pull failures, seed the image into your local `msb` cache
+Registry availability is worth knowing about separately: the module pulls from
+Docker Hub (`redpandadata/redpanda`) — Redpanda's own `docker.redpanda.com` proxy
+serves identical images but rate-limits anonymous pulls aggressively enough to block
+CI runs. If you hit persistent pull failures, seed the image into your local `msb` cache
 ahead of time (`docker save <img> -o /tmp/img.tar && msb load -i /tmp/img.tar -t <img>`) rather than retrying the pull
 indefinitely.

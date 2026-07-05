@@ -101,7 +101,7 @@ pressure, and 4096 MB was the number that actually left headroom.
 **Symptom:** Pulling a particular image (Redpanda's in particular) is slow, gets
 rate-limited, or fails in CI specifically.
 
-**Cause:** Some registries (`docker.redpanda.com` is a Docker Hub proxy) rate-limit
+**Cause:** Registries rate-limit
 anonymous pulls. Separately, microsandbox pulls **single-arch** image layers (matching
 your host architecture) rather than a multi-arch manifest — this is generally a
 *benefit* (smaller pulls; an ArangoDB pull was measured at ~203 MB single-arch vs. an

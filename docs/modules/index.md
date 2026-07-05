@@ -20,7 +20,7 @@ testImplementation("dev.rightsize:modules")
 | [`PostgreSQLContainer`](postgresql.md) | `postgres:18-alpine` | `jdbcUrl`, `username`, `password`, `databaseName`, `withUsername/withPassword/withDatabase(...)` |
 | [`MySQLContainer`](mysql.md) | `mysql:8.4` | `jdbcUrl`, `username`, `password`, `databaseName`, `withUsername/withPassword/withDatabase(...)` |
 | [`MariaDBContainer`](mariadb.md) | `mariadb:11.4` | `jdbcUrl`, `username`, `password`, `databaseName`, `withUsername/withPassword/withDatabase(...)` |
-| [`RedpandaContainer`](redpanda.md) | `docker.redpanda.com/redpandadata/redpanda:v24.2.4` | `bootstrapServers`, `schemaRegistryUrl` |
+| [`RedpandaContainer`](redpanda.md) | `redpandadata/redpanda:v24.2.4` | `bootstrapServers`, `schemaRegistryUrl` |
 | [`KafkaContainer`](kafka.md) | `apache/kafka:4.0.0` | `bootstrapServers` (KRaft single node) |
 | [`RabbitMQContainer`](rabbitmq.md) | `rabbitmq:4-management-alpine` | `amqpUrl`, `managementUrl`, `username`, `password`, `withUsername/withPassword(...)` |
 | [`ClickHouseContainer`](clickhouse.md) | `clickhouse/clickhouse-server:25.8` | `httpUrl`, `username`, `password`, `databaseName`, `withUsername/withPassword/withDatabase(...)` |

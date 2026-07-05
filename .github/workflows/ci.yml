@@ -65,9 +65,8 @@ jobs:
       - uses: actions/setup-java@v4
         with: { distribution: temurin, java-version: '17' }
       - uses: gradle/actions/setup-gradle@v4
-      # Image cache: GitHub-hosted runners are exempt from Docker Hub rate limits, but
-      # docker.redpanda.com is NOT covered, and warm loads beat re-pulls anyway.
-      # Cache key = hash of the pinned image list file.
+      # Image cache: warm loads beat re-pulls and keep registry rate limits out
+      # of the picture entirely. Cache key = hash of the pinned image list file.
       - name: Restore docker image cache
         id: docker-image-cache
         uses: actions/cache@v4
