@@ -47,8 +47,14 @@ RIGHTSIZE_BACKEND=docker ./gradlew integrationTest
 Both backends satisfy the same behavioral contract (see the shared contract test
 suites in `backend-docker` and `backend-microsandbox`), so a change that affects
 observable behavior should be exercised on **both** before you open a PR — CI runs
-the full matrix (unit, `msb-linux`, `msb-macos`, `docker-fallback`; see
+the full matrix (unit, `msb-linux`, `docker-fallback`; see
 `.github/workflows/ci.yml`), but a local run catches problems faster.
+
+> **macOS in CI:** there is no `msb-macos` job — GitHub's hosted Apple Silicon
+> runners are themselves VMs without nested virtualization, so microVMs cannot
+> boot there (Hypervisor.framework rejects VM creation). macOS support is
+> verified on real Apple Silicon hardware before release.
+
 
 Useful env vars while developing (full reference in
 [Configuration](README.md#configuration)):
