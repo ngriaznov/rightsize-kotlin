@@ -54,6 +54,32 @@ jobs:
           path: ~/.microsandbox/cache
           key: msb-images-${{ runner.os }}-${{ github.run_id }}
 
+  msb-windows:
+    runs-on: windows-2025   # WHP is pre-enabled on this image (confirmed on windows-2022 and
+                            # windows-2025 in the windows-spike branch's spike workflow) — no
+                            # enablement step needed, unlike msb-linux's KVM udev rule.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '17' }
+      - uses: gradle/actions/setup-gradle@v4
+      - uses: actions/cache/restore@v4
+        with:
+          path: ~/.microsandbox/cache
+          key: msb-images-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: msb-images-${{ runner.os }}-
+      # --max-workers=1 serializes the per-module integrationTest tasks (the repo sets
+      # org.gradle.parallel=true, which otherwise runs them concurrently): msb on Windows
+      # has a database-migration race under concurrent sandbox creation, so sandboxes
+      # must be created one at a time on this runner.
+      - shell: bash
+        run: RIGHTSIZE_BACKEND=microsandbox ./gradlew integrationTest --max-workers=1
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: ~/.microsandbox/cache
+          key: msb-images-${{ runner.os }}-${{ github.run_id }}
+
   # No msb-macos job: GitHub's hosted Apple Silicon runners are themselves VMs
   # without nested virtualization, so Hypervisor.framework VM creation fails
   # (msb: build_microvm VmSetup(VmCreate)). macOS support is verified on real

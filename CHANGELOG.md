@@ -68,10 +68,14 @@ but no `0.1.0` tag has been cut.
 - **BOM** (`bom`): a `java-platform` module aligning versions across the four
   published artifacts.
 - **Automatic backend selection**: `RIGHTSIZE_BACKEND` env var to force a
-  backend; otherwise microsandbox on macOS Apple Silicon or Linux with
-  `/dev/kvm`, falling back to Docker.
+  backend; otherwise microsandbox on macOS Apple Silicon, Linux with
+  `/dev/kvm`, or Windows with Windows Hypervisor Platform, falling back to
+  Docker.
 - **CI**: a GitHub Actions matrix covering the unit suite plus integration tests
-  on Linux (KVM), macOS (Apple Silicon), and a Docker-only fallback job.
+  on Linux (KVM) and Windows (`windows-2025`, WHP), and a Docker-only fallback
+  job; macOS (Apple Silicon) has no hosted-runner lane (GitHub's Apple Silicon
+  runners don't support nested virtualization) and is verified on real
+  hardware instead.
 - **JaCoCo coverage floor** on `core` (80% line / 70% branch), gating `check`.
 - Packaging/OSS groundwork: Apache-2.0 `LICENSE` + `NOTICE`, Maven publishing POM
   metadata, `.editorconfig`, `.github/CONTRIBUTING.md`, `.github/RELEASING.md`.
@@ -90,5 +94,25 @@ but no `0.1.0` tag has been cut.
   behaviors the msb backend compensates for were re-verified as still present:
   detached `msb run` still never starts the image ENTRYPOINT, and `msb logs -f`
   still never exits after its sandbox stops.
+- **Native Windows support for the microsandbox backend** (x86_64/arm64), gated
+  on Windows Hypervisor Platform: two new `Platform` rows carrying the
+  `msb-windows-*.exe`/`libkrunfw-windows-*.dll` release assets; the provisioner
+  installs a platform-derived binary name (`msb.exe` on Windows, suffixless
+  `msb` elsewhere) and gates install-completeness on a plain file-exists check
+  on Windows rather than the POSIX executable bit; the default cache root on
+  Windows is `%LOCALAPPDATA%\rightsize` (`RIGHTSIZE_CACHE_DIR` still overrides
+  it everywhere). `MsbBackendProvider` attempts microsandbox on any detected
+  Windows platform and surfaces a WHP-specific `unsupportedReason` (pointing at
+  `msb doctor --fix`) if boot fails, rather than probing before the fact — CI
+  (`msb-windows`, `windows-2025`) confirms this is safe because GitHub's hosted
+  Windows runners ship with WHP already enabled. Attached-mode `msb run` on
+  Windows does not relay the guest's stdout to the parent process (confirmed
+  empirically); the backend already sources workload logs from `msb logs`
+  exclusively, which was the only channel that ever worked correctly for that
+  purpose on Windows. Process teardown documented, not changed: the JVM has no
+  POSIX signals on Windows, so `destroy()`/`destroyForcibly()` both resolve to
+  `TerminateProcess`, which is safe here because the actual graceful shutdown
+  is the `msb stop`/`msb rm` invocation that already precedes killing the
+  attached child on every platform.
 
 [Unreleased]: https://github.com/ngriaznov/rightsize-kotlin/commits/main

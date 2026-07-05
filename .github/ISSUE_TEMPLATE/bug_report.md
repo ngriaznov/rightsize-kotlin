@@ -7,7 +7,7 @@ labels: bug
 
 **Backend** (Docker / microsandbox / both):
 
-**Platform** (OS, arch, and for microsandbox: KVM availability or Apple Silicon):
+**Platform** (OS, arch, and for microsandbox: KVM availability, Apple Silicon, or Windows Hypervisor Platform status):
 
 **rightsize version / commit:**
 

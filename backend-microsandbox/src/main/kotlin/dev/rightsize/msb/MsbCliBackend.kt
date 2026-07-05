@@ -36,6 +36,7 @@ class MsbCliBackend(internal val msb: Path) : SandboxBackend {
     }
 
     private val startedNames = ConcurrentHashMap.newKeySet<String>()
+    private val windowsHost = Platform.current()?.isWindows == true
     init { Runtime.getRuntime().addShutdownHook(Thread { startedNames.forEach { silently(it) } }) }
 
     override fun create(spec: ContainerSpec): SandboxHandle = Handle(spec)
@@ -148,8 +149,15 @@ class MsbCliBackend(internal val msb: Path) : SandboxBackend {
      * 3. An explicit [AutoCloseable.close] never triggers the replay: closing means the caller
      *    asked delivery to stop, so nothing the live stream hadn't already produced is delivered
      *    retroactively (the "no delivery after close" contract).
+     *
+     * On Windows hosts this routes to [followLogsByPolling] instead: `msb logs -f` there keeps
+     * running but never relays new log lines to its stdout pipe while the sandbox is Running
+     * (confirmed empirically against the real binary — the same lines are retrievable through
+     * non-follow `msb logs` the whole time), so a pipe-reading follow child can never deliver a
+     * live line on Windows.
      */
     override fun followLogs(handle: SandboxHandle, consumer: (String) -> Unit): AutoCloseable {
+        if (windowsHost) return followLogsByPolling(handle, consumer)
         val proc = ProcessBuilder(listOf(msb.toString()) + MsbCommands.followLogs(handle.id))
             .redirectErrorStream(true).start()
         runCatching { proc.outputStream.close() }
@@ -191,6 +199,43 @@ class MsbCliBackend(internal val msb: Path) : SandboxBackend {
             // sandbox had already stopped before close() was called, the watchdog's own flush
             // already ran (destroying `proc` and joining `t` itself) and flushTailOnce() is a
             // no-op here.
+        }
+    }
+
+    /**
+     * Windows follow-logs path: no follow process at all. A single worker thread polls the
+     * non-follow `msb logs` fetch and delivers each fetch's not-yet-delivered lines, tracked by
+     * a monotonic per-worker `delivered` index — the same index-based diffing the POSIX
+     * watchdog's one-shot replay uses, made continuous. Delivery contract is identical to the
+     * POSIX path: in order, each line at most once, nothing after [AutoCloseable.close].
+     *
+     * The last line of a fetch is held back while the sandbox is Running: the log may have been
+     * read mid-write, and delivering a partial line would split one workload line into two
+     * deliveries (the next fetch's index-based diff would then skip its complete form). Once the
+     * sandbox leaves Running, a final fetch delivers everything outstanding — including a
+     * trailing unterminated line, exactly as the POSIX watchdog's replay does.
+     */
+    private fun followLogsByPolling(handle: SandboxHandle, consumer: (String) -> Unit): AutoCloseable {
+        val closeRequested = AtomicBoolean(false)
+        val worker = Thread {
+            var delivered = 0
+            while (!closeRequested.get()) {
+                val running = handle.id in runningSandboxNames()
+                val full = invoke(MsbCommands.logs(handle.id), LOGS_TIMEOUT_SEC).stdout
+                val lines = full.lines().let { if (full.endsWith("\n")) it.dropLast(1) else it }
+                val deliverable = if (running) maxOf(delivered, lines.size - 1) else lines.size
+                for (i in delivered until deliverable) {
+                    if (closeRequested.get()) return@Thread
+                    consumer(lines[i])
+                }
+                delivered = maxOf(delivered, deliverable)
+                if (!running) break
+                Thread.sleep(READINESS_POLL_MS)
+            }
+        }.apply { isDaemon = true; start() }
+        return AutoCloseable {
+            closeRequested.set(true)
+            worker.join(READER_JOIN_TIMEOUT_MS)
         }
     }
 

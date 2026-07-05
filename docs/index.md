@@ -39,9 +39,10 @@ hardware isolation and nothing to install."
 
 The full comparison table, benchmark methodology, and platform matrix live in the
 [project README](https://github.com/ngriaznov/rightsize-kotlin#why) — this site doesn't
-repeat them. In one line: Apple Silicon macs and Linux-with-KVM get microVMs;
-everything else falls back to Docker automatically, and tests run unchanged on either
-backend. Backend-specific edges are covered in [Backends](backends.md#backend-differences).
+repeat them. In one line: Apple Silicon macs, Linux-with-KVM, and Windows-with-WHP get
+microVMs; everything else falls back to Docker automatically, and tests run unchanged
+on either backend. Backend-specific edges are covered in
+[Backends](backends.md#backend-differences).
 
 ## Where to go next
 

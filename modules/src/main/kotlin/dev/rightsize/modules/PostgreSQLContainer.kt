@@ -2,6 +2,7 @@ package dev.rightsize.modules
 
 import dev.rightsize.GenericContainer
 import dev.rightsize.core.wait.Wait
+import java.time.Duration
 
 /**
  * A single-node PostgreSQL container. Defaults to a `test`/`test`/`test` user/password/database
@@ -31,7 +32,10 @@ class PostgreSQLContainer(image: String = "postgres:18-alpine") : GenericContain
         // connections" BOTH times. Waiting for the first occurrence races that restart: a client
         // can connect to the init-time server just before it's torn down. times=2 waits for the
         // second, durable listen.
-        waitingFor(Wait.forLogMessage(".*database system is ready to accept connections.*", 2))
+        // 120s: the init-boot-then-real-boot sequence can exceed the default 60s on shared
+        // CI runners.
+        waitingFor(Wait.forLogMessage(".*database system is ready to accept connections.*", 2)
+            .withStartupTimeout(Duration.ofSeconds(120)))
     }
 
     /** Overrides `POSTGRES_USER` (default `test`). */

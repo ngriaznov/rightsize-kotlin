@@ -12,12 +12,15 @@ test, and submit changes.
   every module, so Gradle will provision it if you don't have a matching JDK).
 - Git.
 - To run integration tests against a real backend, at least one of:
-  - **microsandbox**: macOS on Apple Silicon, or Linux (x86_64/arm64) with a readable
-    `/dev/kvm`. rightsize self-provisions the `msb` binary on first use — no manual
-    install required. See [Backends](README.md#backends) for the full compatibility
-    matrix, including Intel Mac and Windows caveats.
+  - **microsandbox**: macOS on Apple Silicon, Linux (x86_64/arm64) with a readable
+    `/dev/kvm`, or Windows (x86_64/arm64) with Windows Hypervisor Platform enabled
+    (upstream beta). rightsize self-provisions the `msb` binary on first use — no
+    manual install required. See [Backends](README.md#backends) for the full
+    compatibility matrix, including Intel Mac and WHP-less-Windows caveats.
   - **Docker**: any Docker-compatible daemon reachable at the default socket, or via
-    `DOCKER_HOST` / the active `docker` CLI context.
+    `DOCKER_HOST` / the active `docker` CLI context. On Windows this means a
+    unix-socket-reachable daemon (e.g. Docker Engine inside WSL) — the backend's
+    transport does not speak Windows named pipes.
 
 ## Building
 
@@ -37,7 +40,7 @@ Tests that need a real backend are tagged `sandbox-it` and excluded from the pla
 with `RIGHTSIZE_BACKEND`:
 
 ```bash
-# microsandbox backend (needs Apple Silicon or Linux + /dev/kvm)
+# microsandbox backend (needs Apple Silicon, Linux + /dev/kvm, or Windows + WHP)
 RIGHTSIZE_BACKEND=microsandbox ./gradlew integrationTest
 
 # Docker backend (needs a reachable Docker daemon)
@@ -47,7 +50,7 @@ RIGHTSIZE_BACKEND=docker ./gradlew integrationTest
 Both backends satisfy the same behavioral contract (see the shared contract test
 suites in `backend-docker` and `backend-microsandbox`), so a change that affects
 observable behavior should be exercised on **both** before you open a PR — CI runs
-the full matrix (unit, `msb-linux`, `docker-fallback`; see
+the full matrix (unit, `msb-linux`, `msb-windows`, `docker-fallback`; see
 `.github/workflows/ci.yml`), but a local run catches problems faster.
 
 > **macOS in CI:** there is no `msb-macos` job — GitHub's hosted Apple Silicon
@@ -63,7 +66,7 @@ Useful env vars while developing (full reference in
 | --- | --- |
 | `RIGHTSIZE_BACKEND` | Force `microsandbox` or `docker`. Required for `integrationTest`. |
 | `MSB_PATH` | Point at an already-installed `msb` binary, skipping auto-provisioning. |
-| `RIGHTSIZE_CACHE_DIR` | Relocate the provisioned-runtime cache (default `~/.cache/rightsize`). |
+| `RIGHTSIZE_CACHE_DIR` | Relocate the provisioned-runtime cache (default `~/.cache/rightsize`; `%LOCALAPPDATA%\rightsize` on Windows). |
 | `DOCKER_HOST` | Non-default Docker socket (Colima, OrbStack, remote daemon, etc.). |
 
 ### The `sandbox-it` tag convention

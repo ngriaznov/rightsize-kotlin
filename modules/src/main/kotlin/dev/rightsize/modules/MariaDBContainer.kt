@@ -2,6 +2,7 @@ package dev.rightsize.modules
 
 import dev.rightsize.GenericContainer
 import dev.rightsize.core.wait.Wait
+import java.time.Duration
 
 /**
  * A single-node MariaDB container. Defaults to a `test`/`test`/`test` user/password/database trio
@@ -53,7 +54,10 @@ class MariaDBContainer(image: String = "mariadb:11.4") : GenericContainer<MariaD
         withEnv("MARIADB_DATABASE", databaseState)
         withEnv("MARIADB_ROOT_PASSWORD", "test")
         // Anchored on the real server's line (see the class doc for the captured log excerpt).
-        waitingFor(Wait.forLogMessage(".*port: 3306.*mariadb\\.org binary distribution.*", 1))
+        // 120s: same double-boot entrypoint as MySQL (init pass, temporary server, real
+        // server), which can exceed the default 60s on shared CI runners.
+        waitingFor(Wait.forLogMessage(".*port: 3306.*mariadb\\.org binary distribution.*", 1)
+            .withStartupTimeout(Duration.ofSeconds(120)))
         // No withMemoryLimit override: same InnoDB-footprint precedent as MySQL 8.4 — booted
         // clean on msb's default ~450M microVM RAM (observed ~14.8s IT round-trip on msb; no
         // memory-ladder escalation was needed).

@@ -130,9 +130,10 @@ provisioning the `msb` microsandbox runtime:
    releases, matched to your OS/architecture.
 2. Every downloaded asset is verified against its SHA-256 checksum from the release
    manifest before use.
-3. Both files are installed atomically under `~/.cache/rightsize/` — the `msb` binary
-   is moved into place *last*, so a crashed install can never look complete; a later
-   run detects and repairs it rather than trusting a half-written cache.
+3. Both files are installed atomically under `~/.cache/rightsize/` (`%LOCALAPPDATA%\rightsize`
+   on Windows) — the `msb` binary is moved into place *last*, so a crashed install can
+   never look complete; a later run detects and repairs it rather than trusting a
+   half-written cache.
 4. A cross-process file lock keeps parallel Gradle test workers from racing each
    other during this download.
 
@@ -140,10 +141,11 @@ None of this needs root, a running daemon, or any manual step — it's a normal 
 the first `./gradlew test` run, the same way Gradle itself downloads its wrapper. On
 subsequent runs the cache is already populated and this step is skipped entirely.
 
-If you're on a platform where microsandbox doesn't apply (Intel Mac, Windows, Linux
-without KVM), rightsize instead resolves to the Docker backend and talks to your local
-Docker daemon over its usual socket — no separate provisioning step, but you do need a
-working `docker` install.
+If you're on a platform where microsandbox doesn't apply (Intel Mac, Windows without
+Windows Hypervisor Platform, Linux without KVM), rightsize instead resolves to the
+Docker backend and talks to your local Docker daemon over its usual socket — no
+separate provisioning step, but you do need a working `docker` install (on Windows,
+one reachable via a unix socket, e.g. Docker Engine inside WSL).
 
 ### Air-gapped or pre-seeded environments
 

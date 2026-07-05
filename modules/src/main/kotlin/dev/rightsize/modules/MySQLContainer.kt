@@ -2,6 +2,7 @@ package dev.rightsize.modules
 
 import dev.rightsize.GenericContainer
 import dev.rightsize.core.wait.Wait
+import java.time.Duration
 
 /**
  * A single-node MySQL container. Defaults to a `test`/`test`/`test` user/password/database trio
@@ -49,7 +50,11 @@ class MySQLContainer(image: String = "mysql:8.4") : GenericContainer<MySQLContai
         withEnv("MYSQL_ROOT_PASSWORD", "test")
         // Anchored on the real server's line (see the class doc for the captured log excerpt and
         // why an unanchored "port: 3306" or a naive times=2 both misfire on the temp-server boot).
-        waitingFor(Wait.forLogMessage(".*mysqld: ready for connections.*port: 3306($|[^0-9]).*", 1))
+        // 120s: the entrypoint's full sequence (initialize database files, boot a temporary
+        // server, provision user/database, shut it down, boot the real server) can exceed the
+        // default 60s on shared CI runners.
+        waitingFor(Wait.forLogMessage(".*mysqld: ready for connections.*port: 3306($|[^0-9]).*", 1)
+            .withStartupTimeout(Duration.ofSeconds(120)))
         // No withMemoryLimit override: boots clean on msb's default ~450M microVM RAM well under
         // 60s — unlike SpringCloudConfig's Paketo JVM image, MySQL 8.4's InnoDB default footprint
         // fits the default, so no module-level memory floor is warranted here.

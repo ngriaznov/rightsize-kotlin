@@ -2,6 +2,7 @@ package dev.rightsize.modules
 
 import dev.rightsize.GenericContainer
 import dev.rightsize.core.wait.Wait
+import java.time.Duration
 
 /**
  * A single-node ClickHouse container, queried over its HTTP interface (port 8123). The native
@@ -47,7 +48,11 @@ class ClickHouseContainer(image: String = "clickhouse/clickhouse-server:25.8") :
         withEnv("CLICKHOUSE_DB", databaseState)
         // Protocol-aware HTTP probe: /ping answers "Ok.\n" once the HTTP interface is really up —
         // no double-boot restart race the way the Postgres/MySQL/MariaDB entrypoints have.
-        waitingFor(Wait.forHttp("/ping").forPort(HTTP_PORT))
+        // 120s: the entrypoint's user/database provisioning runs a second server pass before the
+        // HTTP interface opens, and on shared CI runners (and laptops running sibling containers
+        // in parallel) that pass alone can exceed the default 60s.
+        waitingFor(Wait.forHttp("/ping").forPort(HTTP_PORT)
+            .withStartupTimeout(Duration.ofSeconds(120)))
     }
 
     /** Overrides `CLICKHOUSE_USER` (default `test`). */

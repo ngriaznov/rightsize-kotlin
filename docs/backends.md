@@ -14,8 +14,10 @@ Selection is lazy and happens once per JVM, in this order:
 1. **`RIGHTSIZE_BACKEND=microsandbox|docker`**, if set, wins outright — and it must be
    usable, or the run fails immediately naming the exact precondition that wasn't met
    (rather than silently falling through to the other backend).
-2. Otherwise, **microsandbox** if the platform supports it: macOS on Apple Silicon, or
-   Linux with a readable `/dev/kvm`.
+2. Otherwise, **microsandbox** if the platform supports it: macOS on Apple Silicon, Linux
+   with a readable `/dev/kvm`, or Windows (x86_64/arm64) — attempted directly, since msb's
+   own `msb doctor` reports whether Windows Hypervisor Platform is actually usable, more
+   reliably than a pre-boot probe could.
 3. Otherwise, **Docker** if a daemon socket is reachable.
 4. Otherwise, fail — naming the exact precondition that failed for every backend that
    was considered, not just the first one.
@@ -31,9 +33,9 @@ is the whole story that matters from the outside.
 |---|---|
 | `RIGHTSIZE_BACKEND` | Force `microsandbox` or `docker`, overriding auto-selection. |
 | `MSB_PATH` | Use a pre-installed `msb` binary; skips the download/provisioning step entirely. |
-| `RIGHTSIZE_CACHE_DIR` | Relocate the runtime cache (default `~/.cache/rightsize`). |
+| `RIGHTSIZE_CACHE_DIR` | Relocate the runtime cache (default `~/.cache/rightsize`; `%LOCALAPPDATA%\rightsize` on Windows, falling back to `%USERPROFILE%\AppData\Local\rightsize` if `LOCALAPPDATA` is unset). |
 | `RIGHTSIZE_MSB_SKIP_DOWNLOAD` | `true` = fail with guidance instead of downloading — for air-gapped CI; pair with `MSB_PATH` or a pre-seeded cache. |
-| `DOCKER_HOST` | Standard docker-java variable. The Docker backend also honors the active docker CLI context (`~/.docker/config.json`) — set this if your daemon isn't at the default `/var/run/docker.sock` (Docker Desktop / Colima / OrbStack on a non-default socket, for instance). |
+| `DOCKER_HOST` | Standard docker-java variable. The Docker backend also honors the active docker CLI context (`~/.docker/config.json`) — set this if your daemon isn't at the default `/var/run/docker.sock` (Docker Desktop / Colima / OrbStack on a non-default socket, for instance). On Windows this is not optional: the Docker backend's `zerodep` transport speaks only unix sockets, so `RIGHTSIZE_BACKEND=docker` on native Windows needs a unix-socket-reachable daemon (e.g. the Docker Engine running inside WSL, with `DOCKER_HOST` pointed at its socket) — a Windows named pipe alone will not work. |
 
 ## `backend-microsandbox` deep-dive
 
@@ -42,7 +44,8 @@ is the whole story that matters from the outside.
 On first use, if no runtime is already cached (or `MSB_PATH` isn't set), rightsize
 downloads a pinned `msb` release (currently `0.6.3`) plus its `libkrunfw` companion
 library from GitHub releases, matched to your OS/architecture
-(`msb-darwin-aarch64`, `msb-linux-x86_64`, `msb-linux-aarch64`, and the corresponding
+(`msb-darwin-aarch64`, `msb-linux-x86_64`, `msb-linux-aarch64`,
+`msb-windows-x86_64.exe`, `msb-windows-aarch64.exe`, and the corresponding
 `libkrunfw-*` asset).
 
 Every downloaded asset is verified against the release's `checksums.sha256` before
@@ -52,11 +55,15 @@ place **last** — so the binary's mere existence is the "install complete" mark
 process crashing mid-install can never leave a state where a later run wrongly
 believes an incomplete install is usable. A cross-process file lock
 (`FileChannel.lock()`) serializes concurrent installs so parallel Gradle test workers
-provision exactly once rather than racing each other.
+provision exactly once rather than racing each other — this holds on Windows too, where
+the same kernel-held lock is released on process death exactly as it is on POSIX.
 
-`libkrunfw` lives in a `lib/` directory as a sibling of `bin/msb` — msb's own resolver
-expects it at `../lib` relative to the binary, and the installer lays files out to
-match.
+`libkrunfw` lives in a `lib/` directory as a sibling of `bin/msb` (`bin\msb.exe` on
+Windows) — msb's own resolver expects it at `../lib` relative to the binary, and the
+installer lays files out to match. The installed binary name is platform-derived:
+suffixless `msb` on macOS/Linux, `msb.exe` on Windows, since there is no execute bit on
+Windows to gate on — the install-validity check there is a plain exists-and-is-a-file
+test instead of the POSIX executable-bit check.
 
 ### Attached-mode supervision
 
@@ -69,11 +76,23 @@ is "the sandbox name shows `Running` in `msb ls`" — not the attached process's
 exit code or stdout; workload logs come from `msb logs`, a separate channel. See
 [How It Works](how-it-works.md) for more on why this shape was necessary.
 
+On Windows, the attached `msb run` process's own stdout does not relay the guest
+workload's output at all (confirmed empirically) — `msb logs` is not just the
+backend's preferred channel there, it is the only one. Process teardown also differs
+at the JVM level: the JVM has no POSIX signals on Windows, so `Process.destroy()` and
+`destroyForcibly()` both call `TerminateProcess` — there is no separate graceful
+variant to escalate from. This is harmless here because the actual graceful shutdown
+is `msb stop`/`msb rm`, issued before the attached child is killed; killing the
+process afterward is a pure cleanup step on every platform.
+
 ### The provisioning cache
 
-Everything lands under `~/.cache/rightsize/` (or `RIGHTSIZE_CACHE_DIR` if you've
-relocated it) — the pinned msb toolchain, versioned by directory so a future rightsize
-release pinning a newer msb doesn't collide with an older cached one.
+Everything lands under `~/.cache/rightsize/` on macOS/Linux, `%LOCALAPPDATA%\rightsize`
+on Windows (or `RIGHTSIZE_CACHE_DIR` on any platform, if you've relocated it) — the
+pinned msb toolchain, versioned by directory so a future rightsize release pinning a
+newer msb doesn't collide with an older cached one. `%LOCALAPPDATA%` is used rather than
+`%USERPROFILE%` because the cache holds a machine-local native toolchain, not
+roaming-profile data.
 
 ## `backend-docker` deep-dive: the zerodep story
 
@@ -120,7 +139,11 @@ timing quirks. Know these before you hit them:
   implementation detail, not a behavior difference from the caller's point of view —
   but it does mean a `followOutput` subscriber on microsandbox can see its last line
   arrive slightly *after* the sandbox itself reports stopped, rather than exactly at
-  stream EOF the way a Docker log stream closes.
+  stream EOF the way a Docker log stream closes. On Windows hosts the live stream is a
+  poll too, not just the tail-flush: `msb logs -f` there never relays new lines to its
+  stdout pipe while the sandbox runs, so the backend polls non-follow `msb logs` for
+  the whole stream — same ordered, no-duplicate delivery, with per-line latency up to
+  the poll interval (300 ms).
 - **Network-alias tunnels on microsandbox serve one connection at a time.** See
   [Networking](concepts/networking.md#limits-on-the-microsandbox-backend) — this is a
   real capability gap versus Docker's native bridge networking, not just a timing
@@ -131,3 +154,15 @@ timing quirks. Know these before you hit them:
   `Wait.forListeningPort()` can be satisfied before the in-guest process is actually
   ready on either backend, and when to prefer `Wait.forHttp`/`Wait.forLogMessage`
   instead.
+- **Native Windows msb support is upstream beta (microsandbox 0.6.3).** The guest is
+  Linux on every host, so guest-side behavior (entrypoints, `/etc/hosts` aliasing, the
+  exec-stream tunnels) is unaffected by running on Windows — the Windows-specific
+  surface is entirely host-side (downloading a `.exe`/`.dll` pair, the cache root,
+  process supervision). `RIGHTSIZE_BACKEND=microsandbox` on a Windows host without a
+  usable Windows Hypervisor Platform fails immediately naming that precondition,
+  exactly as it does today on an Intel Mac or a KVM-less Linux box, rather than
+  silently falling back to Docker.
+- **The Docker backend on Windows needs a unix-socket-reachable daemon.** The
+  `zerodep` transport (see below) speaks unix sockets only, so a Docker daemon
+  reachable purely via a Windows named pipe won't work — point `DOCKER_HOST` at a
+  unix-socket endpoint (for example, the Docker Engine running inside WSL).
