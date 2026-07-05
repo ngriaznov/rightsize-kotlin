@@ -31,7 +31,9 @@ object MsbProvisioner {
                 "— use the docker backend (RIGHTSIZE_BACKEND=docker) or set MSB_PATH")
         val installDir = cacheDir.resolve("msb").resolve(MSB_VERSION)
         val msb = installDir.resolve("bin").resolve("msb")
-        val krun = installDir.resolve("lib").resolve(platform.krunAsset)
+        // Installed under the canonical name msb resolves (`../lib/` next to its binary),
+        // not the release-asset name it is downloaded as — msb never probes the asset name.
+        val krun = installDir.resolve("lib").resolve(platform.krunInstallName)
         // An install is complete only when BOTH the msb binary and the krun asset are present.
         // The msb binary is written last (see below), so its presence alone is not sufficient.
         if (isInstalled(msb, krun)) return msb

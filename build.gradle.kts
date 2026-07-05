@@ -96,6 +96,13 @@ subprojects {
         classpath = testSourceSet.runtimeClasspath
         useJUnitPlatform { includeTags("sandbox-it") }
         outputs.upToDateWhen { false }
+        // Full exception detail in the console: these failures carry runtime diagnostics
+        // (msb/daemon output tails) that are otherwise only in the HTML report, which CI
+        // logs never show.
+        testLogging {
+            exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
+            events("failed")
+        }
     }
 
     // Coverage floor on `core` only: it's the pure-logic module (GenericContainer, Backends,
