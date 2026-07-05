@@ -46,14 +46,84 @@ class MsbCliBackend(internal val msb: Path) : SandboxBackend {
      * empirically against the real binary). The `msb run` child lives as long as the sandbox;
      * readiness = name Running in `msb ls --format json`. Workload logs come from `msb logs`,
      * not this process's stdout.
+     *
+     * A first boot attempt that exits before Running with msb's image-cache-corruption
+     * signature (see [isImageCacheCorruption]) is healed by removing the affected image's
+     * cache entry and retried exactly once — see [spawnAndAwaitRunning]. The failed attempt
+     * never reached Running, so [Handle.attached] and [startedNames] (both populated only
+     * after [spawnAndAwaitRunning] returns) carry no state from it to double-register, and
+     * its child has already been reaped by [bootOnce].
      */
     override fun start(handle: SandboxHandle) {
         handle as Handle
-        val (proc, tail) = spawnAttachedRun(handle)   // ATTACHED mode: -d never runs the ENTRYPOINT
-        handle.attached = proc
+        handle.attached = spawnAndAwaitRunning(handle)
         startedNames += handle.id
-        awaitRunning(handle, proc, tail)               // readiness = name Running in `msb ls`
     }
+
+    /**
+     * Boots via [bootOnce]; on a first failure carrying msb's image-cache-corruption
+     * signature, heals by removing just the affected image's cache entry
+     * (`msb image remove <image>`, result ignored — including "image not found", since the
+     * real signal is whether the retried boot succeeds, not whether removal reported
+     * success) and retries the boot exactly once. A second identical failure surfaces an
+     * error naming the image and the attempted heal instead of retrying further. The heal
+     * is scoped to the one image reference — never the whole cache directory, and never any
+     * sandbox state (`image remove` touches only the image cache's manifest and layer
+     * bookkeeping).
+     *
+     * Two corruption shapes were found empirically and the same one command heals both:
+     * the failing image's manifest was never committed to msb's cache database (a
+     * concurrent pull lost the race for a shared base layer before its own manifest write
+     * landed) — `image remove` reports "image not found" and the retry succeeds anyway,
+     * because by then the concurrent winner has finished materializing the shared layer —
+     * or the manifest IS committed but the cache file backing one of its layers is gone,
+     * where `image remove` clears the stale entry and the retry re-pulls from scratch.
+     */
+    private fun spawnAndAwaitRunning(handle: Handle): Process {
+        val firstOutput = try {
+            return bootOnce(handle)
+        } catch (first: ImageCacheCorruptionException) {
+            first.output
+        }
+        val heal = runCatching { invoke(MsbCommands.imageRemove(handle.spec.image), STOP_TIMEOUT_SEC) }
+        try {
+            return bootOnce(handle)
+        } catch (second: ImageCacheCorruptionException) {
+            error("msb run for sandbox ${handle.id} hit its image cache error twice in a row for image " +
+                "'${handle.spec.image}', even after removing that image's cache entry (${describeHeal(heal)}) " +
+                "and retrying — this is likely a deeper cache corruption than this backend's one-shot heal " +
+                "covers; try clearing the msb image cache by hand (`msb image prune` or removing the cache " +
+                "directory under MSB_HOME).\nfirst attempt:\n$firstOutput\nafter heal + retry:\n${second.output}")
+        }
+    }
+
+    /**
+     * One boot attempt: spawns the attached `msb run` child and waits for Running. On any
+     * failure the child is reaped here (for the classified early-exit failures it has
+     * already exited; a readiness timeout leaves it alive and it is force-killed), so a
+     * failed attempt leaves no live process behind — the caller owns retry policy, never
+     * cleanup.
+     */
+    private fun bootOnce(handle: Handle): Process {
+        val (proc, tail) = spawnAttachedRun(handle)   // ATTACHED mode: -d never runs the ENTRYPOINT
+        try {
+            awaitRunning(handle, proc, tail)          // readiness = name Running in `msb ls`
+        } catch (t: Throwable) {
+            if (proc.isAlive) proc.destroyForcibly()
+            throw t
+        }
+        return proc
+    }
+
+    /** Renders a heal attempt's outcome for the second-failure message — the heal's own
+     * failure (e.g. "image not found") is itself informative to whoever reads the error. */
+    private fun describeHeal(result: Result<ExecResult>): String = result.fold(
+        onSuccess = { r ->
+            if (r.exitCode == 0) "removed"
+            else "`msb image remove` exited ${r.exitCode}: ${r.stderr.trim()}"
+        },
+        onFailure = { e -> "`msb image remove` itself failed to run: ${e.message}" },
+    )
 
     /**
      * Spawns `msb run`, draining its combined output to a tail kept for diagnostics only —
@@ -69,12 +139,17 @@ class MsbCliBackend(internal val msb: Path) : SandboxBackend {
         return proc to tail
     }
 
-    /** Polls until [handle] reaches Running, or fails fast if the `msb run` child exits first. */
+    /** Polls until [handle] reaches Running, or fails fast if the `msb run` child exits first.
+     * An early exit is classified from the child's combined output: the image-cache-corruption
+     * signature throws [ImageCacheCorruptionException] (the one failure [spawnAndAwaitRunning]
+     * heals and retries), a host-port bind conflict throws [PortBindConflictException], and
+     * anything else surfaces the raw output. */
     private fun awaitRunning(handle: Handle, proc: Process, tail: ConcurrentLinkedDeque<String>) {
         val deadline = System.currentTimeMillis() + FIRST_RUN_PULL_TIMEOUT_MS
         while (System.currentTimeMillis() < deadline) {
             if (!proc.isAlive) {
                 val output = tail.joinToString("\n")
+                if (isImageCacheCorruption(output)) throw ImageCacheCorruptionException(output)
                 if (isPortBindConflict(output)) {
                     throw PortBindConflictException(
                         "msb run for sandbox ${handle.id} could not bind a host port: $output")
@@ -336,3 +411,32 @@ class MsbCliBackend(internal val msb: Path) : SandboxBackend {
     private fun drain(stream: InputStream, onLine: (String) -> Unit): Thread =
         Thread { stream.bufferedReader().forEachLine(onLine) }.apply { isDaemon = true; start() }
 }
+
+/** The one boot failure [MsbCliBackend] heals and retries — carries the `msb run` child's
+ * combined output for the second-failure diagnostic. Internal to the boot path: never
+ * escapes `start()`, which converts a repeat failure into a plain error naming the heal. */
+internal class ImageCacheCorruptionException(val output: String) :
+    RuntimeException("msb image cache corruption:\n$output")
+
+/**
+ * True if [output] (an early-exited `msb run` child's combined stdout/stderr) names msb's
+ * image cache error: a manifest/layer index entry pointing at a cache file that isn't on
+ * disk. Observed verbatim against a real msb 0.6.3 binary:
+ *
+ * ```
+ * error: image error: cache error at /path/to/.microsandbox/cache/layers/sha256_<64hex>.tar.gz: No such file or directory (os error 2)
+ * ```
+ *
+ * Root cause, reproduced by racing concurrent `msb run`/`msb pull` of images that share a
+ * base layer against one fresh cache: two pulls converting the same shared blob race, and
+ * the loser's read of the shared `.tar.gz` finds it already deleted by the winner's
+ * post-conversion cleanup. Confirmed order-independent: across ten trials of three
+ * concurrent pulls, seven reproduced the error, naming each image as the victim at least
+ * once. Never reproduces sequentially.
+ *
+ * Deliberately a substring match on the stable parts of msb's wording ("cache error at",
+ * "No such file") rather than the full sentence — the path and digest vary per host/image,
+ * and msb has no structured/typed error for this.
+ */
+internal fun isImageCacheCorruption(output: String): Boolean =
+    "cache error at" in output && "No such file" in output

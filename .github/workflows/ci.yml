@@ -47,7 +47,22 @@ jobs:
           path: ~/.microsandbox/cache
           key: msb-images-${{ runner.os }}-${{ github.run_id }}
           restore-keys: msb-images-${{ runner.os }}-
-      - run: RIGHTSIZE_BACKEND=microsandbox ./gradlew integrationTest
+      - shell: bash
+        run: RIGHTSIZE_BACKEND=microsandbox ./gradlew integrationTest 2>&1 | tee /tmp/it-output.log
+      # msb's image cache can be left with an index pointing at layer files that don't
+      # exist (a pull interrupted mid-write, or its concurrent-pull race); msb then
+      # hard-errors on that image. Purge before saving so a corrupted cache is never
+      # banked for future runs — the next run re-pulls clean instead of restoring the
+      # poison. The backend self-heals the race at boot, so this guard is the cache-
+      # hygiene backstop, not the primary defense.
+      - name: Purge image cache if corruption was observed
+        if: always()
+        shell: bash
+        run: |
+          if grep -q "cache error at .*No such file" /tmp/it-output.log 2>/dev/null; then
+            echo "image-cache corruption detected — purging before save"
+            rm -rf ~/.microsandbox/cache
+          fi
       - uses: actions/cache/save@v4
         if: always()
         with:
@@ -73,7 +88,18 @@ jobs:
       # has a database-migration race under concurrent sandbox creation, so sandboxes
       # must be created one at a time on this runner.
       - shell: bash
-        run: RIGHTSIZE_BACKEND=microsandbox ./gradlew integrationTest --max-workers=1
+        run: RIGHTSIZE_BACKEND=microsandbox ./gradlew integrationTest --max-workers=1 2>&1 | tee /tmp/it-output.log
+      # Same guard as msb-linux; `shell: bash` matters here since this job's default
+      # shell is pwsh (bash is available on the hosted Windows images, and `~` and
+      # /tmp resolve through git-bash's own path mapping).
+      - name: Purge image cache if corruption was observed
+        if: always()
+        shell: bash
+        run: |
+          if grep -q "cache error at .*No such file" /tmp/it-output.log 2>/dev/null; then
+            echo "image-cache corruption detected — purging before save"
+            rm -rf ~/.microsandbox/cache
+          fi
       - uses: actions/cache/save@v4
         if: always()
         with:
