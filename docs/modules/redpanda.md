@@ -7,7 +7,7 @@
 
 | | |
 |---|---|
-| Default image | `docker.redpanda.com/redpandadata/redpanda:latest` |
+| Default image | `docker.redpanda.com/redpandadata/redpanda:v24.2.4` |
 | Exposed ports | `9092` (Kafka API), `9093` (internal listener), `8081` (schema registry) |
 | Wait strategy | `Wait.forLogMessage(".*Successfully started Redpanda.*")` |
 

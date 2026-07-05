@@ -5,5 +5,5 @@ memcached:1.6-alpine
 mongo:8.0
 arangodb:3.11
 apache/kafka:4.0.0
-docker.redpanda.com/redpandadata/redpanda:latest
+docker.redpanda.com/redpandadata/redpanda:v24.2.4
 hyness/spring-cloud-config-server:latest

@@ -5,7 +5,7 @@ import dev.rightsize.core.ContainerSpec
 import dev.rightsize.core.wait.Wait
 
 /** A single-node Redpanda broker (Kafka API-compatible) with its schema registry enabled. */
-class RedpandaContainer(image: String = "docker.redpanda.com/redpandadata/redpanda:latest") :
+class RedpandaContainer(image: String = "docker.redpanda.com/redpandadata/redpanda:v24.2.4") :
     GenericContainer<RedpandaContainer>(image) {
 
     private companion object {
