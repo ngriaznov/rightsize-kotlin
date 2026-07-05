@@ -1,0 +1,12 @@
+rightsize
+Copyright 2026 Mykyta Hriaznov
+
+This product is licensed under the Apache License, Version 2.0.
+See the LICENSE file for the full license text.
+
+This product includes software developed as part of the rightsize project
+(https://github.com/ngriaznov/rightsize-kotlin).
+
+rightsize's runtime dependencies (docker-java, microsandbox `msb`, and others)
+retain their own licenses; see each dependency's published POM/module metadata
+for details.

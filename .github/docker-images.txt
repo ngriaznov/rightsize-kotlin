@@ -1,0 +1,9 @@
+alpine:3.19
+python:3.12-alpine
+redis:8.6-alpine
+memcached:1.6-alpine
+mongo:8.0
+arangodb:3.11
+apache/kafka:4.0.0
+docker.redpanda.com/redpandadata/redpanda:latest
+hyness/spring-cloud-config-server:latest

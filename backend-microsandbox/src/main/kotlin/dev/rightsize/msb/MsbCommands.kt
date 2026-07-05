@@ -1,0 +1,63 @@
+package dev.rightsize.msb
+
+import dev.rightsize.core.ContainerSpec
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
+
+/**
+ * Pure msb CLI argv construction. Flag spellings verified empirically against the real
+ * `msb` binary. ATTACHED mode (no -d): `msb run -d` (detached) never starts the image's
+ * own ENTRYPOINT/CMD, only attached mode does.
+ */
+object MsbCommands {
+    fun run(spec: ContainerSpec): List<String> = buildList {
+        add("run"); add("--name"); add(spec.name)
+        spec.memoryLimitMb?.let { add("-m"); add("${it}M") }   // `msb run --help`: -m/--memory <MEMORY>, e.g. 512M/1G
+        spec.ports.forEach { add("-p"); add("${it.hostPort}:${it.guestPort}") }
+        spec.env.forEach { (k, v) -> add("-e"); add("$k=$v") }
+        spec.mounts.forEach { add("--mount-file"); add("${it.hostPath}:${it.guestPath}") }
+        add(spec.image)
+        spec.command?.let { add("--"); addAll(it) }   // null => image default ENTRYPOINT/CMD runs
+    }
+
+    fun exec(name: String, cmd: List<String>) = listOf("exec", name, "--") + cmd
+    fun execStream(name: String, cmd: List<String>) = listOf("exec", "--stream", name, "--") + cmd
+    fun logs(name: String) = listOf("logs", name, "--tail", "1000")
+    fun followLogs(name: String) = listOf("logs", name, "-f")
+    fun stop(name: String) = listOf("stop", name)
+    fun rm(name: String) = listOf("rm", name)
+    fun ls() = listOf("ls", "--format", "json")
+}
+
+/** One entry of `msb ls --format json`'s output — only the two fields this backend reads.
+ * `created_at`/`image` (and anything a future msb version adds) are ignored by the
+ * [MsbLsJson.json] instance's `ignoreUnknownKeys`. Both fields are nullable rather than
+ * defaulted to an empty string: an object missing one must be excluded outright, not
+ * treated as an entry named `""`.
+ */
+@Serializable
+private data class LsEntry(val name: String? = null, val status: String? = null)
+
+/**
+ * Parses `msb ls --format json`, the msb backend's only way to learn which sandboxes are
+ * currently `Running`. msb 0.6.2's shape is a flat JSON array of objects with keys
+ * `created_at, image, name, status` (status capitalized, e.g. "Running") — confirmed
+ * empirically against the real binary.
+ *
+ * PIN: keep this in sync with `msb ls --format json`'s actual shape if msb changes it; the IT
+ * (`MsbRunningSandboxNamesIT`) is the only guard on that short of a live-CLI shape drift.
+ */
+internal object MsbLsJson {
+    private val json = Json { ignoreUnknownKeys = true }
+
+    /** Names of objects whose `status` field equals `Running`. An object missing `name` or
+     * `status` is skipped, not counted; a `json` that isn't the documented array shape at all
+     * yields an empty set rather than throwing, the same best-effort posture the hand-rolled
+     * parser this replaced had.
+     */
+    fun runningNames(json: String): Set<String> = runCatching {
+        this.json.decodeFromString<List<LsEntry>>(json)
+    }.getOrDefault(emptyList()).mapNotNull { entry ->
+        entry.name?.takeIf { entry.status == "Running" }
+    }.toSet()
+}
