@@ -31,7 +31,10 @@ abstract class BackendContractTest {
         val c = GenericContainer("python:3.12-alpine")
             .withCommand("python", "-m", "http.server", "8000")
             .withExposedPorts(8000)
-            .waitingFor(Wait.forHttp("/").forPort(8000))
+            .waitingFor(Wait.forHttp("/").forPort(8000)
+                // 120s: shared CI runners boot a microVM + python noticeably slower
+                // than dev hardware; the default 60s flakes there.
+                .withStartupTimeout(java.time.Duration.ofSeconds(120)))
         c.start()
         try {
             val conn = URI("http://127.0.0.1:${c.getMappedPort(8000)}/").toURL()

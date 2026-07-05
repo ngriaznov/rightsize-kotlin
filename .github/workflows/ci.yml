@@ -54,29 +54,10 @@ jobs:
           path: ~/.microsandbox/cache
           key: msb-images-${{ runner.os }}-${{ github.run_id }}
 
-  msb-macos:
-    runs-on: macos-latest    # Apple Silicon
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
-        with: { distribution: temurin, java-version: '17' }
-      - uses: gradle/actions/setup-gradle@v4
-      # Image-cache warming is incremental: registries rate-limit the runners'
-      # shared IPs, so each run restores the newest prior cache, pulls what the
-      # quota allows, and saves its grown copy even on failure — after a few
-      # runs the cache is warm and pulls stop entirely.
-      - uses: actions/cache/restore@v4
-        with:
-          path: ~/.microsandbox/cache
-          key: msb-images-${{ runner.os }}-${{ github.run_id }}
-          restore-keys: msb-images-${{ runner.os }}-
-      - run: RIGHTSIZE_BACKEND=microsandbox ./gradlew integrationTest
-      - uses: actions/cache/save@v4
-        if: always()
-        with:
-          path: ~/.microsandbox/cache
-          key: msb-images-${{ runner.os }}-${{ github.run_id }}
-
+  # No msb-macos job: GitHub's hosted Apple Silicon runners are themselves VMs
+  # without nested virtualization, so Hypervisor.framework VM creation fails
+  # (msb: build_microvm VmSetup(VmCreate)). macOS support is verified on real
+  # Apple Silicon hardware; a self-hosted mac runner could restore CI coverage.
   docker-fallback:
     runs-on: ubuntu-latest
     steps:
