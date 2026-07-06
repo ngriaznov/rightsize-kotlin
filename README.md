@@ -224,12 +224,15 @@ RIGHTSIZE_BACKEND=microsandbox ./gradlew integrationTest   # needs Apple Silicon
 RIGHTSIZE_BACKEND=docker ./gradlew integrationTest         # needs any Docker-compatible daemon
 ```
 
-CI runs the matrix on Linux (KVM), macOS (Apple Silicon), and a Docker-only job.
+CI runs the matrix on Linux (KVM), Windows (WHP), and a Docker-only job. There is
+no macOS job — GitHub's hosted Apple Silicon runners cannot nest virtualization —
+so macOS is verified on real hardware.
 
 ## Documentation
 
-Full documentation (concepts, backends, module reference, troubleshooting) lives under
-[`docs/`](docs) and is published from `mkdocs.yml`.
+Full documentation (concepts, backends, module reference, troubleshooting) is at
+**[ngriaznov.github.io/rightsize-kotlin](https://ngriaznov.github.io/rightsize-kotlin/)**,
+built from [`docs/`](docs) by MkDocs.
 
 ## License
 

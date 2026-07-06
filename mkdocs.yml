@@ -1,4 +1,5 @@
 site_name: rightsize
+site_url: https://ngriaznov.github.io/rightsize-kotlin/
 site_description: Testcontainers-style integration testing on microsandbox microVMs. No Docker required.
 repo_url: https://github.com/ngriaznov/rightsize-kotlin
 repo_name: ngriaznov/rightsize-kotlin
