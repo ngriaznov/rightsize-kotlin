@@ -7,8 +7,15 @@ reaches its first tagged release.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-07-06
+
 ### Fixed
 
+- **`ClickHouseContainer` readiness gets a 180-second budget.** The entrypoint
+  runs a second server pass for user/database provisioning before the HTTP
+  interface opens, and a loaded Windows CI runner was observed still in early
+  config processing at the previous 120-second ceiling. The budget is a
+  deadline, not a wait — readiness returns the moment `/ping` answers.
 - **The microsandbox backend retries a boot that lost msb's startup-migration
   race.** Every msb invocation runs schema migrations against its shared SQLite
   state database on startup, and two concurrent invocations can race them — the
@@ -148,5 +155,6 @@ Initial public release.
   exactly once; any other failure, or a second failure after the heal,
   propagates unchanged.
 
-[Unreleased]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/ngriaznov/rightsize-kotlin/releases/tag/v0.1.0
