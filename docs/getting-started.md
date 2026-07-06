@@ -1,35 +1,17 @@
 # Getting Started
 
-## 0. Status and `mavenLocal()`
+## 0. Coordinates
 
-rightsize is early: it publishes as `0.1.0-SNAPSHOT` under group `dev.rightsize`, and
-it is **not yet on Maven Central or any shared repository**. Until it is, you build it
-from source and consume it from your local `~/.m2`:
-
-```bash
-git clone https://github.com/ngriaznov/rightsize-kotlin.git
-cd rightsize
-./gradlew publishToMavenLocal
-```
-
-This publishes five artifacts: `core`, `modules`, `backend-microsandbox`,
-`backend-docker`, and the `bom` platform.
-
-Make sure the consuming project's `repositories { }` block includes `mavenLocal()`,
-or the `0.1.0-SNAPSHOT` coordinates won't resolve:
-
-```kotlin
-repositories {
-    mavenLocal()
-    mavenCentral()
-}
-```
+rightsize publishes to Maven Central under the group `dev.rightsize` — five
+artifacts: `core`, `modules`, `backend-microsandbox`, `backend-docker`, and the
+`bom` platform. Plain `mavenCentral()` in `repositories { }` is all the
+consuming project needs.
 
 ## 1. Add the dependencies
 
 ```kotlin
 // build.gradle.kts
-testImplementation(platform("dev.rightsize:bom:0.1.0-SNAPSHOT"))
+testImplementation(platform("dev.rightsize:bom:0.1.0"))
 testImplementation("dev.rightsize:core")
 testImplementation("dev.rightsize:modules")
 testRuntimeOnly("dev.rightsize:backend-microsandbox")

@@ -49,12 +49,9 @@ than Docker, image pulls and container-to-container tests faster.
 
 ## Quickstart
 
-> **Status: early.** Not yet on Maven Central — build from source
-> (`./gradlew publishToMavenLocal`) and depend via `mavenLocal()`.
-
 ```kotlin
 // build.gradle.kts
-testImplementation(platform("dev.rightsize:bom:0.1.0-SNAPSHOT"))
+testImplementation(platform("dev.rightsize:bom:0.1.0"))
 testImplementation("dev.rightsize:core")
 testImplementation("dev.rightsize:modules")
 testRuntimeOnly("dev.rightsize:backend-microsandbox")

@@ -7,8 +7,9 @@ reaches its first tagged release.
 
 ## [Unreleased]
 
-Initial public groundwork — not yet released. Everything below exists on `main`
-but no `0.1.0` tag has been cut.
+## [0.1.0] - 2026-07-06
+
+Initial public release.
 
 ### Added
 
@@ -133,4 +134,5 @@ but no `0.1.0` tag has been cut.
   exactly once; any other failure, or a second failure after the heal,
   propagates unchanged.
 
-[Unreleased]: https://github.com/ngriaznov/rightsize-kotlin/commits/main
+[Unreleased]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/ngriaznov/rightsize-kotlin/releases/tag/v0.1.0

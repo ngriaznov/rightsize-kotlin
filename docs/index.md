@@ -59,8 +59,8 @@ on either backend. Backend-specific edges are covered in
 
 ## Status
 
-Early. Not yet on Maven Central — build from source and depend via `mavenLocal()`. See
-[Getting Started](getting-started.md#0-status-and-mavenlocal) for the exact steps.
+On Maven Central under the group `dev.rightsize`. See
+[Getting Started](getting-started.md) for the coordinates.
 
 ## License
 
