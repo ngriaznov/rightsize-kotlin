@@ -113,6 +113,24 @@ but no `0.1.0` tag has been cut.
   POSIX signals on Windows, so `destroy()`/`destroyForcibly()` both resolve to
   `TerminateProcess`, which is safe here because the actual graceful shutdown
   is the `msb stop`/`msb rm` invocation that already precedes killing the
-  attached child on every platform.
+  attached child on every platform. One more msb-Windows gap is compensated
+  rather than surfaced: `msb logs -f` on Windows stays alive but never relays
+  lines while the sandbox runs, so `followOutput` there polls fresh `msb logs`
+  snapshots instead of holding a `logs -f` pipe — a failed msb invocation
+  reads as no-signal, and the terminal tail is delivered exactly once after
+  the sandbox stops, including a final line with no trailing newline. The
+  full contract suite runs un-gated on Windows.
+
+### Fixed
+
+- **The microsandbox backend self-heals msb's image-cache race.** Concurrent
+  pulls of images sharing base layers can corrupt msb's image cache — the
+  losing pull reads a layer tarball the winner's cleanup already deleted, and
+  every later boot of that image fails with `cache error at
+  .../layers/<sha>.tar.gz: No such file or directory`. A boot failing with
+  that signature now removes the affected image from msb's cache
+  (`msb image remove`, scoped to the one reference) and retries the boot
+  exactly once; any other failure, or a second failure after the heal,
+  propagates unchanged.
 
 [Unreleased]: https://github.com/ngriaznov/rightsize-kotlin/commits/main
