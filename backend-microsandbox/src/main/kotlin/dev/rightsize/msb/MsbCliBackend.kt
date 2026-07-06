@@ -289,14 +289,28 @@ class MsbCliBackend(internal val msb: Path) : SandboxBackend {
      * deliveries (the next fetch's index-based diff would then skip its complete form). Once the
      * sandbox leaves Running, a final fetch delivers everything outstanding — including a
      * trailing unterminated line, exactly as the POSIX watchdog's replay does.
+     *
+     * A failed msb invocation is no-signal — never content, never "stopped". msb's
+     * per-invocation SQLite migration races concurrent msb processes on Windows, so a transient
+     * `msb ls`/`msb logs` failure is expected here; reading it as an empty log would misplace
+     * the `delivered` index, and reading it as a gone sandbox would end delivery with lines
+     * still undelivered. Both invocations of an iteration must succeed before either is acted
+     * on, which also makes the terminal flush a trusted fetch: the not-running branch only ever
+     * runs against a successful `msb logs` snapshot.
      */
     private fun followLogsByPolling(handle: SandboxHandle, consumer: (String) -> Unit): AutoCloseable {
         val closeRequested = AtomicBoolean(false)
         val worker = Thread {
             var delivered = 0
             while (!closeRequested.get()) {
-                val running = handle.id in runningSandboxNames()
-                val full = invoke(MsbCommands.logs(handle.id), LOGS_TIMEOUT_SEC).stdout
+                val ls = invoke(MsbCommands.ls(), LOGS_TIMEOUT_SEC)
+                val fetch = invoke(MsbCommands.logs(handle.id), LOGS_TIMEOUT_SEC)
+                if (ls.exitCode != 0 || fetch.exitCode != 0) {
+                    Thread.sleep(READINESS_POLL_MS)
+                    continue
+                }
+                val running = handle.id in MsbLsJson.runningNames(ls.stdout)
+                val full = fetch.stdout
                 val lines = full.lines().let { if (full.endsWith("\n")) it.dropLast(1) else it }
                 val deliverable = if (running) maxOf(delivered, lines.size - 1) else lines.size
                 for (i in delivered until deliverable) {
