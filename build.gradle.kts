@@ -13,6 +13,19 @@ val moduleDescriptions = mapOf(
     "bom" to "Version-aligned platform BOM for rightsize's published modules.",
 )
 
+// Signing is release-only: the key arrives ASCII-armored via environment, so regular
+// builds and publishToMavenLocal never require GPG material to be present. Maven
+// Central rejects unsigned artifacts, so a real publish without the key set fails
+// there, loudly, rather than silently uploading something unreleasable.
+fun Project.signPublicationsWhenKeyPresent() {
+    val key = providers.environmentVariable("RIGHTSIZE_GPG_KEY").orNull ?: return
+    val passphrase = providers.environmentVariable("RIGHTSIZE_GPG_PASSPHRASE").orNull
+    extensions.configure<SigningExtension> {
+        useInMemoryPgpKeys(key, passphrase)
+        sign(extensions.getByType<PublishingExtension>().publications)
+    }
+}
+
 fun MavenPublication.applyRightsizePom(moduleName: String) = pom {
     name = "rightsize-$moduleName"
     description = moduleDescriptions.getValue(moduleName)
@@ -57,6 +70,7 @@ subprojects {
     }
 
     apply(plugin = "maven-publish")
+    apply(plugin = "signing")
     if (name == "bom") {
         afterEvaluate {
             extensions.configure<PublishingExtension> {
@@ -67,12 +81,20 @@ subprojects {
                     }
                 }
             }
+            signPublicationsWhenKeyPresent()
         }
         return@subprojects
     }
     apply(plugin = "org.jetbrains.kotlin.jvm")
     extensions.configure<org.jetbrains.kotlin.gradle.dsl.KotlinJvmProjectExtension> {
         jvmToolchain(17)
+    }
+    // Maven Central requires a sources and a javadoc jar next to every library jar. The
+    // javadoc jar is produced from the (empty) Java source set — the accepted convention
+    // for Kotlin libraries; Central's validation checks presence, not content.
+    extensions.configure<JavaPluginExtension> {
+        withSourcesJar()
+        withJavadocJar()
     }
     dependencies {
         "testImplementation"(platform("org.junit:junit-bom:5.11.3"))
@@ -87,6 +109,7 @@ subprojects {
             }
         }
     }
+    signPublicationsWhenKeyPresent()
     tasks.named<Test>("test") { useJUnitPlatform { excludeTags("sandbox-it") } }
     val testSourceSet = extensions.getByType<SourceSetContainer>()["test"]
     tasks.register<Test>("integrationTest") {
