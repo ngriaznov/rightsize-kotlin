@@ -48,11 +48,11 @@ class ClickHouseContainer(image: String = "clickhouse/clickhouse-server:25.8") :
         withEnv("CLICKHOUSE_DB", databaseState)
         // Protocol-aware HTTP probe: /ping answers "Ok.\n" once the HTTP interface is really up —
         // no double-boot restart race the way the Postgres/MySQL/MariaDB entrypoints have.
-        // 120s: the entrypoint's user/database provisioning runs a second server pass before the
-        // HTTP interface opens, and on shared CI runners (and laptops running sibling containers
-        // in parallel) that pass alone can exceed the default 60s.
+        // 180s: the entrypoint's user/database provisioning runs a second server pass before the
+        // HTTP interface opens; on shared CI runners that pass alone can exceed the default 60s,
+        // and a loaded Windows runner was observed still in early config processing at 120s.
         waitingFor(Wait.forHttp("/ping").forPort(HTTP_PORT)
-            .withStartupTimeout(Duration.ofSeconds(120)))
+            .withStartupTimeout(Duration.ofSeconds(180)))
     }
 
     /** Overrides `CLICKHOUSE_USER` (default `test`). */
