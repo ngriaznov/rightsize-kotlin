@@ -28,10 +28,10 @@ class MsbCliBackend(internal val msb: Path) : SandboxBackend {
         const val FIRST_RUN_PULL_TIMEOUT_MS = 600_000L   // first run may pull the image
         const val READINESS_POLL_MS = 300L
         const val STOP_TIMEOUT_SEC = 60L
-        // Before retrying a boot that lost msb's startup-migration race — enough for the
-        // winning invocation's migration transaction to commit; the retry's own `msb run`
+        // Before retrying a boot that hit msb's state-database error — enough for a winning
+        // concurrent invocation's migration transaction to commit; the retry's own `msb run`
         // startup dwarfs this either way.
-        const val MIGRATION_RACE_RETRY_DELAY_MS = 500L
+        const val STATE_DB_RETRY_DELAY_MS = 500L
         const val EXEC_TIMEOUT_SEC = 120L
         const val LOGS_TIMEOUT_SEC = 30L
         const val ATTACHED_PROC_STOP_TIMEOUT_SEC = 10L
@@ -66,8 +66,9 @@ class MsbCliBackend(internal val msb: Path) : SandboxBackend {
 
     /**
      * Boots via [bootOnce], retrying two classified transient failures once each. A boot
-     * that lost msb's startup-migration race (see [isMsbMigrationRace]) is retried after a
-     * short delay with no heal step — the race is transient by construction. On a first
+     * that hit msb's state-database error — usually the startup-migration race (see
+     * [isMsbStateDbError]) — is retried after a short delay with no heal step; the race
+     * is transient by construction. On a first
      * failure carrying msb's image-cache-corruption
      * signature, heals by removing just the affected image's cache entry
      * (`msb image remove <image>`, result ignored — including "image not found", since the
@@ -89,18 +90,19 @@ class MsbCliBackend(internal val msb: Path) : SandboxBackend {
     private fun spawnAndAwaitRunning(handle: Handle): Process {
         val firstOutput = try {
             return bootOnce(handle)
-        } catch (race: MigrationRaceException) {
-            // Transient by construction (see [isMsbMigrationRace]): the winning msb
-            // invocation's migration commits and a retried boot finds the schema in
-            // place. No heal step, one retry, second loss propagates — the same
-            // one-shot policy as the image-cache heal below.
-            Thread.sleep(MIGRATION_RACE_RETRY_DELAY_MS)
+        } catch (race: MsbStateDbException) {
+            // Usually the startup-migration race, transient by construction (see
+            // [isMsbStateDbError]): the winning msb invocation's migration commits and a
+            // retried boot finds the schema in place. No heal step, one retry, second
+            // failure propagates — the same one-shot policy as the image-cache heal below.
+            Thread.sleep(STATE_DB_RETRY_DELAY_MS)
             try {
                 return bootOnce(handle)
-            } catch (second: MigrationRaceException) {
-                error("msb run for sandbox ${handle.id} lost msb's startup-migration race twice in a " +
-                    "row — expected at most a transient one-off from concurrent msb invocations; " +
-                    "something is hammering msb's state database on this host.\n" +
+            } catch (second: MsbStateDbException) {
+                error("msb run for sandbox ${handle.id} hit msb's state-database error twice in a " +
+                    "row — the usual cause (concurrent msb invocations racing startup migrations) " +
+                    "is transient and one retry covers it, so this looks like real state-database " +
+                    "trouble on this host.\n" +
                     "first attempt:\n${race.output}\nafter retry:\n${second.output}")
             }
         } catch (first: ImageCacheCorruptionException) {
@@ -171,7 +173,7 @@ class MsbCliBackend(internal val msb: Path) : SandboxBackend {
             if (!proc.isAlive) {
                 val output = tail.joinToString("\n")
                 if (isImageCacheCorruption(output)) throw ImageCacheCorruptionException(output)
-                if (isMsbMigrationRace(output)) throw MigrationRaceException(output)
+                if (isMsbStateDbError(output)) throw MsbStateDbException(output)
                 if (isPortBindConflict(output)) {
                     throw PortBindConflictException(
                         "msb run for sandbox ${handle.id} could not bind a host port: $output")
@@ -477,36 +479,35 @@ internal class ImageCacheCorruptionException(val output: String) :
 internal fun isImageCacheCorruption(output: String): Boolean =
     "cache error at" in output && "No such file" in output
 
-/** The other boot failure [MsbCliBackend] retries — the spawned `msb run` child lost msb's
- * startup-migration race (see [isMsbMigrationRace]). No heal step: the race is transient by
- * construction, so a plainly retried boot finds the schema already migrated. Internal to
- * the boot path, like its sibling above. */
-internal class MigrationRaceException(val output: String) :
-    RuntimeException("msb startup-migration race:\n$output")
+/** The other boot failure [MsbCliBackend] retries — the spawned `msb run` child hit a
+ * failure of msb's own state database, usually the startup-migration race (see
+ * [isMsbStateDbError]). No heal step: the race is transient by construction, so a plainly
+ * retried boot finds the schema already migrated. Internal to the boot path, like its
+ * sibling above. */
+internal class MsbStateDbException(val output: String) :
+    RuntimeException("msb state-database error:\n$output")
 
 /**
- * True if [output] (an early-exited `msb run` child's combined stdout/stderr) names msb's
- * startup-migration race: every msb invocation runs schema migrations against the shared
- * SQLite state database on startup, and two concurrent invocations can race them — the
- * loser dies before doing any work. Observed verbatim against the real msb 0.6.3 Windows
- * binary:
+ * True if [output] (an early-exited `msb run` child's combined stdout/stderr) names a
+ * failure of msb's own shared SQLite state database. Every msb invocation runs schema
+ * migrations against it on startup, and two concurrent invocations can race them — the
+ * loser dies before doing any work, with whatever wording matches the migration statement
+ * it lost on. Observed verbatim against the real msb 0.6.3 Windows binary, one race,
+ * three shapes:
  *
  * ```
  * error: database error: Execution Error: error returned from database: (code: 1) index idx_manifest_layers_unique already exists
+ * error: database error: Execution Error: error returned from database: (code: 1) duplicate column name: kind
  * ```
  *
- * and, from the same underlying race, the shape that first surfaced it:
- * `UNIQUE constraint failed: seaql_migrations.version`.
+ * plus `UNIQUE constraint failed: seaql_migrations.version`. Chasing individual wordings
+ * is a losing game — the stable part is msb's own `error: database error:` framing, which
+ * is always msb's state database and never the workload's output.
  *
  * A boot is never inherently alone even under fully serialized tests: the attached
  * `msb run` child races this backend's own `msb ls` readiness polling (and, on Windows, an
- * active log poller). Transient by construction — the winner's migration completes and
- * every later invocation finds the schema already in place.
- *
- * Deliberately a substring match on the stable parts of msb's wording — the
- * index/constraint being raced varies with which migration statement loses, and msb has no
- * structured/typed error for this.
+ * active log poller). The migration race is transient by construction; for a
+ * state-database failure that is NOT the race, the one-shot retry costs a moment and then
+ * propagates the failure with both attempts' output.
  */
-internal fun isMsbMigrationRace(output: String): Boolean =
-    "database error" in output &&
-        ("already exists" in output || "UNIQUE constraint failed" in output)
+internal fun isMsbStateDbError(output: String): Boolean = "error: database error:" in output
