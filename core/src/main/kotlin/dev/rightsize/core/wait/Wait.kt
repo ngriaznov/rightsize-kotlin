@@ -39,7 +39,7 @@ interface WaitStrategy {
  * class owns the deadline/poll-interval/log-tail plumbing so subclasses never hand-roll it.
  */
 public abstract class AbstractWaitStrategy protected constructor(
-    protected var timeout: Duration = Duration.ofSeconds(60),
+    protected var timeout: Duration = Duration.ofSeconds(120),
 ) : WaitStrategy {
     protected abstract fun isReady(target: WaitTarget): Boolean
     protected abstract fun what(): String
@@ -67,7 +67,7 @@ public abstract class AbstractWaitStrategy protected constructor(
     }
 }
 
-abstract class PollingWait internal constructor(timeout: Duration = Duration.ofSeconds(60)) : AbstractWaitStrategy(timeout)
+abstract class PollingWait internal constructor(timeout: Duration = Duration.ofSeconds(120)) : AbstractWaitStrategy(timeout)
 
 /** Polls an HTTP endpoint until it returns the expected status code. Build via [Wait.forHttp]. */
 class HttpWaitStrategy(private val path: String) : PollingWait() {
