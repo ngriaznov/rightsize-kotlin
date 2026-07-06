@@ -7,7 +7,7 @@ call it, the default is `Wait.forListeningPort()`.
 ## The three built-ins
 
 All four are reached through the `Wait` factory object (`dev.rightsize.core.wait.Wait`),
-and every one of them supports `.withStartupTimeout(Duration)` (default 60 seconds).
+and every one of them supports `.withStartupTimeout(Duration)` (default 120 seconds).
 
 ### `Wait.forListeningPort()`
 

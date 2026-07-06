@@ -141,4 +141,4 @@ ready" race. The example above does this with `retryUntil200`.
 
 A four-JVM cluster booting cold on a laptop is also just legitimately slow — expect
 60–120 seconds, which is why this module's wait strategy is configured with a 180s
-timeout rather than the 60s default.
+timeout rather than the 120-second default.
