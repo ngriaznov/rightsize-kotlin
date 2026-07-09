@@ -7,6 +7,18 @@ reaches its first tagged release.
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-07-09
+
+### Changed
+
+- **Pinned microsandbox runtime bumped from 0.6.3 to 0.6.6.** The provisioner
+  downloads and SHA-256-verifies the new release on first use (existing
+  `0.6.3` caches are left in place and simply stop being used). The full
+  integration matrix passes unchanged on both backends against 0.6.6, and the
+  backend behaviors the msb backend compensates for were re-verified as still
+  present: detached `msb run` still never starts the image ENTRYPOINT, and
+  `msb logs -f` still never exits after its sandbox stops.
+
 ## [0.1.1] - 2026-07-06
 
 ### Fixed
@@ -164,6 +176,7 @@ Initial public release.
   exactly once; any other failure, or a second failure after the heal,
   propagates unchanged.
 
-[Unreleased]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/ngriaznov/rightsize-kotlin/releases/tag/v0.1.0

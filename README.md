@@ -132,7 +132,7 @@ rightsize picks a backend automatically; override with
 | Windows without WHP | Docker (auto-fallback)ᵇ |
 | Linux without KVM | Docker (auto-fallback) |
 
-ᵃ Windows msb support is upstream beta (microsandbox 0.6.3). rightsize detects a Windows
+ᵃ Windows msb support is upstream beta (microsandbox 0.6.6). rightsize detects a Windows
 build is available and attempts it; if WHP turns out not to be usable, msb's own `msb doctor`
 names the exact precondition (see ᵇ) instead of a generic failure.
 ᵇ Force with `RIGHTSIZE_BACKEND=docker`, or enable WHP: run `msb doctor --fix` in an
