@@ -1,6 +1,7 @@
 package dev.rightsize.junit
 
 import dev.rightsize.GenericContainer
+import dev.rightsize.core.diagnostics.Diagnostics
 import org.junit.jupiter.api.extension.*
 import java.lang.reflect.Field
 import java.lang.reflect.Modifier
@@ -26,10 +27,13 @@ annotation class Sandboxed
 @Retention(AnnotationRetention.RUNTIME)
 annotation class Container
 
-class SandboxedExtension : BeforeAllCallback, AfterAllCallback, BeforeEachCallback, AfterEachCallback {
+class SandboxedExtension :
+    BeforeAllCallback, AfterAllCallback, BeforeEachCallback, AfterEachCallback,
+    AfterTestExecutionCallback, TestWatcher {
     private companion object {
         const val STATIC_KEY = "static"
         const val INSTANCE_KEY = "instance"
+        const val DIAGNOSTICS_KEY = "diagnosticsSnapshot"
     }
 
     private val ns = ExtensionContext.Namespace.create("dev.rightsize.junit")
@@ -77,5 +81,32 @@ class SandboxedExtension : BeforeAllCallback, AfterAllCallback, BeforeEachCallba
 
     override fun afterEach(ctx: ExtensionContext) {
         ctx.startedFrom(INSTANCE_KEY).forEach { it.stop() }
+    }
+
+    /**
+     * Snapshots [Diagnostics.report] right after the test method finishes, before this
+     * extension's own [afterEach] stops (and deregisters from [dev.rightsize.core.diagnostics.LiveContainers])
+     * the `@Container` fields that just ran the test. JUnit 5 runs every extension's
+     * `afterTestExecution` callbacks before any extension's `afterEach` callbacks, so this is the
+     * last point at which the failing test's own containers are still guaranteed to be live —
+     * [testFailed] (a [TestWatcher] callback) only fires after all `afterEach` callbacks have
+     * already completed, by which point they would otherwise already be gone.
+     */
+    override fun afterTestExecution(ctx: ExtensionContext) {
+        if (ctx.executionException.isPresent) {
+            ctx.getStore(ns).put(DIAGNOSTICS_KEY, runCatching { Diagnostics.report() }.getOrNull())
+        }
+    }
+
+    /** Prints [Diagnostics.report] to `System.err` exactly once per failed test — never on a
+     * pass. Prefers the snapshot [afterTestExecution] captured before this extension's own
+     * [afterEach] tore the failing test's containers down; falls back to a live report for a
+     * failure this extension never reached an `afterTestExecution` phase for (e.g. one thrown
+     * from `beforeAll`/`beforeEach` itself). Guarded by [runCatching] so a diagnostics failure
+     * (or simply nothing running) can never mask the real test failure that triggered this
+     * callback. */
+    override fun testFailed(ctx: ExtensionContext, cause: Throwable) {
+        val snapshot = runCatching { ctx.getStore(ns).get(DIAGNOSTICS_KEY) as? String }.getOrNull()
+        runCatching { System.err.println(snapshot ?: Diagnostics.report()) }
     }
 }

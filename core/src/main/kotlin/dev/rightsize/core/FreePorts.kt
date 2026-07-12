@@ -21,6 +21,15 @@ internal object FreePorts {
 
     fun release(port: Int) { issued.remove(port) }
 
+    /**
+     * Marks a host port as issued without going through [allocate]'s own-socket-bind dance —
+     * for ports this process didn't pick itself but must still treat as unavailable, e.g. an
+     * adopted reuse sandbox's already-bound ports (see `GenericContainer.tryAdopt`). Idempotent:
+     * marking an already-issued port is a no-op. Never released by this process — the port stays
+     * genuinely bound by the adopted sandbox for as long as it lives, which can outlast this JVM.
+     */
+    fun reserve(port: Int) { issued.add(port) }
+
     /** Test-only observability seam: a released port must not linger in the issued set. */
     internal fun issuedView(): Set<Int> = issued.toSet()
 }

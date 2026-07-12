@@ -2,6 +2,7 @@ package dev.rightsize.msb
 
 import dev.rightsize.RunId
 import dev.rightsize.core.*
+import dev.rightsize.core.reuse.SandboxNameCollisionException
 import java.io.InputStream
 import java.nio.file.Path
 import java.util.concurrent.ConcurrentHashMap
@@ -13,6 +14,9 @@ import java.util.concurrent.atomic.AtomicBoolean
 class MsbCliBackend(internal val msb: Path) : SandboxBackend {
     override val name = "microsandbox"
     override val supportsNativeNetworks = false   // networks emulated via exec-tunnels
+    // Each sandbox is its own microVM (hardware-isolated); no upstream snapshot/restore support
+    // yet, so checkpoint is false (see docs/checkpoints.md and BackendCapabilities' doc comment).
+    override val capabilities = BackendCapabilities(hardwareIsolated = true, checkpoint = false)
 
     internal class Handle(override val spec: ContainerSpec) : SandboxHandle {
         override val id = spec.name
@@ -43,6 +47,10 @@ class MsbCliBackend(internal val msb: Path) : SandboxBackend {
     private val windowsHost = Platform.current()?.isWindows == true
     init { Runtime.getRuntime().addShutdownHook(Thread { startedNames.forEach { silently(it) } }) }
 
+    /** Test-only view of the own-run-cleanup tracking set — asserts that [start] does (or, for
+     * `keepAlive`, does not) register a sandbox without exposing [startedNames] itself. */
+    internal fun trackedNames(): Set<String> = startedNames.toSet()
+
     override fun create(spec: ContainerSpec): SandboxHandle = Handle(spec)
 
     /**
@@ -57,11 +65,16 @@ class MsbCliBackend(internal val msb: Path) : SandboxBackend {
      * never reached Running, so [Handle.attached] and [startedNames] (both populated only
      * after [spawnAndAwaitRunning] returns) carry no state from it to double-register, and
      * its child has already been reaped by [bootOnce].
+     *
+     * A `keepAlive` sandbox (container reuse, see docs/reuse.md) is never added to
+     * [startedNames]: that set drives both the constructor shutdown hook and [close]'s
+     * own-run sweep, and a reuse sandbox must stay out of every own-run cleanup path this
+     * backend runs, not just the reaper's ledger.
      */
     override fun start(handle: SandboxHandle) {
         handle as Handle
         handle.attached = spawnAndAwaitRunning(handle)
-        startedNames += handle.id
+        if (!handle.spec.keepAlive) startedNames += handle.id
     }
 
     /**
@@ -178,6 +191,10 @@ class MsbCliBackend(internal val msb: Path) : SandboxBackend {
                     throw PortBindConflictException(
                         "msb run for sandbox ${handle.id} could not bind a host port: $output")
                 }
+                if (isNameCollision(output)) {
+                    throw SandboxNameCollisionException(
+                        "sandbox named ${handle.id} already exists: $output")
+                }
                 error("msb run for sandbox ${handle.id} exited (code ${proc.exitValue()}) before reaching " +
                     "Running — check the image entrypoint and `msb run` output below:\n$output")
             }
@@ -204,6 +221,31 @@ class MsbCliBackend(internal val msb: Path) : SandboxBackend {
         startedNames -= handle.id
     }
 
+    /** Reuses [silently] — the same best-effort stop-then-rm this backend has always run for
+     * its own leftovers (constructor shutdown hook, [close]), now also driving the reaper's
+     * init-time sweep for a *different*, dead process's ledger entries. */
+    override fun removeByName(name: String) = silently(name)
+
+    /**
+     * Reuse's adopt path (see docs/reuse.md): [name] is Running iff it's in [runningSandboxNames]
+     * — the same primitive [awaitRunning] itself polls. The returned handle's `spec` is a
+     * minimal reconstruction: an adopting process never knew the original creating spec, and
+     * nothing downstream of adopt (exec/logs/stop, which key off `Handle.id == spec.name`
+     * here) needs more than the name.
+     */
+    override fun findRunning(name: String): SandboxHandle? {
+        if (name !in runningSandboxNames()) return null
+        return Handle(ContainerSpec(name = name, image = "", runId = RunId.value, keepAlive = true))
+    }
+
+    /** `msb stop`/`msb rm` by full binary path — the same subcommands [stop]/[remove] invoke,
+     * argv-shaped for the reaper watchdog script (a plain OS process spawned before this JVM's
+     * first sandbox, with no [MsbCliBackend] instance of its own to call). */
+    override val watchdogCommands = WatchdogCommands(
+        sandboxStop = listOf(msb.toString(), "stop"),
+        sandboxRemove = listOf(msb.toString(), "rm"),
+    )
+
     /**
      * True if msb's own diagnostic output for an early-exited `msb run` names a host-port bind
      * conflict. msb has no structured error for this — only the process's combined stdout/stderr
@@ -214,6 +256,21 @@ class MsbCliBackend(internal val msb: Path) : SandboxBackend {
         val m = output.lowercase()
         return "address already in use" in m || "port is already allocated" in m ||
             "bind: address already in use" in m || ("already in use" in m && "port" in m)
+    }
+
+    /**
+     * True if [output] names a sandbox-name collision — reuse's fresh-create path retries this
+     * as an adopt (see [SandboxNameCollisionException]'s doc) instead of an ordinary failure.
+     * Unlike [isPortBindConflict]/[isImageCacheCorruption]/[isMsbStateDbError], this phrasing has
+     * not been observed against a real `msb run` collision (reuse names are minted from a content
+     * hash, so two processes racing the exact same name is a rare, not-yet-reproduced case) —
+     * kept deliberately conservative (only msb's own stable "already" vocabulary, matched the
+     * same way the other classifiers here are) so it never misclassifies an unrelated failure as
+     * a collision. Revisit against real `msb` output if/when this is exercised in practice.
+     */
+    private fun isNameCollision(output: String): Boolean {
+        val m = output.lowercase()
+        return "already exists" in m || ("already in use" in m && "name" in m)
     }
 
     /** Names with status Running from `msb ls --format json`; see [MsbLsJson] for the tolerant parse. */
@@ -411,19 +468,21 @@ class MsbCliBackend(internal val msb: Path) : SandboxBackend {
 
     override fun close() { startedNames.toList().forEach { silently(it) } }
 
-    /** Remove leftover rz-* sandboxes from crashed earlier runs (not this run's). */
-    fun sweepOrphans() {
-        val out = invoke(MsbCommands.ls(), LOGS_TIMEOUT_SEC).stdout
-        Regex("\\brz-[0-9a-f]{8}-\\d+\\b").findAll(out)
-            .map { it.value }.distinct()
-            .filterNot { it.startsWith("rz-${RunId.value}-") }
-            .forEach { silently(it) }
+    /** Best-effort stop+rm, retried once on msb's transient state-database error — the same
+     * classifier ([isMsbStateDbError]) and combined-stdout+stderr check the reaper watchdog's
+     * shell/PowerShell scripts run on their own stop+rm output (see docs/reaping.md). Without
+     * this, a [removeByName] call racing another process's msb state-db migration (the
+     * init-time sweep's own concurrent-run scenario) would silently drop the removal on its
+     * one and only attempt, leaking the sandbox untracked once the caller discards its ledger
+     * entry regardless of outcome. */
+    private fun silently(name: String) {
+        val stopOut = runCatching { invoke(MsbCommands.stop(name), STOP_TIMEOUT_SEC) }
+        val rmOut = runCatching { invoke(MsbCommands.rm(name), STOP_TIMEOUT_SEC) }
+        val combined = (stopOut.getOrNull()?.combinedOutput() ?: "") + (rmOut.getOrNull()?.combinedOutput() ?: "")
+        if (isMsbStateDbError(combined)) runCatching { invoke(MsbCommands.rm(name), STOP_TIMEOUT_SEC) }
     }
 
-    private fun silently(name: String) {
-        runCatching { invoke(MsbCommands.stop(name), STOP_TIMEOUT_SEC) }
-        runCatching { invoke(MsbCommands.rm(name), STOP_TIMEOUT_SEC) }
-    }
+    private fun ExecResult.combinedOutput() = stdout + stderr
 
     private fun invoke(args: List<String>, timeoutSec: Long): ExecResult {
         val proc = ProcessBuilder(listOf(msb.toString()) + args).start()

@@ -132,6 +132,27 @@ var with an unusual byte in it (check via `docker inspect <image>`) and override
 same way; there's no general-purpose sanitizer built into the backend yet, so this is
 handled per-image.
 
+## Sandboxes are left behind after a crashed or SIGKILLed process
+
+**Symptom:** `msb ls` (or `docker ps`) shows containers named `rz-<hex>-<n>` still running,
+with no rightsize process left that could stop them — usually after a test process was
+`SIGKILL`ed, OOM-killed, or a CI step crashed mid-run.
+
+**Cause:** Normal lifecycle (`stop()`, the `@Sandboxed` extension, the shutdown hook) only runs
+while the owning process is alive. A process that dies without running it leaves its sandboxes
+with nothing left to stop them.
+
+**Fix:** Already handled, on a short delay rather than instantly — rightsize's reaper reaps a
+crashed run in one of two ways: a per-run watchdog process reacts within seconds of the crash
+(unless `RIGHTSIZE_REAPER=sweep` or `off`), and failing that, the next rightsize process to
+start sweeps any dead run it finds in the shared cache dir before creating its own first
+sandbox. If you're seeing leftovers survive both — e.g. `RIGHTSIZE_REAPER=off` was set, or no
+further rightsize process has run since the crash — either unset `RIGHTSIZE_REAPER` (or set it
+to at least `sweep`) and run any rightsize process once, or clean up by hand with `msb rm`/
+`docker rm -f`. See [Orphan Reaping](reaping.md) for the full mechanism, including why a
+watchdog can't help against a remote docker daemon whose CI VM was torn down mid-run (the next
+process to talk to that daemon still sweeps it).
+
 ## Docker backend reports the daemon unreachable, but Docker is clearly running
 
 **Symptom:** `RIGHTSIZE_BACKEND=docker` (or auto-selection resolving to Docker) fails

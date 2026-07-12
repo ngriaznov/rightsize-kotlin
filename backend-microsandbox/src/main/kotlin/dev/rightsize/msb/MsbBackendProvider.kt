@@ -15,6 +15,8 @@ class MsbBackendProvider : BackendProvider {
                 "terminal, which may require a reboot), or use the docker backend"
         else -> "/dev/kvm is not accessible (need KVM, or run on Apple Silicon macOS)"
     }
-    override fun create(): SandboxBackend =
-        MsbCliBackend(MsbProvisioner.ensureInstalled()).also { it.sweepOrphans() }
+    // Orphan reaping is now the ledger-based sweep in dev.rightsize.core.reaper.Reaper,
+    // triggered once per process from Backends.active() right after this resolves — see
+    // docs/reaping.md. The old liveness-blind msb-ls-scan sweep this used to run here is gone.
+    override fun create(): SandboxBackend = MsbCliBackend(MsbProvisioner.ensureInstalled())
 }

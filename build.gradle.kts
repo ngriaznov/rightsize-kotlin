@@ -119,6 +119,12 @@ subprojects {
         classpath = testSourceSet.runtimeClasspath
         useJUnitPlatform { includeTags("sandbox-it") }
         outputs.upToDateWhen { false }
+        // Real double opt-in for the reuse contract tests: withReuse() alone must never be
+        // enough (see docs/reuse.md), so the env half has to come from somewhere real rather
+        // than a test-only seam — this is that somewhere for the one suite where reuse actually
+        // needs a live backend. Harmless to every other sandbox-it test, since none of them call
+        // withReuse().
+        environment("RIGHTSIZE_REUSE", "true")
         // Full exception detail in the console: these failures carry runtime diagnostics
         // (msb/daemon output tails) that are otherwise only in the HTML report, which CI
         // logs never show.

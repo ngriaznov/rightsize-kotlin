@@ -57,6 +57,12 @@ nav:
       - Networking: concepts/networking.md
       - Files & Memory: concepts/files-and-memory.md
   - Backends: backends.md
+  - Orphan Reaping: reaping.md
+  - Container Reuse: reuse.md
+  - Checkpoint / Restore: checkpoints.md
+  - Failure Diagnostics: diagnostics.md
+  - Isolation Requirement: isolation.md
+  - Cross-Language Parity: parity.md
   - Modules:
       - Overview: modules/index.md
       - Redis: modules/redis.md
@@ -79,6 +85,7 @@ nav:
       - Flink: modules/flink.md
   - Troubleshooting: troubleshooting.md
   - How It Works: how-it-works.md
+  - Roadmap: roadmap.md
 
 extra:
   social:

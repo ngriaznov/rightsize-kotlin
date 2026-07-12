@@ -139,8 +139,11 @@ names the exact precondition (see ᵇ) instead of a generic failure.
 elevated terminal (may require a reboot).
 
 Both backends satisfy one behavioral contract, verified by a shared test suite — the
-tests you write run unchanged on either. A few edges are backend-specific rather than
-behavioral divergences:
+tests you write run unchanged on either. That same contract holds across languages, too:
+rightsize's Kotlin, Rust, and Node libraries behave identically for the same container
+spec, verified by each repo's own contract suite — see [Cross-Language
+Parity](https://ngriaznov.github.io/rightsize-kotlin/parity/). A few edges are
+backend-specific rather than behavioral divergences:
 
 - **Network-alias tunnels on microsandbox have real limits** versus Docker's native
   bridge networking — see [Networking](#networking).
@@ -177,6 +180,25 @@ one connection at a time per tunnel (fine for config fetches; not for a cross-co
 Kafka consumer), and the consumer image needs `nc`/busybox. Violations fail fast with an
 actionable error.
 
+## Reliability & lifecycle
+
+- **Orphan reaping.** A crashed or `SIGKILL`ed process can't leak sandboxes — every process
+  writes a small ownership ledger, and an always-on init-time sweep plus an optional per-run
+  watchdog reap a dead run's leftovers, on both backends. Controlled by `RIGHTSIZE_REAPER`.
+- **Container reuse.** `withReuse()` plus the `RIGHTSIZE_REUSE` opt-in keeps a container
+  running across `stop()` and process exit; the next equivalent container — this process or
+  a later one — adopts it instead of booting fresh, identity decided by a cross-language
+  identity hash over the container's config.
+- **Failure diagnostics.** `Diagnostics.report()` — and the `@Sandboxed` extension
+  automatically on test failure — prints every currently-live container's state, mapped
+  ports, and last 50 log lines.
+- **Isolation requirement.** `withRequireIsolation()` fails `start()` immediately when the
+  active backend isn't hardware-isolated, instead of silently running untrusted code under
+  Docker's weaker guarantee.
+- **Checkpoint / restore (Docker).** `checkpoint()` captures a running container's filesystem
+  as a new image; `fromCheckpoint(cp)` boots an ordinary container from it — seed a fixture
+  once per suite, restore it once per test instead of re-running migrations every time.
+
 ## How it works
 
 - **Self-provisioning runtime.** A pinned `msb` release (binary + libkrunfw) is downloaded
@@ -200,6 +222,8 @@ actionable error.
 | `MSB_PATH` | Use a pre-installed `msb` binary; skip downloads |
 | `RIGHTSIZE_CACHE_DIR` | Relocate the runtime cache (default `~/.cache/rightsize`; `%LOCALAPPDATA%\rightsize` on Windows) |
 | `RIGHTSIZE_MSB_SKIP_DOWNLOAD` | `true` = fail instead of downloading (air-gapped CI) |
+| `RIGHTSIZE_REAPER` | `on` (default) / `sweep` / `off` — orphan reaping for a crashed process's leftover sandboxes |
+| `RIGHTSIZE_REUSE` | `true`/`1` — the environment half of container reuse's double opt-in (a `withReuse()` container still needs this) |
 
 ## Examples
 

@@ -1,8 +1,12 @@
 package dev.rightsize.junit
 
+import dev.rightsize.FakeBackend
 import dev.rightsize.GenericContainer
+import dev.rightsize.core.wait.WaitStrategy
+import dev.rightsize.core.wait.WaitTarget
 import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.extension.ExtensionContext
 import org.junit.platform.engine.discovery.DiscoverySelectors
 import org.junit.platform.launcher.core.LauncherFactory
 import org.junit.platform.launcher.core.LauncherDiscoveryRequestBuilder
@@ -31,6 +35,14 @@ class PreStartedContainer : GenericContainer<PreStartedContainer>("fake:latest")
 /** Base class carrying the @Container field for the superclass-field-walk test below. */
 open class BaseWithContainer {
     @Container val fromBase = RecordingContainer()
+}
+
+/** Immediately ready — lets a real [GenericContainer] (backed by [FakeBackend]) start without
+ * ever touching a network, so it exercises the real [GenericContainer.start]/[GenericContainer.stop]
+ * live-container-registry bookkeeping that a hand-faked [RecordingContainer] bypasses entirely. */
+private object InstantlyReady : WaitStrategy {
+    override fun waitUntilReady(target: WaitTarget) {}
+    override fun withStartupTimeout(timeout: java.time.Duration): WaitStrategy = this
 }
 
 class SandboxedExtensionTest {
@@ -72,6 +84,25 @@ class SandboxedExtensionTest {
         @Test fun one() { assertTrue(true) }
     }
 
+    // An INSTANCE @Container field (started in beforeEach, stopped in this extension's own
+    // afterEach) whose one test fails on demand — the primary use case for the diagnostics
+    // hook: the report testFailed emits must still describe this instance's own container, even
+    // though by the time testFailed runs (after afterEach) it has already been stopped.
+    // `shouldFail` defaults to false because Gradle's JUnit Platform test task independently
+    // discovers and runs every nested class with @Test methods on the classpath (same as the
+    // other Sample*/PreStarted* classes below) — unconditionally throwing here would fail that
+    // independent run too; only the controlling test below opts in.
+    @Sandboxed
+    class FailingSandboxedTest {
+        companion object {
+            val backend = FakeBackend()
+            @Volatile var shouldFail = false
+        }
+        @Container val marker: GenericContainer<*> =
+            GenericContainer("diag-marker:latest").withBackend(backend).waitingFor(InstantlyReady)
+        @Test fun boom() { if (shouldFail) throw RuntimeException("boom") }
+    }
+
     private fun runAndExpectNoFailures(testClass: Class<*>) {
         val listener = SummaryGeneratingListener()
         LauncherFactory.create().execute(
@@ -79,6 +110,15 @@ class SandboxedExtensionTest {
                 .selectors(DiscoverySelectors.selectClass(testClass)).build(),
             listener)
         assertEquals(0, listener.summary.totalFailureCount, listener.summary.failures.joinToString { it.exception.toString() })
+    }
+
+    private fun runAndExpectOneFailure(testClass: Class<*>) {
+        val listener = SummaryGeneratingListener()
+        LauncherFactory.create().execute(
+            LauncherDiscoveryRequestBuilder.request()
+                .selectors(DiscoverySelectors.selectClass(testClass)).build(),
+            listener)
+        assertEquals(1, listener.summary.totalFailureCount, "expected exactly one failing test")
     }
 
     @Test fun `static container started once, instance per test`() {
@@ -108,5 +148,59 @@ class SandboxedExtensionTest {
     @Test fun `non-GenericContainer Container field is filtered without a ClassCastException`() {
         // Discovery/start must not throw for a String field annotated @Container; the class runs clean.
         runAndExpectNoFailures(NonContainerFieldSandboxedTest::class.java)
+    }
+
+    private fun captureStderr(block: () -> Unit): String {
+        val captured = java.io.ByteArrayOutputStream()
+        val original = System.err
+        System.setErr(java.io.PrintStream(captured))
+        try { block() } finally { System.setErr(original) }
+        return captured.toString()
+    }
+
+    // testFailed(context, cause), called directly (outside the real JUnit lifecycle), only reads
+    // context.getStore(ns).get(...) for a diagnostics snapshot — this stub backs exactly that one
+    // Store.get(key) call with an always-empty store (so testFailed falls back to a live report)
+    // and errors on any other ExtensionContext/Store method, so an accidental new dependency on
+    // other context state fails loudly here instead of silently passing.
+    private fun contextWithEmptyDiagnosticsStore(): ExtensionContext {
+        val storeHandler = java.lang.reflect.InvocationHandler { _, method, _ ->
+            if (method.name == "get") null
+            else error("SandboxedExtension.testFailed must not call ExtensionContext.Store.${method.name}")
+        }
+        val store = java.lang.reflect.Proxy.newProxyInstance(
+            ExtensionContext.Store::class.java.classLoader, arrayOf(ExtensionContext.Store::class.java), storeHandler,
+        ) as ExtensionContext.Store
+        val ctxHandler = java.lang.reflect.InvocationHandler { _, method, _ ->
+            if (method.name == "getStore") store
+            else error("SandboxedExtension.testFailed must not call ExtensionContext.${method.name}")
+        }
+        return java.lang.reflect.Proxy.newProxyInstance(
+            ExtensionContext::class.java.classLoader, arrayOf(ExtensionContext::class.java), ctxHandler,
+        ) as ExtensionContext
+    }
+
+    @Test fun `testFailed prints the diagnostics report to stderr exactly once per failed test`() {
+        val output = captureStderr {
+            SandboxedExtension().testFailed(contextWithEmptyDiagnosticsStore(), RuntimeException("boom"))
+        }
+        val occurrences = Regex("== rightsize diagnostics:").findAll(output).count()
+        assertEquals(1, occurrences, "expected exactly one diagnostics report in stderr, got:\n$output")
+    }
+
+    @Test fun `the success path (no testFailed call) emits no diagnostics report`() {
+        val output = captureStderr { runAndExpectNoFailures(SampleSandboxedTest::class.java) }
+        assertFalse(output.contains("== rightsize diagnostics:"), "success path must not print a report: $output")
+    }
+
+    @Test fun `testFailed's report describes the failing test's own instance containers, started in beforeEach and already stopped by this extension's afterEach`() {
+        FailingSandboxedTest.shouldFail = true
+        try {
+            val output = captureStderr { runAndExpectOneFailure(FailingSandboxedTest::class.java) }
+            assertTrue(output.contains("diag-marker:latest"),
+                "expected the failing test's own @Container field in the diagnostics report, got:\n$output")
+        } finally {
+            FailingSandboxedTest.shouldFail = false
+        }
     }
 }

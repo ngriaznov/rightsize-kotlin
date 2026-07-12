@@ -5,6 +5,7 @@ import dev.rightsize.core.wait.WaitStrategy
 import dev.rightsize.core.wait.WaitTarget
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.Assertions.*
+import java.nio.file.Files
 import java.util.concurrent.atomic.AtomicInteger
 
 /** A wait strategy that is immediately ready — the fake backend runs nothing to connect to. */
@@ -109,6 +110,31 @@ class GenericContainerTest {
         joiner.start()
         val (_, links) = backend.installedLinks.single()
         assertEquals(listOf(NetworkLink("solo", 9999, solo.getMappedPort(9999))), links)
+    }
+
+    @Test fun `start records the network in the reaper ledger before asking the backend to create it`() {
+        // Named "docker" (not "fake") so the real `Reaper` singleton's ledger actually
+        // participates for this one test — see core/build.gradle.kts, which points
+        // RIGHTSIZE_CACHE_DIR at a build-local dir and RIGHTSIZE_REAPER at "sweep" (ledger
+        // writes without the watchdog's detached-process spawn) for exactly this purpose.
+        val backend = object : FakeBackend() {
+            override val name = "docker"
+            var networkWasLedgeredBeforeEnsureNetwork = false
+            override fun ensureNetwork(networkId: String) {
+                val networksFile = dev.rightsize.core.CacheDir.resolve().resolve("runs").resolve("${RunId.value}.networks")
+                networkWasLedgeredBeforeEnsureNetwork = Files.exists(networksFile) &&
+                    Files.readAllLines(networksFile).contains(networkId)
+                super.ensureNetwork(networkId)
+            }
+        }
+        val net = Network.newNetwork()
+        val c = container(backend).withExposedPorts(8080).withNetwork(net)
+        c.start()
+        assertTrue(backend.networkWasLedgeredBeforeEnsureNetwork,
+            "the network must be appended to the reaper's ledger before the backend is asked to " +
+                "create it — otherwise a crash in between leaks the network with no ledger entry " +
+                "to ever find it")
+        c.stop()
     }
 
     @Test fun `wait-strategy failure stops the container and releases its host ports`() {

@@ -1,5 +1,6 @@
 package dev.rightsize.core
 
+import dev.rightsize.core.reaper.Reaper
 import java.util.ServiceLoader
 
 object Backends {
@@ -12,7 +13,11 @@ object Backends {
                 System.getenv("RIGHTSIZE_BACKEND"),
             ).also {
                 cached = it
-                Runtime.getRuntime().addShutdownHook(Thread { it.close() })
+                // Init-time orphan-reaping sweep: once per process, right after a backend
+                // resolves — mirrors the shutdown-hook registration just below. See
+                // dev.rightsize.core.reaper.Reaper / docs/reaping.md.
+                Reaper.onBackendResolved(it)
+                Runtime.getRuntime().addShutdownHook(Thread { it.close(); Reaper.onProcessExit() })
             }
         }
 

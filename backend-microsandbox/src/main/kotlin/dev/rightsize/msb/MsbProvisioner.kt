@@ -1,5 +1,6 @@
 package dev.rightsize.msb
 
+import dev.rightsize.core.CacheDir
 import java.net.HttpURLConnection
 import java.net.URI
 import java.nio.channels.FileChannel
@@ -23,18 +24,12 @@ object MsbProvisioner {
      * machine-local, non-roaming data — so `%LOCALAPPDATA%` is the Windows-idiomatic home
      * for it, versus cluttering `%USERPROFILE%` with a Unix-style dotfile.
      * `RIGHTSIZE_CACHE_DIR` overrides this on every platform, checked first here so the
-     * override always wins regardless of [platform].
+     * override always wins regardless of [platform]. Delegates to [CacheDir] (core), which
+     * owns this resolution now that the reaper's ledger needs the same directory even in a
+     * docker-only process that never loads this module at all.
      */
-    internal fun defaultCacheDir(platform: Platform?, env: Map<String, String>): Path {
-        env["RIGHTSIZE_CACHE_DIR"]?.let { return Path.of(it) }
-        return if (platform?.isWindows == true) {
-            val localAppData = env["LOCALAPPDATA"]
-                ?: Path.of(System.getProperty("user.home"), "AppData", "Local").toString()
-            Path.of(localAppData, "rightsize")
-        } else {
-            Path.of(System.getProperty("user.home"), ".cache", "rightsize")
-        }
-    }
+    internal fun defaultCacheDir(platform: Platform?, env: Map<String, String>): Path =
+        CacheDir.resolve(env, isWindows = platform?.isWindows == true)
 
     internal fun ensureInstalled(baseUrl: String, cacheDir: Path, env: Map<String, String>): Path =
         ensureInstalled(baseUrl, cacheDir, env, Platform.current())

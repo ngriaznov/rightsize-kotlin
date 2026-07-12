@@ -2,6 +2,7 @@ package dev.rightsize.docker
 
 import com.github.dockerjava.api.DockerClient
 import com.github.dockerjava.api.async.ResultCallback
+import com.github.dockerjava.api.exception.ConflictException
 import com.github.dockerjava.api.exception.InternalServerErrorException
 import com.github.dockerjava.api.model.AccessMode
 import com.github.dockerjava.api.model.Bind
@@ -17,11 +18,14 @@ import com.github.dockerjava.core.DefaultDockerClientConfig
 import com.github.dockerjava.core.DockerClientImpl
 import com.github.dockerjava.zerodep.ZerodepDockerHttpClient
 import dev.rightsize.RunId
+import dev.rightsize.core.BackendCapabilities
 import dev.rightsize.core.ContainerSpec
 import dev.rightsize.core.ExecResult
 import dev.rightsize.core.PortBindConflictException
 import dev.rightsize.core.SandboxBackend
 import dev.rightsize.core.SandboxHandle
+import dev.rightsize.core.WatchdogCommands
+import dev.rightsize.core.reuse.SandboxNameCollisionException
 import java.io.ByteArrayOutputStream
 import java.time.Duration
 import java.util.concurrent.ConcurrentHashMap
@@ -34,11 +38,17 @@ import java.util.concurrent.ConcurrentHashMap
 class DockerBackend : SandboxBackend {
     override val name = "docker"
     override val supportsNativeNetworks = true
+    // Containers share the host kernel (not hardware-isolated); a stopped container can be
+    // committed to an image, so checkpoint-style capture is possible here — see
+    // GenericContainer.checkpoint() and BackendCapabilities' doc comment.
+    override val capabilities = BackendCapabilities(hardwareIsolated = false, checkpoint = true)
 
     private companion object {
         val CONNECT_TIMEOUT: Duration = Duration.ofSeconds(10)
         val RESPONSE_TIMEOUT: Duration = Duration.ofMinutes(10)
         const val STOP_TIMEOUT_SEC = 10
+        // Reuse container names are "rz-reuse-<12hex-of-hash>" — see docs/reuse.md.
+        const val REUSE_NAME_PREFIX = "rz-reuse-"
     }
 
     private val client: DockerClient by lazy {
@@ -52,6 +62,27 @@ class DockerBackend : SandboxBackend {
     }
 
     private class Handle(override val id: String, override val spec: ContainerSpec) : SandboxHandle
+
+    /**
+     * `dev.rightsize.runId` labels a normal, own-run container so [close]'s shutdown-time
+     * sweep (and, on the ledger's sweep path, the reaper) can find every container this
+     * process started. A `keepAlive` container (container reuse, see docs/reuse.md) must stay
+     * out of that own-run cleanup path entirely: it gets `dev.rightsize.reuse=<12hex>` instead
+     * of the run-id label, so [close]'s `dev.rightsize.runId` label filter structurally never
+     * matches it. The 12-hex value is the reuse-name suffix (`rz-reuse-<12hex>`) — a `keepAlive`
+     * spec whose name doesn't follow that shape is a caller bug this rejects rather than
+     * silently mislabeling.
+     */
+    internal fun labelsFor(spec: ContainerSpec): Map<String, String> =
+        if (spec.keepAlive) mapOf("dev.rightsize.reuse" to reuseHashOf(spec.name))
+        else mapOf("dev.rightsize.runId" to spec.runId)
+
+    private fun reuseHashOf(name: String): String {
+        require(name.startsWith(REUSE_NAME_PREFIX)) {
+            "keepAlive ContainerSpec.name must be '$REUSE_NAME_PREFIX<12hex>', got '$name'"
+        }
+        return name.removePrefix(REUSE_NAME_PREFIX)
+    }
 
     override fun create(spec: ContainerSpec): SandboxHandle {
         pullIfMissing(spec.image)
@@ -72,14 +103,38 @@ class DockerBackend : SandboxBackend {
             .withEnv(spec.env.map { (k, v) -> "$k=$v" })
             .withExposedPorts(spec.ports.map { ExposedPort.tcp(it.guestPort) })
             .withHostConfig(host)
-            .withLabels(mapOf("dev.rightsize.runId" to spec.runId))
+            .withLabels(labelsFor(spec))
         spec.command?.let { cmd.withCmd(it) }
-        val id = cmd.exec().id
+        val id = try {
+            cmd.exec().id
+        } catch (e: ConflictException) {
+            // The daemon's 409 for "a container already uses this name" — the shape reuse's
+            // fresh-create path retries as an adopt (see SandboxNameCollisionException's doc).
+            throw SandboxNameCollisionException("docker container name '${spec.name}' is already in use", e)
+        }
         spec.networkId?.let { netId ->
             client.connectToNetworkCmd().withContainerId(id).withNetworkId(ensureNetworkGetId(netId))
                 .withContainerNetwork(ContainerNetwork().withAliases(spec.aliases)).exec()
         }
         return Handle(id, spec)
+    }
+
+    /**
+     * Reuse's adopt path (see docs/reuse.md): resolves [name] to a live daemon id via a name
+     * filter (docker-java's default `listContainersCmd` already excludes stopped containers, so
+     * a hit here is necessarily running), narrowed to an exact name match — the filter itself is
+     * substring/regex, not equality, same caveat [removeByName] already documents. The returned
+     * handle's `spec` is a minimal reconstruction: the original creating spec is not recoverable
+     * from a bare name/id, and nothing downstream of adopt (exec/logs/stop) needs more than the
+     * daemon id this handle carries.
+     */
+    override fun findRunning(name: String): SandboxHandle? {
+        val c = runCatching {
+            client.listContainersCmd().withNameFilter(listOf(name)).exec()
+                .firstOrNull { it.names?.any { n -> n.trimStart('/') == name } == true }
+        }.getOrNull() ?: return null
+        val spec = ContainerSpec(name = name, image = c.image ?: "", runId = RunId.value, keepAlive = true)
+        return Handle(c.id, spec)
     }
 
     override fun start(handle: SandboxHandle) {
@@ -106,6 +161,49 @@ class DockerBackend : SandboxBackend {
 
     override fun remove(handle: SandboxHandle) {
         runCatching { client.removeContainerCmd(handle.id).withForce(true).exec() }
+    }
+
+    /**
+     * The reaper's init-time sweep only has a name (from another, dead process's ledger), not
+     * a live [SandboxHandle]/daemon id — resolve name to id via a name filter first, same as
+     * [close]'s own label-based leftover sweep does for its run. A name filter can match more
+     * than exactly [name] (docker's filter is a substring/regex match, not an equality check),
+     * so results are narrowed to an exact name match before removing anything.
+     */
+    override fun removeByName(name: String) {
+        runCatching {
+            client.listContainersCmd().withNameFilter(listOf(name)).withShowAll(true).exec()
+                .filter { c -> c.names?.any { it.trimStart('/') == name } == true }
+                .forEach { c -> runCatching { client.removeContainerCmd(c.id).withForce(true).exec() } }
+        }
+    }
+
+    /** `docker rm -f`/`docker network rm` — no separate stop step, since force-remove already
+     * covers a running container; argv-shaped for the reaper watchdog script (a plain OS
+     * process spawned before this JVM's first sandbox, with no [DockerBackend] of its own). */
+    override val watchdogCommands = WatchdogCommands(
+        sandboxRemove = listOf("docker", "rm", "-f"),
+        networkRemove = listOf("docker", "network", "rm"),
+    )
+
+    /**
+     * Backs `GenericContainer.checkpoint()` via the engine's commit endpoint (docker-java's
+     * `commitCmd`, `POST /commit?container=...&repo=...&tag=...`) — the container's current
+     * filesystem becomes a new, ordinary image the daemon otherwise treats no differently from
+     * a pulled one. [imageRef] is always `repo:tag` shaped (minted by `GenericContainer.checkpoint`
+     * as `rightsize/checkpoint:<12-hex>`); [repoAndTag] does the split.
+     */
+    override fun commitToImage(handle: SandboxHandle, imageRef: String) {
+        val (repo, tag) = repoAndTag(imageRef)
+        client.commitCmd(handle.id).withRepository(repo).withTag(tag).exec()
+    }
+
+    /** `internal`, not `private`: unit-tested directly in [DockerBackendTest] without a daemon —
+     * everything else about [commitToImage] needs a real one. */
+    internal fun repoAndTag(imageRef: String): Pair<String, String> {
+        val idx = imageRef.indexOf(':')
+        require(idx > 0) { "imageRef must be 'repo:tag', got '$imageRef'" }
+        return imageRef.substring(0, idx) to imageRef.substring(idx + 1)
     }
 
     override fun exec(handle: SandboxHandle, cmd: List<String>): ExecResult {
@@ -151,13 +249,29 @@ class DockerBackend : SandboxBackend {
         ensureNetworkGetId(networkId)
     }
 
-    private fun ensureNetworkGetId(networkId: String): String = networkIds.computeIfAbsent(networkId) {
+    /** `internal`, not `private`: [DockerBackendIT] uses this to get the daemon-assigned id
+     * directly, to prove [removeNetwork]'s cross-instance fallback actually removed the
+     * network at the daemon level (a fresh instance re-resolving the name afterward must get
+     * a brand-new id) rather than merely dropping it from one instance's [networkIds] cache. */
+    internal fun ensureNetworkGetId(networkId: String): String = networkIds.computeIfAbsent(networkId) {
         client.listNetworksCmd().withNameFilter(it).exec().firstOrNull()?.id
             ?: client.createNetworkCmd().withName(it).exec().id
     }
 
+    /**
+     * The reaper's init-time sweep calls this for a network from a *different*, dead process's
+     * ledger — [networkIds] only ever holds ids this same [DockerBackend] instance created via
+     * [ensureNetworkGetId], so a sweep-driven call here would silently no-op forever without a
+     * daemon-level fallback. Falls back to a name filter, narrowed to an exact name match (same
+     * defensive narrowing [removeByName] does for containers — docker's name filter is
+     * substring/regex, not equality) when the id isn't cached locally.
+     */
     override fun removeNetwork(networkId: String) {
-        networkIds.remove(networkId)?.let { runCatching { client.removeNetworkCmd(it).exec() } }
+        val id = networkIds.remove(networkId) ?: runCatching {
+            client.listNetworksCmd().withNameFilter(networkId).exec()
+                .firstOrNull { it.name == networkId }?.id
+        }.getOrNull()
+        id?.let { runCatching { client.removeNetworkCmd(it).exec() } }
     }
 
     private fun pullIfMissing(image: String) {

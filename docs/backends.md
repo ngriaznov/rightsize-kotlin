@@ -5,7 +5,8 @@ rightsize ships two implementations of a single `SandboxBackend` interface:
 (conventional containers, via `docker-java`). Both satisfy one behavioral contract,
 verified by a shared test suite that runs against each — code you write targets
 `GenericContainer` and never the backend directly, so the same test runs unchanged on
-either.
+either. That same contract also holds across languages — see [Cross-Language
+Parity](parity.md).
 
 ## Backend selection
 
@@ -35,6 +36,8 @@ is the whole story that matters from the outside.
 | `MSB_PATH` | Use a pre-installed `msb` binary; skips the download/provisioning step entirely. |
 | `RIGHTSIZE_CACHE_DIR` | Relocate the runtime cache (default `~/.cache/rightsize`; `%LOCALAPPDATA%\rightsize` on Windows, falling back to `%USERPROFILE%\AppData\Local\rightsize` if `LOCALAPPDATA` is unset). |
 | `RIGHTSIZE_MSB_SKIP_DOWNLOAD` | `true` = fail with guidance instead of downloading — for air-gapped CI; pair with `MSB_PATH` or a pre-seeded cache. |
+| `RIGHTSIZE_REAPER` | `on` (default) / `sweep` / `off` — controls orphan reaping (a crashed process's leftover sandboxes). See [Orphan Reaping](reaping.md). |
+| `RIGHTSIZE_REUSE` | Exact string `true` or `1` — the environment half of container reuse's double opt-in (a `withReuse()` container still needs this to actually reuse). See [Container Reuse](reuse.md). |
 | `DOCKER_HOST` | Standard docker-java variable. The Docker backend also honors the active docker CLI context (`~/.docker/config.json`) — set this if your daemon isn't at the default `/var/run/docker.sock` (Docker Desktop / Colima / OrbStack on a non-default socket, for instance). On Windows this is not optional: the Docker backend's `zerodep` transport speaks only unix sockets, so `RIGHTSIZE_BACKEND=docker` on native Windows needs a unix-socket-reachable daemon (e.g. the Docker Engine running inside WSL, with `DOCKER_HOST` pointed at its socket) — a Windows named pipe alone will not work. |
 
 ## `backend-microsandbox` deep-dive

@@ -2,6 +2,7 @@ package dev.rightsize
 
 import dev.rightsize.core.NetworkLink
 import dev.rightsize.core.SandboxBackend
+import dev.rightsize.core.reaper.Reaper
 import java.util.UUID
 
 /**
@@ -50,7 +51,9 @@ class Network private constructor(val id: String) : AutoCloseable {
     }
 
     /** Releases the network on whichever backend last used it. Safe to call even if never used. */
-    override fun close() { backendUsed?.let { b -> runCatching { b.removeNetwork(id) } } }
+    override fun close() {
+        backendUsed?.let { b -> if (runCatching { b.removeNetwork(id) }.isSuccess) Reaper.afterNetworkRemoved(id) }
+    }
 
     companion object {
         /** Creates a new, empty network with a random id. Attach containers before starting them. */

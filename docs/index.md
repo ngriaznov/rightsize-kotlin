@@ -56,6 +56,9 @@ on either backend. Backend-specific edges are covered in
   catalog with copy-paste test examples.
 - **Something not working?** Check [Troubleshooting](troubleshooting.md) first —
   it's built from real failures hit while building rightsize itself.
+- **Running rightsize in more than one language?** See [Cross-Language
+  Parity](parity.md) — the same container spec behaves the same way in rightsize's
+  Kotlin, Rust, and Node libraries.
 
 ## Status
 

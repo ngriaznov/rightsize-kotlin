@@ -7,6 +7,86 @@ reaches its first tagged release.
 
 ## [Unreleased]
 
+### Added
+
+- **Orphan reaping.** A crashed or `SIGKILL`ed process (no clean `stop()`, no shutdown hook)
+  used to leak its sandboxes; now every process writes a small ownership ledger
+  (`runs/<run-id>.{json,sandboxes,networks}`) under the rightsize cache dir before its first
+  sandbox, and two layers reap a dead run's leftovers: an always-on init-time sweep (runs once
+  per process, right after a backend resolves) and an optional per-run watchdog process that
+  reacts within seconds of the crash instead of waiting for the next run. Controlled by the new
+  `RIGHTSIZE_REAPER` variable (`on` default / `sweep` / `off`). See [Orphan
+  Reaping](https://ngriaznov.github.io/rightsize-kotlin/reaping/) for the full mechanism.
+- **`SandboxBackend.removeByName`**, a new SPI method reaping uses to remove a sandbox known
+  only by name (not a live handle) — both backends implement it; the docker backend gets a
+  cross-run orphan sweep for the first time (previously msb-only).
+- **`ContainerSpec.keepAlive`**, a new field marking a sandbox as a reuse container. Every
+  own-run cleanup path a backend runs consults it: msb never adds a `keepAlive` sandbox to its
+  `startedNames` set (so neither the constructor shutdown hook nor `close()` reaps it), and
+  docker labels a `keepAlive` container `dev.rightsize.reuse=<12hex>` instead of the run-id
+  label at create time (so `close()`'s run-id label filter never matches it). The reaping
+  ledger already excluded it.
+- **Container reuse.** `GenericContainer.withReuse()` marks a container to survive `stop()`
+  and process exit instead of being torn down — the next equivalent container (this process
+  or a later one) adopts the still-running sandbox instead of booting fresh. Gated by a double
+  opt-in: `withReuse()` alone does nothing unless `RIGHTSIZE_REUSE=true`/`1` is also set, so a
+  fixture written with `withReuse()` never silently leaks a sandbox in an environment that
+  didn't opt in. Identity is a SHA-256 over a canonical, cross-language-stable rendering of the
+  container's image/env/command/exposed ports/memory limit/mounted file contents, named
+  `rz-reuse-<12hex>` and tracked in a `<cache-dir>/reuse/<hash>.json` registry. Reuse and a
+  custom `withNetwork()` are mutually exclusive (a typed error at `start()`) — reuse identity
+  doesn't cover cross-container topology. See [Container
+  Reuse](https://ngriaznov.github.io/rightsize-kotlin/reuse/) for the full mechanism.
+- **`SandboxBackend.findRunning`**, a new SPI method reuse's adopt path uses to verify a
+  registry-recorded sandbox is actually running before trusting it, given only its name.
+- **Failure diagnostics.** `Diagnostics.report()` describes every currently-live container —
+  name, image, state, host, mapped ports, and its last 50 log lines — as a plain string; a
+  failing `logs` call degrades to `logs: unavailable (<reason>)` instead of throwing. The
+  `@Sandboxed` extension now prints the report to `System.err` automatically, exactly once per
+  failed test. See [Failure
+  Diagnostics](https://ngriaznov.github.io/rightsize-kotlin/diagnostics/).
+- **Isolation requirement.** `SandboxBackend.capabilities` exposes `hardwareIsolated` per
+  backend (microsandbox: `true`, each sandbox its own microVM; docker: `false`, shared host
+  kernel). `GenericContainer.withRequireIsolation()` makes `start()` throw
+  `IsolationRequiredException` — before any create/network work, so no sandbox is created — when
+  the active backend doesn't provide it. See [Isolation
+  Requirement](https://ngriaznov.github.io/rightsize-kotlin/isolation/).
+- **Checkpoint / restore.** `GenericContainer.checkpoint()` captures a running container's
+  filesystem as a new image (`rightsize/checkpoint:<12-hex>`, random per call) via the new
+  `SandboxBackend.commitToImage` SPI method; `GenericContainer.fromCheckpoint(cp)` boots a
+  normal container from it, its env/command/exposed ports/memory limit defaulted from the
+  checkpoint's spec and overridable with the usual `withX` builders. A restored container is
+  ordinary in every respect — fresh host ports, normal reaping ledger entry, normal `stop()`.
+  Implemented on the docker backend via the engine's commit endpoint
+  (`capabilities.checkpoint = true`); microsandbox has no upstream snapshot primitive yet
+  (`capabilities.checkpoint = false`) — `checkpoint()` throws `CheckpointUnsupportedException`
+  before any backend call. This is a filesystem capture, not a memory snapshot: a restored
+  container's processes restart from scratch. See [Checkpoint /
+  Restore](https://ngriaznov.github.io/rightsize-kotlin/checkpoints/).
+- **Cross-language parity, published.** The claim behind the five features above — that the
+  same container spec produces the same observable behavior in rightsize's Kotlin, Rust, and
+  Node libraries, on both backends — is now a documented artifact with a full behavior-area
+  table (lifecycle, port mapping, env/command, copy-in, exec, logs/follow, wait strategies,
+  networks/aliases, boot-failure retries, reaping, reuse identity, capabilities, isolation and
+  checkpoint gating, diagnostics format) and a pinned cross-language identity-hash vector. See
+  [Cross-Language Parity](https://ngriaznov.github.io/rightsize-kotlin/parity/).
+
+### Changed
+
+- **The old msb-only orphan sweep is gone.** `MsbBackendProvider.create()` used to scan `msb ls`
+  once per process and best-effort-remove any `rz-*` name not belonging to the current run —
+  liveness-blind (it could remove a sandbox from a *concurrent*, still-running process), msb-only,
+  and only ever caught leftovers already visible in `msb ls` at process start. The new
+  ledger-based sweep above replaces it, judges liveness properly (PID + start-time match), and
+  works identically on both backends.
+
+### Fixed
+
+- **Reuse's fresh-create path retries on a host-port bind conflict**, same as the ordinary
+  create path (`PORT_BIND_ATTEMPTS = 5`). It previously gave up after a single attempt, so a
+  reuse container could fail to start on the same transient host-port race an ordinary
+  container already retries through.
+
 ## [0.1.2] - 2026-07-09
 
 ### Changed
