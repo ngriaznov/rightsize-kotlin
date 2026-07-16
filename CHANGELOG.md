@@ -7,6 +7,10 @@ reaches its first tagged release.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.3.0] - 2026-07-16
+
 ### Added
 
 - **Runtime file copy.** `GenericContainer.copyFileToContainer`/`copyContentToContainer`/
@@ -302,7 +306,8 @@ Initial public release.
   exactly once; any other failure, or a second failure after the heal,
   propagates unchanged.
 
-[Unreleased]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.1.0...v0.1.1
