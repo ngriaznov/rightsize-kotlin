@@ -32,6 +32,8 @@ just let the JUnit extension do it) to tear it down.
 | `logs: String` | Full captured logs so far |
 | `followOutput(consumer: (String) -> Unit): AutoCloseable` | Streams new log lines as they arrive; close the returned handle to stop delivery |
 | `execInContainer(vararg cmd: String): ExecResult` | Runs a command inside the running container; returns `exitCode`/`stdout`/`stderr` as **properties**, not Java-style getters |
+| `copyFileToContainer`/`copyContentToContainer`/`copyFileFromContainer` | Copies a file, directory, or in-memory content into or out of the running container — see [Copying Files](../copy.md) |
+| `checkpoint(name: String? = null): Checkpoint` | Captures the running container's filesystem for `GenericContainer.fromCheckpoint` to restore later — see [Checkpoint / Restore](../checkpoints.md) |
 
 `getMappedPort` fails with a message telling you exactly what to check — whether you
 forgot `start()`, forgot `withExposedPorts(...)` for that port, or the container

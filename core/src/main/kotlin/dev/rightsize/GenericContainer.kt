@@ -1,13 +1,17 @@
 package dev.rightsize
 
 import dev.rightsize.core.*
+import dev.rightsize.core.checkpoint.*
 import dev.rightsize.core.diagnostics.LiveContainers
 import dev.rightsize.core.reaper.Reaper
 import dev.rightsize.core.reaper.canonicalBackendId
 import dev.rightsize.core.reuse.*
 import dev.rightsize.core.wait.*
 import java.lang.Long.toHexString
+import java.nio.file.FileSystems
+import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.attribute.PosixFilePermissions
 import java.security.SecureRandom
 import java.time.Instant
 import java.util.concurrent.atomic.AtomicInteger
@@ -46,7 +50,17 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
     private var reuseRequested = false
     private var reuseEnvOverride: Map<String, String>? = null
     private var reuseCacheDirOverride: Path? = null
+    private var checkpointCacheDirOverride: Path? = null
     private var requireIsolationRequested = false
+    // Both set together by fromCheckpoint; null on every ordinary container. See
+    // withCheckpointRef's doc for what each drives.
+    private var checkpointRef: String? = null
+    private var checkpointCreatorBackend: String? = null
+    // The links installed by linkToRunningSiblings at start() — empty when this container never
+    // joined a Network or joined one with no running siblings yet. checkpoint() replays these
+    // after a workload-restarting backend's cycle, since the reboot tears the emulated tunnels
+    // down (see checkpoint's doc).
+    private var startNetworkLinks: List<NetworkLink> = emptyList()
 
     private var handle: SandboxHandle? = null
     private var mappedPorts: Map<Int, Int> = emptyMap()
@@ -100,12 +114,23 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
      */
     fun withRequireIsolation(): SELF { requireIsolationRequested = true; return this as SELF }
     internal fun withBackend(b: SandboxBackend): SELF { backendOverride = b; return this as SELF }
+    /** Internal factory seam: `fromCheckpoint` sets [checkpointRef] (msb boots via
+     * `msb run --snapshot <ref>` instead of its normal image path — see `MsbCommands.run`) and
+     * [checkpointCreatorBackend] (checked at [start], before any backend call — see
+     * [CheckpointBackendMismatchException]). Not a public `withX` builder: restoring from a
+     * checkpoint is only ever reached through [fromCheckpoint] itself. */
+    internal fun withCheckpointRef(ref: String, creatorBackend: String): SELF {
+        checkpointRef = ref; checkpointCreatorBackend = creatorBackend; return this as SELF
+    }
     /** Internal test seam: injects the environment [withReuse]'s env half is read from, instead
      * of the real `System.getenv()`. */
     internal fun withReuseEnvOverride(env: Map<String, String>): SELF { reuseEnvOverride = env; return this as SELF }
     /** Internal test seam: injects the reuse registry's root directory instead of the real
      * rightsize cache dir, so reuse tests never touch a developer's `~/.cache/rightsize`. */
     internal fun withReuseCacheDir(dir: Path): SELF { reuseCacheDirOverride = dir; return this as SELF }
+    /** Internal test seam: injects the named-checkpoint registry's root directory instead of the
+     * real rightsize cache dir — the same seam [withReuseCacheDir] provides for reuse. */
+    internal fun withCheckpointCacheDir(dir: Path): SELF { checkpointCacheDirOverride = dir; return this as SELF }
 
     /** True from a successful [start] until [stop]; false before the first [start] and after. */
     open val isRunning: Boolean get() = handle != null
@@ -132,31 +157,164 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
     fun followOutput(consumer: (String) -> Unit): AutoCloseable = backend.followLogs(requireHandle(), consumer)
 
     /**
-     * Captures this RUNNING container's current filesystem as a new image
-     * (`rightsize/checkpoint:<12-hex>`, random per call) via the active backend's
-     * `commitToImage` — a filesystem snapshot, not a memory snapshot: [fromCheckpoint] boots a
-     * fresh container whose filesystem starts where this one left off, but its processes
-     * restart from scratch (see docs/checkpoints.md). Gated on `capabilities.checkpoint` BEFORE
-     * any backend call — an unsupported backend (microsandbox today) throws
-     * [CheckpointUnsupportedException] and the backend is never reached. Requires this
-     * container to be running; a never-started or already-stopped one throws
-     * [IllegalStateException].
+     * Copies [hostPath] (a file or directory) into this RUNNING container at [containerPath] —
+     * a Testcontainers-style runtime operation against an already-started container, distinct
+     * from [withCopyFileToContainer]'s start-time mount (see docs/copy.md for when to use
+     * which). The destination's parent directory is created in the guest first (`mkdir -p`, via
+     * the existing [execInContainer] SPI), so callers never pre-create it; directory-vs-file
+     * source and "copy into a nonexistent destination" naming follow `docker cp`/`msb copy`'s
+     * own `cp -r`-style semantics. Requires this container to be running (see [requireHandle])
+     * and [containerPath] to be absolute (see [NonAbsoluteContainerPathException]) — both
+     * checked before any backend call. A failed backend copy throws [ContainerCopyException]
+     * carrying the underlying tool's stderr.
      */
-    fun checkpoint(): Checkpoint {
+    fun copyFileToContainer(hostPath: Path, containerPath: String) {
+        val h = requireHandle()
+        requireAbsoluteContainerPath(containerPath)
+        backend.exec(h, listOf("mkdir", "-p", parentOf(containerPath)))
+        backend.copyToContainer(h, hostPath, containerPath)
+    }
+
+    /**
+     * [copyFileToContainer] convenience for in-memory [content]: writes the bytes to a temp file
+     * (mode `0600` where the host filesystem supports POSIX permissions) and delegates, removing
+     * the temp file afterward whether the copy succeeded or not. No streaming protocol — this is
+     * a plain write-then-copy.
+     */
+    fun copyContentToContainer(content: ByteArray, containerPath: String) {
+        requireHandle()   // fail fast before touching the filesystem for a not-running container
+        val tmp = createSecureTempFile()
+        try {
+            Files.write(tmp, content)
+            copyFileToContainer(tmp, containerPath)
+        } finally {
+            Files.deleteIfExists(tmp)
+        }
+    }
+
+    /** [String] convenience over the [ByteArray] overload of [copyContentToContainer], UTF-8 encoded. */
+    fun copyContentToContainer(content: String, containerPath: String) =
+        copyContentToContainer(content.toByteArray(Charsets.UTF_8), containerPath)
+
+    /**
+     * Copies [containerPath] (a file or directory) out of this RUNNING container to [hostPath] —
+     * the reverse of [copyFileToContainer]. Creates [hostPath]'s parent directory on the host
+     * first (via the language's stdlib), so callers never pre-create it. Requires this container
+     * to be running and [containerPath] to be absolute — both checked before any backend call.
+     */
+    fun copyFileFromContainer(containerPath: String, hostPath: Path) {
+        val h = requireHandle()
+        requireAbsoluteContainerPath(containerPath)
+        hostPath.parent?.let { Files.createDirectories(it) }
+        backend.copyFromContainer(h, containerPath, hostPath)
+    }
+
+    private fun requireAbsoluteContainerPath(containerPath: String) {
+        if (!containerPath.startsWith("/")) throw NonAbsoluteContainerPathException(containerPath)
+    }
+
+    /** The guest directory a copy-in destination's parent must exist in before the transfer —
+     * `/a/b/c` -> `/a/b`; anything with no non-root parent (`/file`, `/`) -> `/` (always present,
+     * so the `mkdir -p` step is a harmless no-op there). */
+    private fun parentOf(containerPath: String): String {
+        val idx = containerPath.lastIndexOf('/')
+        return if (idx <= 0) "/" else containerPath.substring(0, idx)
+    }
+
+    /**
+     * Captures this RUNNING container's current filesystem as a checkpoint via the active
+     * backend's `createCheckpoint` — a filesystem snapshot, not a memory snapshot: [fromCheckpoint]
+     * boots a fresh container whose filesystem starts where this one left off, but its processes
+     * restart from scratch (see docs/checkpoints.md). [Checkpoint.ref] is backend-shaped (a
+     * docker image tag or an msb snapshot name); with [name] omitted (the default) it's random
+     * per call and purely in-process — nothing is written anywhere, exactly today's behavior.
+     *
+     * Passing [name] instead makes the checkpoint DURABLE and rediscoverable in any later
+     * process, without ever holding onto the returned [Checkpoint] — see docs/checkpoints.md's
+     * "Reusing checkpoints across runs" section. The ref is derived from [name]
+     * (`rightsize/checkpoint:<name>` / `rz-ckpt-<name>`, replacing the random hex a nameless call
+     * would use), and a registry entry ([dev.rightsize.core.checkpoint.CheckpointRegistry],
+     * under the rightsize cache dir) is written ONLY after the backend checkpoint below has
+     * already succeeded — a failed capture never leaves a stale entry behind. [name] must match
+     * `^[a-z0-9][a-z0-9-]{0,40}$`, checked before any backend call (before even the capability
+     * gate reads the active backend's name — see [dev.rightsize.core.checkpoint.InvalidCheckpointNameException]).
+     * Re-checkpointing an existing [name] REPLACES it: the old artifact is best-effort removed
+     * (see [replaceExistingNamedCheckpoint], gated the same way `Checkpoint.find`/`Checkpoint.remove`
+     * are — skipped when the old entry's backend differs from the active one) BEFORE the new one
+     * is captured, and the registry entry is rewritten only once that new capture succeeds —
+     * latest wins. Once written, a named checkpoint is looked up via `Checkpoint.find`/`list`/
+     * `remove`, not this method.
+     *
+     * [Checkpoint.backend] records which backend created it either way, since restoring under a
+     * different one is meaningless (see [CheckpointBackendMismatchException]). Gated on
+     * `capabilities.checkpoint` BEFORE any backend call — an unsupported backend throws
+     * [CheckpointUnsupportedException] and the backend is never reached. Requires this container
+     * to be running; a never-started or already-stopped one throws [IllegalStateException].
+     *
+     * A backend whose `capabilities.checkpointRestartsWorkload` is true (microsandbox: its
+     * disk-snapshot cycle stops, snapshots, then resumes the sandbox, restarting the workload)
+     * gets this container's emulated network links (if any were installed at start) re-installed,
+     * then its own wait strategy re-run, before returning — the reboot kills the exec-tunneled
+     * links same as it kills the workload, and a bare return would also hand back a false-ready
+     * container (e.g. msb's loopback forwarder accepts TCP before the guest listens). Docker's
+     * checkpoint leaves the container undisturbed, so neither re-install nor re-wait happens there.
+     */
+    fun checkpoint(name: String? = null): Checkpoint {
+        if (name != null) validateCheckpointName(name)
         if (!backend.capabilities.checkpoint) throw CheckpointUnsupportedException(backend.name)
         val h = requireHandle()
-        val imageRef = "rightsize/checkpoint:${randomImageTag()}"
-        backend.commitToImage(h, imageRef)
-        return Checkpoint(
-            imageRef = imageRef,
-            spec = CheckpointSpec(
-                env = env.toMap(),
-                command = command,
-                exposedPorts = exposedPorts.toList(),
-                memoryLimitMb = memoryLimitMb,
-            ),
+        if (name != null) replaceExistingNamedCheckpoint(name)
+        val ref = if (name != null) mintCheckpointRef(name) else mintCheckpointRef()
+        backend.createCheckpoint(h, ref)
+        if (backend.capabilities.checkpointRestartsWorkload) {
+            if (startNetworkLinks.isNotEmpty()) backend.installNetworkLinks(h, startNetworkLinks)
+            waitStrategy.waitUntilReady(waitTarget())
+        }
+        val spec = CheckpointSpec(
+            env = env.toMap(),
+            command = command,
+            exposedPorts = exposedPorts.toList(),
+            memoryLimitMb = memoryLimitMb,
         )
+        if (name != null) writeNamedCheckpointRecord(name, ref, spec)
+        return Checkpoint(ref = ref, backend = backend.name, spec = spec)
     }
+
+    /** Replace semantics for [checkpoint]'s named path: best-effort removes the OLD backend
+     * artifact (via [SandboxBackend.removeCheckpoint], itself best-effort/idempotent on both real
+     * backends) before the new one is captured — but only when the old entry's `backend` matches
+     * the active one, the same same-backend gate `Checkpoint.find`/`Checkpoint.remove` apply,
+     * since the active backend has no business operating on a ref format it didn't create. When
+     * they differ, this is a no-op and proceeds straight to the new capture, leaving the old
+     * artifact behind under its original backend (see docs/checkpoints.md's cross-run section).
+     * No registry write happens here — [checkpoint] rewrites the entry itself, only after the new
+     * capture succeeds, so a crash between this call and that one leaves the registry pointing at
+     * nothing rather than at a removed ref. */
+    private fun replaceExistingNamedCheckpoint(name: String) {
+        CheckpointRegistry(checkpointCacheDir()).read(name)?.let { old ->
+            if (old.backend.equals(backend.name, ignoreCase = true)) {
+                runCatching { backend.removeCheckpoint(old.ref) }
+            }
+        }
+    }
+
+    private fun writeNamedCheckpointRecord(name: String, ref: String, spec: CheckpointSpec) {
+        CheckpointRegistry(checkpointCacheDir()).write(
+            name, CheckpointRecord(name, ref, backend.name, Instant.now().toString(), spec))
+    }
+
+    private fun checkpointCacheDir(): Path = checkpointCacheDirOverride ?: CacheDir.resolve()
+
+    /** `rightsize/checkpoint:<12-hex>` for a docker-shaped ref, `rz-ckpt-<12-hex>` for an
+     * msb-shaped one — [Checkpoint.ref]'s shape is decided by the ACTIVE backend at capture
+     * time, since a docker image tag and an msb snapshot name are meaningless to the other
+     * backend (see [CheckpointBackendMismatchException]). */
+    private fun mintCheckpointRef(): String = mintCheckpointRef(randomCheckpointHex())
+
+    /** Named-checkpoint overload of [mintCheckpointRef]: same backend-shaped prefix, [suffix]
+     * (the checkpoint name) in place of the random hex a nameless call mints. */
+    private fun mintCheckpointRef(suffix: String): String =
+        if (canonicalBackendId(backend.name) == "msb") "rz-ckpt-$suffix" else "rightsize/checkpoint:$suffix"
 
     protected open fun customizeSpec(spec: ContainerSpec, mapped: (Int) -> Int): ContainerSpec = spec
     protected open fun containerIsStarted() {}
@@ -177,6 +335,14 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
         // have created fresh or adopted a running reuse sandbox.
         if (requireIsolationRequested && !backend.capabilities.hardwareIsolated) {
             throw IsolationRequiredException(backend.name)
+        }
+        // Same placement as the isolation check above: a checkpoint ref from one backend is
+        // meaningless to another (an msb snapshot name isn't a docker image tag, or vice versa),
+        // so this must fail before any create/network work too.
+        checkpointCreatorBackend?.let { creator ->
+            if (!backend.name.equals(creator, ignoreCase = true)) {
+                throw CheckpointBackendMismatchException(creator, backend.name)
+            }
         }
         if (reuseRequested) {
             if (reuseEnvEnabled()) { startReuse(); return }
@@ -206,9 +372,15 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
         LiveContainers.register(h, backend, host)
     }
 
-    /** Links to siblings already running when we start; a failure here still tears us down. */
+    /** Links to siblings already running when we start; a failure here still tears us down.
+     * Stashes the computed links in [startNetworkLinks] so [checkpoint] can replay them after a
+     * workload-restarting backend's cycle. */
     private fun linkToRunningSiblings(handle: SandboxHandle, net: Network?) {
-        net?.let { backend.installNetworkLinks(handle, it.linksForNewMember()) }
+        net?.let {
+            val links = it.linksForNewMember()
+            startNetworkLinks = links
+            backend.installNetworkLinks(handle, links)
+        }
     }
 
     /** Allocates one free host port per exposed guest port, replacing any previous mapping. */
@@ -242,6 +414,7 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
                 aliases = aliases.toList(),
                 runId = RunId.value,
                 memoryLimitMb = memoryLimitMb,
+                checkpointRef = checkpointRef,
             )
             spec = customizeSpec(spec) { guest -> mappedPorts.getValue(guest) }
             Reaper.beforeCreate(backend, spec)
@@ -324,6 +497,10 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
             "Reuse (withReuse()) cannot be combined with a custom network (withNetwork()) on " +
                 "${describe()} — reuse identity covers only this container's own configuration, never " +
                 "cross-container network topology. Drop withNetwork() or withReuse().")
+        if (checkpointRef != null) throw ReuseFromCheckpointConflictException(
+            "Reuse (withReuse()) cannot be combined with a restored checkpoint container " +
+                "(GenericContainer.fromCheckpoint(...)) on ${describe()} — reuse identity never covers " +
+                "a checkpoint ref. Drop withReuse(), or restore the checkpoint without it.")
         val hash = ReuseIdentity.hash(buildIdentitySpec())
         val name = ReuseIdentity.name(hash)
         val registry = ReuseRegistry(reuseCacheDir())
@@ -499,23 +676,25 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
         operator fun invoke(image: String): GenericContainer<*> = Anonymous(image)
 
         /** 12 lowercase hex chars from 6 cryptographically random bytes — the random suffix of
-         * a `rightsize/checkpoint:<12-hex>` image tag (see [checkpoint]). */
-        private fun randomImageTag(): String {
+         * a checkpoint ref, docker- or msb-shaped (see [mintCheckpointRef]). */
+        private fun randomCheckpointHex(): String {
             val bytes = ByteArray(6)
             checkpointRandom.nextBytes(bytes)
             return bytes.joinToString("") { "%02x".format(it) }
         }
 
         /**
-         * Builds a normal container from [checkpoint]'s image and the source container's spec
+         * Builds a normal container from [checkpoint]'s ref and the source container's spec
          * defaults (env, command, exposed ports, memory limit) — the usual `withX` builders
          * still apply afterward, so a caller can override any of these (e.g. a different wait
          * strategy) before calling `start()`. The result is an ordinary container in every
          * respect: fresh host ports, normal reaping ledger entry, normal stop. Nothing about it
-         * is "special" once started. See docs/checkpoints.md.
+         * is "special" once started, except that [dev.rightsize.core.SandboxBackend.name] must
+         * match [Checkpoint.backend] at `start()` (see [CheckpointBackendMismatchException]).
+         * See docs/checkpoints.md.
          */
         fun fromCheckpoint(checkpoint: Checkpoint): GenericContainer<*> {
-            val c = invoke(checkpoint.imageRef)
+            val c = invoke(checkpoint.ref).withCheckpointRef(checkpoint.ref, checkpoint.backend)
             checkpoint.spec.env.forEach { (k, v) -> c.withEnv(k, v) }
             checkpoint.spec.command?.let { c.withCommand(*it.toTypedArray()) }
             if (checkpoint.spec.exposedPorts.isNotEmpty()) {
@@ -524,5 +703,19 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
             checkpoint.spec.memoryLimitMb?.let { c.withMemoryLimit(it) }
             return c
         }
+
+        /**
+         * A temp file for [copyContentToContainer]'s write-then-copy, mode `0600` where the host
+         * filesystem supports POSIX permissions (every backend's guest is Linux, but the host
+         * running the test/build process may not be — Windows has no POSIX permission concept,
+         * so this falls back to the platform default there rather than throwing).
+         */
+        private fun createSecureTempFile(): Path =
+            if (FileSystems.getDefault().supportedFileAttributeViews().contains("posix")) {
+                Files.createTempFile("rightsize-copy-", ".tmp",
+                    PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rw-------")))
+            } else {
+                Files.createTempFile("rightsize-copy-", ".tmp")
+            }
     }
 }

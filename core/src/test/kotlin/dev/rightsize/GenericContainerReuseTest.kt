@@ -4,6 +4,7 @@ import dev.rightsize.core.*
 import dev.rightsize.core.diagnostics.LiveContainers
 import dev.rightsize.core.reuse.ReuseIdentity
 import dev.rightsize.core.reuse.ReuseIdentitySpec
+import dev.rightsize.core.reuse.ReuseFromCheckpointConflictException
 import dev.rightsize.core.reuse.ReuseNetworkConflictException
 import dev.rightsize.core.reuse.ReuseRecord
 import dev.rightsize.core.reuse.ReuseRegistry
@@ -365,6 +366,19 @@ class GenericContainerReuseTest {
         val net = Network.newNetwork()
         val c = reuseContainer(backend, tmp).withNetwork(net)
         assertThrows(ReuseNetworkConflictException::class.java) { c.start() }
+    }
+
+    // checkpointRef is deliberately excluded from reuse identity (see ReuseIdentitySpec's doc) —
+    // the two features are not a supported combination, same shape as the network conflict above.
+    @Test fun `reuse plus a restored checkpoint container is a typed error`(@TempDir tmp: Path) {
+        val backend = ReuseFakeBackend()
+        val cp = Checkpoint(
+            ref = "rightsize/checkpoint:0123456789ab", backend = "fake",
+            spec = CheckpointSpec(env = emptyMap(), command = null, exposedPorts = emptyList(), memoryLimitMb = null),
+        )
+        val c = GenericContainer.fromCheckpoint(cp).withBackend(backend).waitingFor(ReuseReady)
+            .withReuse().withReuseCacheDir(tmp).withReuseEnvOverride(mapOf("RIGHTSIZE_REUSE" to "true"))
+        assertThrows(ReuseFromCheckpointConflictException::class.java) { c.start() }
     }
 
     // --- Port-bind conflict on the fresh-create path ---

@@ -57,6 +57,7 @@ nav:
       - Networking: concepts/networking.md
       - Files & Memory: concepts/files-and-memory.md
   - Backends: backends.md
+  - Copying Files: copy.md
   - Orphan Reaping: reaping.md
   - Container Reuse: reuse.md
   - Checkpoint / Restore: checkpoints.md

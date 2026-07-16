@@ -126,6 +126,23 @@ configuration, never cross-container network topology, so a reused container's p
 network can't be captured by the hash. Combining the two throws a typed error at `start()`
 naming both knobs; drop one or the other.
 
+## The checkpoint restriction
+
+Reuse cannot be combined with a container built via `GenericContainer.fromCheckpoint(...)` either
+— a checkpoint ref is excluded from reuse identity for the same reason a network is: it describes
+how this one container happened to boot, not something reuse's cross-process identity hash
+covers. Combining the two throws a typed error at `start()`; restore a checkpoint as an ordinary
+container, or use reuse without `fromCheckpoint`, not both.
+
+## Interaction with runtime copy
+
+[Copying Files](copy.md)'s runtime operations (`copyFileToContainer`/`copyContentToContainer`/
+`copyFileFromContainer`) work on a reuse-active container exactly as on any other — they're
+ordinary operations against a running sandbox. They are **not** part of reuse identity: a runtime
+copy mutates the shared sandbox's state, and that mutation is invisible to the identity hash, so
+two "equivalent" containers that differ only in what one of them copied in at runtime still adopt
+the same sandbox.
+
 ## Interaction with reaping
 
 `withReuse()` sets `keepAlive = true` on the underlying spec, which is exactly the flag

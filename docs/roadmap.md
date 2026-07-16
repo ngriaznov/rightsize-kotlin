@@ -5,12 +5,21 @@ Items graduate off this page when they ship; the CHANGELOG records what landed.
 
 ## Native microVM memory snapshots
 
-Filesystem-level checkpoint/restore shipped on the docker backend — see
-[Checkpoint / Restore](checkpoints.md). What's left: true microVM memory
+Filesystem-level checkpoint/restore has shipped on both backends — docker via
+image commit, microsandbox via disk snapshot (see
+[Checkpoint / Restore](checkpoints.md)). What's left: true microVM *memory*
 snapshots on microsandbox, resuming a process mid-execution instead of
-restarting it from a captured filesystem. That needs a snapshot primitive
-upstream in microsandbox itself; once available, it would also make restore
-near-instant.
+restarting it from a captured filesystem. That needs a memory-snapshot
+primitive upstream in microsandbox itself, beyond the disk-snapshot one it
+has today; once available, it would also make restore near-instant.
+
+## Portable checkpoint archives
+
+Named checkpoints (see [Checkpoint / Restore](checkpoints.md)) are rediscoverable across
+processes on the SAME machine, but the artifact itself — a docker image, an msb snapshot — never
+leaves it. Export/import (`docker save`/`docker load`, `msb snapshot export`/an equivalent
+import) would let a checkpoint travel between machines or ride along in a CI cache, rather than
+being re-seeded from scratch on every runner.
 
 ## Module breadth
 
@@ -29,10 +38,12 @@ fixture story, Vitest/Jest global-setup helpers, Axum/sqlx examples.
 Define an ad-hoc image inline in the test (Dockerfile-from-code) instead of
 publishing one — for testing your own service, not just its dependencies.
 
-## Copy files out; host-directory mounts
+## Host-directory mounts
 
-Copy-out (`copyFileFromContainer`) for extracting generated artifacts and
-debug dumps; host-directory binds alongside the existing copy-in.
+Runtime copy in both directions has shipped — see [Copying Files](copy.md).
+What's left: host-directory binds alongside the existing single-file
+`withCopyFileToContainer` mount, for start-time cases that want a live
+host-directory view rather than a one-time copy.
 
 ## Declarative multi-service groups
 

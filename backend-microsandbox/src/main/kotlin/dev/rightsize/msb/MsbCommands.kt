@@ -3,6 +3,7 @@ package dev.rightsize.msb
 import dev.rightsize.core.ContainerSpec
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import java.nio.file.Path
 
 /**
  * Pure msb CLI argv construction. Flag spellings verified empirically against the real
@@ -16,7 +17,13 @@ object MsbCommands {
         spec.ports.forEach { add("-p"); add("${it.hostPort}:${it.guestPort}") }
         spec.env.forEach { (k, v) -> add("-e"); add("$k=$v") }
         spec.mounts.forEach { add("--mount-file"); add("${it.hostPath}:${it.guestPath}") }
-        add(spec.image)
+        // --snapshot is mutually exclusive with the image arg (msb run --help): a checkpointRef
+        // boots from a disk snapshot instead of the ordinary image (see docs/checkpoints.md).
+        // Still no -d, same as every other boot this backend does — detached mode never starts
+        // the image's own ENTRYPOINT/CMD (see this file's header comment), and that's just as
+        // true of a snapshot-booted sandbox as an ordinary one.
+        val checkpointRef = spec.checkpointRef
+        if (checkpointRef != null) { add("--snapshot"); add(checkpointRef) } else add(spec.image)
         spec.command?.let { add("--"); addAll(it) }   // null => image default ENTRYPOINT/CMD runs
     }
 
@@ -27,6 +34,25 @@ object MsbCommands {
     fun stop(name: String) = listOf("stop", name)
     fun rm(name: String) = listOf("rm", name)
     fun ls() = listOf("ls", "--format", "json")
+    /** `msb snapshot create --from <sandbox> <name>` requires [sandbox] STOPPED; writes a sparse
+     * disk snapshot artifact under `~/.microsandbox/snapshots/<name>`. */
+    fun snapshotCreate(sandbox: String, name: String) = listOf("snapshot", "create", "--from", sandbox, name)
+    fun snapshotRemove(name: String) = listOf("snapshot", "rm", name)
+    /** `msb snapshot inspect <name>` — its exit code alone is [MsbCliBackend.hasCheckpoint]'s
+     * signal (0 = exists, non-zero = doesn't); see docs/checkpoints.md. */
+    fun snapshotInspect(name: String) = listOf("snapshot", "inspect", name)
+
+    /**
+     * `msb copy -q <src> <name>:<dst>` — copies a host file or directory into the running
+     * sandbox at [containerPath]; `-q` suppresses msb's own progress output (this backend never
+     * reads copy's stdout, only its exit code and stderr on failure). See docs/copy.md.
+     */
+    fun copyTo(name: String, hostPath: Path, containerPath: String) =
+        listOf("copy", "-q", hostPath.toString(), "$name:$containerPath")
+
+    /** `msb copy -q <name>:<src> <dst>` — the reverse of [copyTo]. */
+    fun copyFrom(name: String, containerPath: String, hostPath: Path) =
+        listOf("copy", "-q", "$name:$containerPath", hostPath.toString())
 
     /**
      * `msb image remove <reference>` deletes one cached image's entry (manifest + layer

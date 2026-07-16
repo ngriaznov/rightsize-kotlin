@@ -14,9 +14,12 @@ import java.util.concurrent.atomic.AtomicBoolean
 class MsbCliBackend(internal val msb: Path) : SandboxBackend {
     override val name = "microsandbox"
     override val supportsNativeNetworks = false   // networks emulated via exec-tunnels
-    // Each sandbox is its own microVM (hardware-isolated); no upstream snapshot/restore support
-    // yet, so checkpoint is false (see docs/checkpoints.md and BackendCapabilities' doc comment).
-    override val capabilities = BackendCapabilities(hardwareIsolated = true, checkpoint = false)
+    // Each sandbox is its own microVM (hardware-isolated); checkpoint is backed by msb's disk
+    // snapshot primitives (stop -> snapshot create -> rm -> run --snapshot), which restarts the
+    // workload, hence checkpointRestartsWorkload = true (see docs/checkpoints.md and
+    // BackendCapabilities' doc).
+    override val capabilities = BackendCapabilities(
+        hardwareIsolated = true, checkpoint = true, checkpointRestartsWorkload = true)
 
     internal class Handle(override val spec: ContainerSpec) : SandboxHandle {
         override val id = spec.name
@@ -38,6 +41,10 @@ class MsbCliBackend(internal val msb: Path) : SandboxBackend {
         const val STATE_DB_RETRY_DELAY_MS = 500L
         const val EXEC_TIMEOUT_SEC = 120L
         const val LOGS_TIMEOUT_SEC = 30L
+        const val COPY_TIMEOUT_SEC = 120L
+        // `msb snapshot create` writes a full disk image (sparse — a tiny alpine snapshot was
+        // observed at 3.9 MB on disk despite a "4 GiB" nominal size) — generous but bounded.
+        const val SNAPSHOT_TIMEOUT_SEC = 180L
         const val ATTACHED_PROC_STOP_TIMEOUT_SEC = 10L
         const val READER_JOIN_TIMEOUT_MS = 2000L
         const val TAIL_LINES = 50
@@ -73,17 +80,18 @@ class MsbCliBackend(internal val msb: Path) : SandboxBackend {
      */
     override fun start(handle: SandboxHandle) {
         handle as Handle
-        handle.attached = spawnAndAwaitRunning(handle)
+        handle.attached = spawnAndAwaitRunning(handle, handle.spec)
         if (!handle.spec.keepAlive) startedNames += handle.id
     }
 
     /**
-     * Boots via [bootOnce], retrying two classified transient failures once each. A boot
-     * that hit msb's state-database error — usually the startup-migration race (see
-     * [isMsbStateDbError]) — is retried after a short delay with no heal step; the race
-     * is transient by construction. On a first
-     * failure carrying msb's image-cache-corruption
-     * signature, heals by removing just the affected image's cache entry
+     * Boots via [bootOnce], retrying two classified transient failures once each. [spec] is
+     * ordinarily [Handle.spec] itself (from [start]), but [createCheckpoint]'s re-boot passes a
+     * copy with `checkpointRef` set instead — [handle] still supplies the identity (`id`) both
+     * callers boot under. A boot that hit msb's state-database error — usually the
+     * startup-migration race (see [isMsbStateDbError]) — is retried after a short delay with no
+     * heal step; the race is transient by construction. On a first failure carrying msb's
+     * image-cache-corruption signature, heals by removing just the affected image's cache entry
      * (`msb image remove <image>`, result ignored — including "image not found", since the
      * real signal is whether the retried boot succeeds, not whether removal reported
      * success) and retries the boot exactly once. A second identical failure surfaces an
@@ -100,9 +108,9 @@ class MsbCliBackend(internal val msb: Path) : SandboxBackend {
      * or the manifest IS committed but the cache file backing one of its layers is gone,
      * where `image remove` clears the stale entry and the retry re-pulls from scratch.
      */
-    private fun spawnAndAwaitRunning(handle: Handle): Process {
+    private fun spawnAndAwaitRunning(handle: Handle, spec: ContainerSpec): Process {
         val firstOutput = try {
-            return bootOnce(handle)
+            return bootOnce(handle, spec)
         } catch (race: MsbStateDbException) {
             // Usually the startup-migration race, transient by construction (see
             // [isMsbStateDbError]): the winning msb invocation's migration commits and a
@@ -110,7 +118,7 @@ class MsbCliBackend(internal val msb: Path) : SandboxBackend {
             // failure propagates — the same one-shot policy as the image-cache heal below.
             Thread.sleep(STATE_DB_RETRY_DELAY_MS)
             try {
-                return bootOnce(handle)
+                return bootOnce(handle, spec)
             } catch (second: MsbStateDbException) {
                 error("msb run for sandbox ${handle.id} hit msb's state-database error twice in a " +
                     "row — the usual cause (concurrent msb invocations racing startup migrations) " +
@@ -121,12 +129,12 @@ class MsbCliBackend(internal val msb: Path) : SandboxBackend {
         } catch (first: ImageCacheCorruptionException) {
             first.output
         }
-        val heal = runCatching { invoke(MsbCommands.imageRemove(handle.spec.image), STOP_TIMEOUT_SEC) }
+        val heal = runCatching { invoke(MsbCommands.imageRemove(spec.image), STOP_TIMEOUT_SEC) }
         try {
-            return bootOnce(handle)
+            return bootOnce(handle, spec)
         } catch (second: ImageCacheCorruptionException) {
             error("msb run for sandbox ${handle.id} hit its image cache error twice in a row for image " +
-                "'${handle.spec.image}', even after removing that image's cache entry (${describeHeal(heal)}) " +
+                "'${spec.image}', even after removing that image's cache entry (${describeHeal(heal)}) " +
                 "and retrying — this is likely a deeper cache corruption than this backend's one-shot heal " +
                 "covers; try clearing the msb image cache by hand (`msb image prune` or removing the cache " +
                 "directory under MSB_HOME).\nfirst attempt:\n$firstOutput\nafter heal + retry:\n${second.output}")
@@ -134,16 +142,16 @@ class MsbCliBackend(internal val msb: Path) : SandboxBackend {
     }
 
     /**
-     * One boot attempt: spawns the attached `msb run` child and waits for Running. On any
-     * failure the child is reaped here (for the classified early-exit failures it has
-     * already exited; a readiness timeout leaves it alive and it is force-killed), so a
-     * failed attempt leaves no live process behind — the caller owns retry policy, never
-     * cleanup.
+     * One boot attempt: spawns the attached `msb run` child for [spec] and waits for [handle] to
+     * reach Running. On any failure the child is reaped here (for the classified early-exit
+     * failures it has already exited; a readiness timeout leaves it alive and it is
+     * force-killed), so a failed attempt leaves no live process behind — the caller owns retry
+     * policy, never cleanup.
      */
-    private fun bootOnce(handle: Handle): Process {
-        val (proc, tail) = spawnAttachedRun(handle)   // ATTACHED mode: -d never runs the ENTRYPOINT
+    private fun bootOnce(handle: Handle, spec: ContainerSpec): Process {
+        val (proc, tail, drainer) = spawnAttachedRun(spec)   // ATTACHED mode: -d never runs the ENTRYPOINT
         try {
-            awaitRunning(handle, proc, tail)          // readiness = name Running in `msb ls`
+            awaitRunning(handle, proc, tail, drainer)          // readiness = name Running in `msb ls`
         } catch (t: Throwable) {
             if (proc.isAlive) proc.destroyForcibly()
             throw t
@@ -162,17 +170,17 @@ class MsbCliBackend(internal val msb: Path) : SandboxBackend {
     )
 
     /**
-     * Spawns `msb run`, draining its combined output to a tail kept for diagnostics only —
-     * msb's own boot output (registry/pull errors, a crash before the sandbox exists), never
-     * the workload's. [logs] never reads from this tail; it always shells out to `msb logs`.
+     * Spawns `msb run` for [spec], draining its combined output to a tail kept for diagnostics
+     * only — msb's own boot output (registry/pull errors, a crash before the sandbox exists),
+     * never the workload's. [logs] never reads from this tail; it always shells out to `msb logs`.
      */
-    private fun spawnAttachedRun(handle: Handle): Pair<Process, ConcurrentLinkedDeque<String>> {
-        val proc = ProcessBuilder(listOf(msb.toString()) + MsbCommands.run(handle.spec))
+    private fun spawnAttachedRun(spec: ContainerSpec): Triple<Process, ConcurrentLinkedDeque<String>, Thread> {
+        val proc = ProcessBuilder(listOf(msb.toString()) + MsbCommands.run(spec))
             .redirectErrorStream(true).start()
         runCatching { proc.outputStream.close() }   // no host stdin to forward; avoid EOF-wait stalls
         val tail = ConcurrentLinkedDeque<String>()
-        drain(proc.inputStream) { tail.addLast(it); if (tail.size > TAIL_LINES) tail.removeFirst() }
-        return proc to tail
+        val drainer = drain(proc.inputStream) { tail.addLast(it); if (tail.size > TAIL_LINES) tail.removeFirst() }
+        return Triple(proc, tail, drainer)
     }
 
     /** Polls until [handle] reaches Running, or fails fast if the `msb run` child exits first.
@@ -180,10 +188,14 @@ class MsbCliBackend(internal val msb: Path) : SandboxBackend {
      * signature throws [ImageCacheCorruptionException] (the one failure [spawnAndAwaitRunning]
      * heals and retries), a host-port bind conflict throws [PortBindConflictException], and
      * anything else surfaces the raw output. */
-    private fun awaitRunning(handle: Handle, proc: Process, tail: ConcurrentLinkedDeque<String>) {
+    private fun awaitRunning(handle: Handle, proc: Process, tail: ConcurrentLinkedDeque<String>, drainer: Thread) {
         val deadline = System.currentTimeMillis() + FIRST_RUN_PULL_TIMEOUT_MS
         while (System.currentTimeMillis() < deadline) {
             if (!proc.isAlive) {
+                // The child's death precedes the drainer thread consuming its final buffered
+                // lines — join it (bounded) or the diagnostics below can miss the very stderr
+                // that explains the exit.
+                runCatching { drainer.join(5_000) }
                 val output = tail.joinToString("\n")
                 if (isImageCacheCorruption(output)) throw ImageCacheCorruptionException(output)
                 if (isMsbStateDbError(output)) throw MsbStateDbException(output)
@@ -245,6 +257,109 @@ class MsbCliBackend(internal val msb: Path) : SandboxBackend {
         sandboxStop = listOf(msb.toString(), "stop"),
         sandboxRemove = listOf(msb.toString(), "rm"),
     )
+
+    /**
+     * Backs `GenericContainer.checkpoint()` via msb's disk-snapshot primitives (see
+     * docs/checkpoints.md): `msb snapshot create` requires the sandbox STOPPED, so this reuses
+     * [stop] itself (the same backend-internal stop this SPI method's own caller would otherwise
+     * reach — it closes exec tunnels and reaps the supervising attached process, and touches
+     * neither `startedNames` nor the reaper ledger, both of which only [remove] and
+     * `GenericContainer`'s own bookkeeping touch) rather than duplicating its cleanup.
+     *
+     * Restoring is NOT `msb start`. Upstream, `msb start` is `Sandbox::start_detached`, and on
+     * Windows the detached spawn passes `CREATE_BREAKAWAY_FROM_JOB` — a flag that fails with
+     * `ERROR_ACCESS_DENIED` whenever msb runs inside a Windows job object that doesn't grant
+     * breakaway rights, which is exactly the case when this JVM is itself a child of a Gradle
+     * test process or a CI runner's job. That denial is deterministic, not transient, so no
+     * retry ever clears it. Attached `msb run` — this backend's ordinary boot, no creation
+     * flags — works everywhere, including a `--snapshot` boot, so the resume step here is
+     * instead: remove the stopped sandbox (its disk state now lives entirely in the snapshot)
+     * and boot a fresh attached sandbox from that snapshot under the SAME name/ports/env/memory
+     * limit, via [spawnAndAwaitRunning] — the exact boot path [start] itself uses, just fed
+     * [handle]'s own spec with `checkpointRef` set to the new ref (`MsbCommands.run` then emits
+     * `--snapshot <ref>` in place of the image arg). [Handle.attached] is swapped to the new
+     * child; `id`/`spec` — the ledger-relevant identity — are untouched.
+     *
+     * `capabilities.checkpointRestartsWorkload = true` is exactly why: the rebooted workload
+     * starts from scratch, so `GenericContainer.checkpoint()` re-applies the container's own
+     * wait strategy before returning.
+     *
+     * Failure handling has two distinct shapes:
+     * - `snapshot create` fails: the sandbox is left STOPPED, never removed, and this throws
+     *   naming the failed step and the by-hand remedy (`msb start <name>` — safe here, since a
+     *   human running it from an interactive shell isn't inside the restrictive job object that
+     *   makes it fail in CI). No "restart it for the caller" best-effort — that restart was
+     *   exactly the broken call this method no longer makes.
+     * - the snapshot succeeds but the re-boot from it fails, after the stopped sandbox has
+     *   already been removed: this throws naming the ref and that its state is still recoverable
+     *   via `GenericContainer.fromCheckpoint`, since the original sandbox is gone but the
+     *   snapshot survives it.
+     */
+    override fun createCheckpoint(handle: SandboxHandle, ref: String) {
+        handle as Handle
+        stop(handle)
+        val snap = invoke(MsbCommands.snapshotCreate(handle.id, ref), SNAPSHOT_TIMEOUT_SEC)
+        if (snap.exitCode != 0) {
+            error("msb snapshot create --from ${handle.id} $ref failed (exit ${snap.exitCode}): " +
+                "${snap.stderr.trim().ifEmpty { snap.stdout.trim() }} — sandbox ${handle.id} is left " +
+                "stopped; resume it by hand with `msb start ${handle.id}`.")
+        }
+        invoke(MsbCommands.rm(handle.id), STOP_TIMEOUT_SEC)
+        try {
+            handle.attached = spawnAndAwaitRunning(handle, handle.spec.copy(checkpointRef = ref))
+        } catch (e: Exception) {
+            error("re-booting sandbox ${handle.id} from checkpoint $ref failed: ${e.message} — the " +
+                "sandbox was removed but its state is preserved in checkpoint $ref, restorable via " +
+                "GenericContainer.fromCheckpoint.")
+        }
+    }
+
+    /** Best-effort `msb snapshot rm` — "not found" is success, same contract as [removeByName].
+     * Snapshot artifacts are never auto-pruned (see docs/checkpoints.md); this exists so tests
+     * can keep shared CI state clean. */
+    override fun removeCheckpoint(ref: String) {
+        runCatching { invoke(MsbCommands.snapshotRemove(ref), STOP_TIMEOUT_SEC) }
+    }
+
+    /**
+     * `msb snapshot inspect <ref>` exits 0 when the snapshot exists. A non-zero exit is only
+     * "genuinely gone" — and thus only resolves to `false` — when stderr carries msb's own
+     * miss framing (see [isCheckpointMiss]); msb has no separate structured error to
+     * distinguish that from any other inspect failure (a corrupted state database, a
+     * permission failure, a transient hiccup), so per the SPI contract those must never fold
+     * into `false` — they throw instead, carrying stderr (falling back to stdout when empty),
+     * the same substring-classifier discipline [isImageCacheCorruption]/[isMsbStateDbError]
+     * already use. Unlike [removeCheckpoint]'s best-effort `runCatching`, a probe failure here
+     * is never swallowed: [Checkpoint.find]'s stale-entry cleanup calls this to decide whether
+     * to delete a registry entry, and folding a probe failure into `false` would let it
+     * permanently orphan a live checkpoint.
+     */
+    override fun hasCheckpoint(ref: String): Boolean {
+        val r = invoke(MsbCommands.snapshotInspect(ref), STOP_TIMEOUT_SEC)
+        if (r.exitCode == 0) return true
+        if (isCheckpointMiss(r.stderr)) return false
+        error("msb snapshot inspect $ref failed (exit ${r.exitCode}): " +
+            "${r.stderr.trim().ifEmpty { r.stdout.trim() }}")
+    }
+
+    /**
+     * Runtime copy (see docs/copy.md), both directions: `msb copy -q <src> <name>:<dst>` /
+     * `msb copy -q <name>:<src> <dst>`, through the same [invoke] plumbing every other one-shot
+     * msb command in this backend uses. Unlike [exec]/[logs], a copy failure must never look
+     * like a silent success, so the exit code is checked explicitly here and raised as
+     * [ContainerCopyException] carrying stderr.
+     */
+    override fun copyToContainer(handle: SandboxHandle, hostPath: Path, containerPath: String) {
+        val r = invoke(MsbCommands.copyTo(handle.id, hostPath, containerPath), COPY_TIMEOUT_SEC)
+        if (r.exitCode != 0) throw ContainerCopyException(
+            "msb copy into sandbox ${handle.id} failed (exit ${r.exitCode}): ${r.stderr.trim().ifEmpty { r.stdout.trim() }}")
+    }
+
+    override fun copyFromContainer(handle: SandboxHandle, containerPath: String, hostPath: Path) {
+        val r = invoke(MsbCommands.copyFrom(handle.id, containerPath, hostPath), COPY_TIMEOUT_SEC)
+        if (r.exitCode != 0) throw ContainerCopyException(
+            "msb copy from sandbox ${handle.id} failed (exit ${r.exitCode}): ${r.stderr.trim().ifEmpty { r.stdout.trim() }}")
+    }
 
     /**
      * True if msb's own diagnostic output for an early-exited `msb run` names a host-port bind
@@ -570,3 +685,21 @@ internal class MsbStateDbException(val output: String) :
  * propagates the failure with both attempts' output.
  */
 internal fun isMsbStateDbError(output: String): Boolean = "error: database error:" in output
+
+/**
+ * True if [stderr] (from `msb snapshot inspect <ref>`) names msb's own "no such snapshot"
+ * miss, as opposed to some other inspect failure. Observed verbatim against the real msb
+ * 0.6.6 binary:
+ *
+ * ```
+ * error: snapshot not found: rz-ckpt-0123456789ab at /path/to/.microsandbox/snapshots/rz-ckpt-0123456789ab
+ * ```
+ *
+ * Deliberately a substring match on the stable `error: snapshot not found:` framing rather
+ * than the full line — the trailing path is host-specific and msb has no structured/typed
+ * error for this, the same substring-classifier discipline [isImageCacheCorruption] and
+ * [isMsbStateDbError] already use. Any non-zero exit whose stderr does NOT match this is a
+ * genuine probe failure, not a miss, and [MsbCliBackend.hasCheckpoint] throws instead of
+ * returning `false` for it.
+ */
+internal fun isCheckpointMiss(stderr: String): Boolean = "error: snapshot not found:" in stderr

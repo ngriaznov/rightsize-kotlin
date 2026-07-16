@@ -39,7 +39,8 @@ class DockerCheckpointIT {
             assertEquals(0, write.exitCode, "writing the marker file failed: ${write.stderr}")
 
             val cp = original.checkpoint()
-            checkpointImageRef = cp.imageRef
+            assertEquals("docker", cp.backend)
+            checkpointImageRef = cp.ref
             original.stop()
 
             val restored = GenericContainer.fromCheckpoint(cp)

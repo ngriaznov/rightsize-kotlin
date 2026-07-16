@@ -30,6 +30,18 @@ class MsbCommandsTest {
         assertEquals("redis:8.6-alpine", cmd.last())   // no trailing `--`: attached mode runs the image default
     }
 
+    // --snapshot replaces the image arg entirely when checkpointRef is set (mutually exclusive
+    // per `msb run --help`) — still no -d, same as every other boot this backend does.
+    @Test fun `run command uses --snapshot instead of the image arg when checkpointRef is set`() {
+        val cmd = MsbCommands.run(spec.copy(checkpointRef = "rz-ckpt-0123456789ab"))
+        assertEquals(listOf("run", "--name", "rz-abc-1",
+            "-p", "12345:6379", "-e", "A=1",
+            "--mount-file", "/tmp/f.conf:/etc/f.conf",
+            "--snapshot", "rz-ckpt-0123456789ab", "--", "redis-server", "--port", "6379"), cmd)
+        assertFalse(cmd.contains("redis:8.6-alpine"), "the ordinary image arg must not appear alongside --snapshot")
+        assertFalse(cmd.contains("-d"))
+    }
+
     @Test fun `run command includes -m when memoryLimitMb is set, absent when null`() {
         val withLimit = MsbCommands.run(spec.copy(memoryLimitMb = 1024))
         val mIndex = withLimit.indexOf("-m")
@@ -50,5 +62,19 @@ class MsbCommandsTest {
         assertEquals(listOf("ls", "--format", "json"), MsbCommands.ls())   // no `--json` flag on ls
         assertEquals(listOf("image", "remove", "floci/floci-az:0.8.0"),
             MsbCommands.imageRemove("floci/floci-az:0.8.0"))
+    }
+
+    @Test fun `snapshot create and snapshot rm`() {
+        assertEquals(listOf("snapshot", "create", "--from", "rz-abc-1", "rz-ckpt-0123456789ab"),
+            MsbCommands.snapshotCreate("rz-abc-1", "rz-ckpt-0123456789ab"))
+        assertEquals(listOf("snapshot", "rm", "rz-ckpt-0123456789ab"),
+            MsbCommands.snapshotRemove("rz-ckpt-0123456789ab"))
+    }
+
+    @Test fun `copyTo and copyFrom`() {
+        assertEquals(listOf("copy", "-q", "/host/src.txt", "rz-abc-1:/dst.txt"),
+            MsbCommands.copyTo("rz-abc-1", Path.of("/host/src.txt"), "/dst.txt"))
+        assertEquals(listOf("copy", "-q", "rz-abc-1:/src.txt", "/host/dst.txt"),
+            MsbCommands.copyFrom("rz-abc-1", "/src.txt", Path.of("/host/dst.txt")))
     }
 }

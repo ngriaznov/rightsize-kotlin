@@ -10,6 +10,15 @@ package dev.rightsize.core.reuse
 class ReuseNetworkConflictException(message: String) : RuntimeException(message)
 
 /**
+ * Thrown at `start()` when a container built via `GenericContainer.fromCheckpoint(...)` is also
+ * reuse-active (`withReuse()` plus `RIGHTSIZE_REUSE`) — `ContainerSpec.checkpointRef` is
+ * deliberately excluded from [ReuseIdentitySpec] (identity covers only a container's own
+ * configuration, and a checkpoint ref no more describes that than a network does), so the two
+ * can't be combined. Drop `withReuse()`, or restore the checkpoint without it.
+ */
+class ReuseFromCheckpointConflictException(message: String) : RuntimeException(message)
+
+/**
  * Signals that a backend's create/start failed because the reuse sandbox name was already taken
  * — another process's `start()` won the same create race. `GenericContainer`'s reuse flow
  * catches this to re-enter the adopt path once instead of treating it as an ordinary failure.

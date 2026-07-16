@@ -195,9 +195,15 @@ actionable error.
 - **Isolation requirement.** `withRequireIsolation()` fails `start()` immediately when the
   active backend isn't hardware-isolated, instead of silently running untrusted code under
   Docker's weaker guarantee.
-- **Checkpoint / restore (Docker).** `checkpoint()` captures a running container's filesystem
-  as a new image; `fromCheckpoint(cp)` boots an ordinary container from it — seed a fixture
-  once per suite, restore it once per test instead of re-running migrations every time.
+- **Checkpoint / restore.** `checkpoint()` captures a running container's filesystem — a new
+  image on Docker, a disk snapshot on microsandbox; `fromCheckpoint(cp)` boots an ordinary
+  container from it — seed a fixture once per suite, restore it once per test instead of
+  re-running migrations every time. Pass a name (`checkpoint("seeded-db")`) to make it durable
+  and reusable across runs — later processes find it again via `Checkpoint.find`/`list`/`remove`
+  instead of re-seeding.
+- **Runtime file copy.** `copyFileToContainer`/`copyContentToContainer`/`copyFileFromContainer`
+  move files, directories, or in-memory content into or out of an already-running container on
+  both backends, parent directories created automatically on either side.
 
 ## How it works
 

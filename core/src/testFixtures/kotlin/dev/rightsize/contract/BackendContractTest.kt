@@ -5,6 +5,7 @@ import dev.rightsize.MountableFile
 import dev.rightsize.RunId
 import dev.rightsize.core.Backends
 import dev.rightsize.core.CacheDir
+import dev.rightsize.core.Checkpoint
 import dev.rightsize.core.CheckpointUnsupportedException
 import dev.rightsize.core.ContainerSpec
 import dev.rightsize.core.ExecResult
@@ -23,6 +24,7 @@ import dev.rightsize.core.reuse.ReuseRegistry
 import dev.rightsize.core.wait.Wait
 import org.junit.jupiter.api.*
 import org.junit.jupiter.api.Assertions.*
+import org.junit.jupiter.api.io.TempDir
 import java.net.HttpURLConnection
 import java.net.URI
 import java.nio.file.Files
@@ -463,34 +465,179 @@ abstract class BackendContractTest {
 
     // --- Checkpoint / restore (see docs/checkpoints.md) ---
 
-    // Pins the exact checkpoint value each real backend advertises: docker true (image commit),
-    // microsandbox false (no upstream snapshot primitive yet).
+    // Both real backends support checkpoint today (docker via image commit, microsandbox via
+    // disk snapshot) — this only ever reports false for a backend that doesn't declare the
+    // capability (e.g. a test double), which neither contract subclass is.
     @Test fun `capabilities reports this backend's actual checkpoint value`() {
         val backend = Backends.active()
-        val expected = !backend.name.equals("microsandbox", ignoreCase = true)
-        assertEquals(expected, backend.capabilities.checkpoint,
-            "backend '${backend.name}' reported checkpoint=${backend.capabilities.checkpoint}, expected $expected")
+        assertTrue(backend.capabilities.checkpoint,
+            "backend '${backend.name}' reported checkpoint=false, expected true")
+    }
+
+    // Pins the exact checkpointRestartsWorkload value each real backend advertises: docker false
+    // (the container is committed and left running undisturbed), microsandbox true (its disk
+    // snapshot needs the sandbox stopped, so the resumed workload restarts from scratch).
+    @Test fun `capabilities reports this backend's actual checkpointRestartsWorkload value`() {
+        val backend = Backends.active()
+        val expected = backend.name.equals("microsandbox", ignoreCase = true)
+        assertEquals(expected, backend.capabilities.checkpointRestartsWorkload,
+            "backend '${backend.name}' reported checkpointRestartsWorkload=" +
+                "${backend.capabilities.checkpointRestartsWorkload}, expected $expected")
     }
 
     // The gating behavior (typed error before any backend call) must be identical across
     // languages regardless of which real backend is under test. On a checkpoint-capable backend
-    // this also proves the real commit round-trips into a well-formed imageRef; the committed
-    // image is not auto-reaped (see docs/checkpoints.md), so this test removes its own.
-    @Test fun `checkpoint gates on the active backend's checkpoint capability`() {
+    // this also proves the real capture round-trips into a well-formed ref and that the
+    // restored container is fully functional again — the checkpoint itself is not auto-reaped
+    // (see docs/checkpoints.md), so this test removes its own.
+    @Test fun `checkpoint gates on the active backend's checkpoint capability, then restores cleanly`() {
         val backend = Backends.active()
-        val c = GenericContainer("alpine:3.19").withCommand("sleep", "120")
-            .waitingFor(Wait.forLogMessage(".*", 0).withStartupTimeout(Duration.ofSeconds(30)))
+        val c = GenericContainer("alpine:3.19").withCommand("sh", "-c", "echo BOOT-MARKER; sleep 120")
+            .waitingFor(Wait.forLogMessage(".*BOOT-MARKER.*"))
         c.start()
         try {
             if (backend.capabilities.checkpoint) {
+                val write = c.execInContainer("sh", "-c", // /srv, not /tmp: the microsandbox guest mounts /tmp as tmpfs, which a disk snapshot cannot capture.
+                "echo checkpoint-marker > /srv/marker.txt && sync")
+                assertEquals(0, write.exitCode, "writing the marker file failed: ${write.stderr}")
+
                 val cp = c.checkpoint()
-                assertTrue(Regex("^rightsize/checkpoint:[0-9a-f]{12}$").matches(cp.imageRef),
-                    "imageRef must be 'rightsize/checkpoint:<12 hex>', got '${cp.imageRef}'")
-                runCatching { ProcessBuilder("docker", "rmi", "-f", cp.imageRef).inheritIO().start().waitFor() }
+                val refPattern = if (backend.name.equals("microsandbox", ignoreCase = true))
+                    Regex("^rz-ckpt-[0-9a-f]{12}$") else Regex("^rightsize/checkpoint:[0-9a-f]{12}$")
+                assertTrue(refPattern.matches(cp.ref), "unexpected ref shape for '${backend.name}': '${cp.ref}'")
+                assertEquals(backend.name, cp.backend)
+
+                // checkpointRestartsWorkload backends (microsandbox) restart the workload as part
+                // of checkpoint() itself; the source container must still be usable afterward.
+                val stillUsable = c.execInContainer("true")
+                assertEquals(0, stillUsable.exitCode, "source container must still work after checkpoint()")
+
+                val restored = GenericContainer.fromCheckpoint(cp)
+                    .waitingFor(Wait.forLogMessage(".*", 0).withStartupTimeout(Duration.ofSeconds(30)))
+                try {
+                    restored.start()
+                    val read = restored.execInContainer("cat", "/srv/marker.txt")
+                    assertEquals(0, read.exitCode, "reading the marker file back failed: ${read.stderr}")
+                    assertTrue(read.stdout.contains("checkpoint-marker"),
+                        "restored container is missing the checkpointed filesystem state: ${read.stdout}")
+                } finally {
+                    restored.stop()
+                    runCatching { backend.removeCheckpoint(cp.ref) }
+                }
             } else {
                 val e = assertThrows(CheckpointUnsupportedException::class.java) { c.checkpoint() }
                 assertTrue(e.message!!.contains(backend.name), "message should name the active backend: ${e.message}")
             }
+        } finally { c.stop() }
+    }
+
+    // The whole point of named checkpoints (see docs/checkpoints.md's "Reusing checkpoints
+    // across runs" section): a checkpoint taken by one container is restorable via
+    // Checkpoint.find alone, with no reference to the Checkpoint object checkpoint() itself
+    // returned and this test discards. The name is nonced with this run's own RunId so a
+    // leftover artifact from a crashed run never collides with a fresh one.
+    @Test fun `a named checkpoint is rediscoverable via Checkpoint-find after its creating container is gone`() {
+        val backend = Backends.active()
+        Assumptions.assumeTrue(backend.capabilities.checkpoint, "backend '${backend.name}' does not support checkpoint")
+        val name = "ckpt-${RunId.value}-golden"
+        val original = GenericContainer("alpine:3.19").withCommand("sh", "-c", "echo BOOT-MARKER; sleep 120")
+            .waitingFor(Wait.forLogMessage(".*BOOT-MARKER.*"))
+        original.start()
+        try {
+            val write = original.execInContainer("sh", "-c", // /srv, not /tmp: the microsandbox guest mounts /tmp as tmpfs, which a disk snapshot cannot capture.
+                "echo checkpoint-marker > /srv/marker.txt && sync")
+            assertEquals(0, write.exitCode, "writing the marker file failed: ${write.stderr}")
+            original.checkpoint(name)
+            original.stop()
+
+            val found = Checkpoint.find(name)
+            assertNotNull(found, "Checkpoint.find must rediscover '$name' after its creating container is gone")
+            assertEquals(backend.name, found!!.backend)
+
+            val restored = GenericContainer.fromCheckpoint(found)
+                .waitingFor(Wait.forLogMessage(".*", 0).withStartupTimeout(Duration.ofSeconds(30)))
+            restored.start()
+            try {
+                val read = restored.execInContainer("cat", "/srv/marker.txt")
+                assertEquals(0, read.exitCode, "reading the marker file back failed: ${read.stderr}")
+                assertTrue(read.stdout.contains("checkpoint-marker"),
+                    "restored container is missing the checkpointed filesystem state: ${read.stdout}")
+            } finally { restored.stop() }
+        } finally {
+            // Guard-style cleanup: a mid-test assertion failure must still remove the checkpoint,
+            // not just a clean pass — Checkpoint.remove is itself idempotent either way.
+            runCatching { original.stop() }
+            Checkpoint.remove(name)
+        }
+    }
+
+    // --- Runtime copy (see docs/copy.md) ---
+
+    private fun sleepyAlpine() = GenericContainer("alpine:3.19").withCommand("sleep", "120")
+        .waitingFor(Wait.forLogMessage(".*", 0).withStartupTimeout(Duration.ofSeconds(30)))
+
+    @Test fun `copyFileToContainer round-trips a host file, creating a nonexistent parent`() {
+        val hostFile = Files.createTempFile("rightsize-copyin-", ".txt")
+        Files.writeString(hostFile, "copy-in-payload\n")
+        val c = sleepyAlpine()
+        c.start()
+        try {
+            c.copyFileToContainer(hostFile, "/copy-in/nested/from-host.txt")
+            val r = c.execInContainer("cat", "/copy-in/nested/from-host.txt")
+            assertEquals(0, r.exitCode, "cat failed: ${r.stderr}")
+            assertEquals("copy-in-payload\n", r.stdout)
+        } finally { c.stop(); Files.deleteIfExists(hostFile) }
+    }
+
+    @Test fun `copyContentToContainer round-trips in-memory content`() {
+        val c = sleepyAlpine()
+        c.start()
+        try {
+            c.copyContentToContainer("copy-content-payload\n", "/copy-content/nested/from-memory.txt")
+            val r = c.execInContainer("cat", "/copy-content/nested/from-memory.txt")
+            assertEquals(0, r.exitCode, "cat failed: ${r.stderr}")
+            assertEquals("copy-content-payload\n", r.stdout)
+        } finally { c.stop() }
+    }
+
+    @Test fun `copyFileToContainer round-trips a directory, contents land under the destination`() {
+        val hostDir = Files.createTempDirectory("rightsize-copyin-dir-")
+        Files.writeString(hostDir.resolve("nested.txt"), "copy-in-dir-payload\n")
+        val c = sleepyAlpine()
+        c.start()
+        try {
+            c.copyFileToContainer(hostDir, "/copy-in-dir")
+            val r = c.execInContainer("cat", "/copy-in-dir/nested.txt")
+            assertEquals(0, r.exitCode, "cat failed: ${r.stderr}")
+            assertEquals("copy-in-dir-payload\n", r.stdout)
+        } finally {
+            c.stop()
+            Files.deleteIfExists(hostDir.resolve("nested.txt")); Files.deleteIfExists(hostDir)
+        }
+    }
+
+    @Test fun `copyFileFromContainer round-trips a guest file, creating a nonexistent host parent`(@TempDir tmp: Path) {
+        val c = sleepyAlpine()
+        c.start()
+        try {
+            val write = c.execInContainer("sh", "-c", "echo copy-out-payload > /copy-out.txt")
+            assertEquals(0, write.exitCode, "writing the guest file failed: ${write.stderr}")
+            val hostFile = tmp.resolve("nested").resolve("from-guest.txt")
+            c.copyFileFromContainer("/copy-out.txt", hostFile)
+            assertEquals("copy-out-payload\n", Files.readString(hostFile))
+        } finally { c.stop() }
+    }
+
+    @Test fun `copyFileFromContainer round-trips a guest directory`(@TempDir tmp: Path) {
+        val c = sleepyAlpine()
+        c.start()
+        try {
+            val write = c.execInContainer("sh", "-c",
+                "mkdir -p /copy-out-dir && echo copy-out-dir-payload > /copy-out-dir/nested.txt")
+            assertEquals(0, write.exitCode, "writing the guest directory failed: ${write.stderr}")
+            val hostDir = tmp.resolve("copy-out-dir")
+            c.copyFileFromContainer("/copy-out-dir", hostDir)
+            assertEquals("copy-out-dir-payload\n", Files.readString(hostDir.resolve("nested.txt")))
         } finally { c.stop() }
     }
 }

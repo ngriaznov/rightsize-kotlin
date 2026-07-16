@@ -157,6 +157,11 @@ timing quirks. Know these before you hit them:
   `Wait.forListeningPort()` can be satisfied before the in-guest process is actually
   ready on either backend, and when to prefer `Wait.forHttp`/`Wait.forLogMessage`
   instead.
+- **Checkpoint/restore is supported on both backends, via different mechanisms.**
+  `capabilities.checkpoint` is `true` on both — Docker commits the running container to a new
+  image; microsandbox stops the sandbox, snapshots its disk, and reboots it, which restarts the
+  workload (`capabilities.checkpointRestartsWorkload`). See [Checkpoint /
+  Restore](checkpoints.md#mechanism-per-backend) for the full comparison.
 - **Native Windows msb support is upstream beta (microsandbox 0.6.6).** The guest is
   Linux on every host, so guest-side behavior (entrypoints, `/etc/hosts` aliasing, the
   exec-stream tunnels) is unaffected by running on Windows — the Windows-specific

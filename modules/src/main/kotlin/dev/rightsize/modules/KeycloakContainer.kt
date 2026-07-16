@@ -49,7 +49,7 @@ class KeycloakContainer(image: String = "quay.io/keycloak/keycloak:26.4") :
         // Quarkus JVM — see the class doc for the measured OOM-at-default / clean-at-1024 story.
         withMemoryLimit(1024)
         // Health is on the MANAGEMENT port, not HTTP — see the class doc for the captured boot line.
-        waitingFor(Wait.forHttp("/health").forPort(MANAGEMENT_PORT).withStartupTimeout(Duration.ofSeconds(120)))
+        waitingFor(Wait.forHttp("/health").forPort(MANAGEMENT_PORT).withStartupTimeout(Duration.ofSeconds(180)))
     }
 
     /** Overrides `KC_BOOTSTRAP_ADMIN_USERNAME` (default `admin`). */

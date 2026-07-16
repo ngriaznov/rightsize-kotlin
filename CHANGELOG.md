@@ -7,8 +7,50 @@ reaches its first tagged release.
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
 
+- **Runtime file copy.** `GenericContainer.copyFileToContainer`/`copyContentToContainer`/
+  `copyFileFromContainer` move a file, a directory, or in-memory content into or out of an
+  already-**running** container — distinct from the existing start-time
+  `withCopyFileToContainer` mount. Both directions require the container to be running and the
+  container-side path to be absolute (typed errors, checked before any backend call), and both
+  automatically create the destination's parent directory (in the guest via `exec`, on the host
+  via the stdlib) so callers never pre-create it. Directory-vs-file source and "copy into a
+  nonexistent destination" naming follow `docker cp`/`msb copy`'s own `cp -r`-style semantics on
+  both backends; docker shells out to the `docker` CLI's own `cp` (already a hard dependency via
+  the reaper's watchdog commands) rather than hand-rolling tar encode/decode against the daemon
+  API, and microsandbox uses `msb copy`. See [Copying Files](https://ngriaznov.github.io/rightsize-kotlin/copy/).
+- **Checkpoint / restore, including named/persistent checkpoints.** `checkpoint()`/`fromCheckpoint`
+  work on both backends: docker commits the running container to an image, microsandbox drives a
+  disk snapshot (`msb stop` → `msb snapshot create` → `msb rm` → a fresh attached
+  `msb run --snapshot <ref>` under the same name/ports/env/memory limit) — so
+  `capabilities.checkpoint` is `true` on both, and `capabilities.checkpointRestartsWorkload`
+  (`true` on microsandbox, whose snapshot cycle restarts the workload; `false` on docker, which
+  leaves the container undisturbed) governs whether `checkpoint()` re-applies the container's own
+  wait strategy before returning. `Checkpoint` carries `ref` (backend-shaped: a docker image tag
+  or an msb snapshot name), `backend` (the backend that created it), and `spec` (the source
+  container's env/command/exposed ports/memory limit) — restoring under a different active
+  backend than the creator throws `CheckpointBackendMismatchException` before any backend call,
+  naming both backends and the `RIGHTSIZE_BACKEND=<creator>` remedy. `SandboxBackend.createCheckpoint`/
+  `removeCheckpoint` are the backend-side primitives (docker `rmi`/msb `snapshot rm` for removal);
+  checkpoints are not auto-reaped.
+  Passing a name to `checkpoint("seeded-db")` instead makes it durable and rediscoverable from any
+  later process: the ref is derived from the name (replacing the random hex), a registry entry is
+  written under the rightsize cache directory only after the backend checkpoint succeeds, and
+  `Checkpoint.find(name)`/`list()`/`remove(name)` are the cross-process lookup/cleanup API —
+  `find` probes the artifact via the new `SandboxBackend.hasCheckpoint` SPI method and resolves a
+  stale entry (backend-side artifact gone) to absent, cleaning it up along the way. Re-checkpointing
+  an existing name replaces it: the old artifact is best-effort removed before the new one is
+  captured, and the registry entry is rewritten only once that capture succeeds. Names must match
+  `^[a-z0-9][a-z0-9-]{0,40}$`, checked before any backend call. See
+  [Checkpoint / Restore](https://ngriaznov.github.io/rightsize-kotlin/checkpoints/).
+
+### Fixed
+
+- **`MySQLContainer` readiness gets a 180-second budget** (was 120), the same treatment
+  `ClickHouseContainer` already got. A loaded Windows CI runner was observed still short of
+  ready at 123 seconds — past the previous ceiling. The budget is a deadline, not a wait —
+  readiness returns the moment the real server's `ready for connections` line appears.
 ## [0.2.0] - 2026-07-12
 
 ### Added

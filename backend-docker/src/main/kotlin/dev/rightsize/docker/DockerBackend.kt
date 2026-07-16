@@ -4,6 +4,7 @@ import com.github.dockerjava.api.DockerClient
 import com.github.dockerjava.api.async.ResultCallback
 import com.github.dockerjava.api.exception.ConflictException
 import com.github.dockerjava.api.exception.InternalServerErrorException
+import com.github.dockerjava.api.exception.NotFoundException
 import com.github.dockerjava.api.model.AccessMode
 import com.github.dockerjava.api.model.Bind
 import com.github.dockerjava.api.model.ContainerNetwork
@@ -19,6 +20,7 @@ import com.github.dockerjava.core.DockerClientImpl
 import com.github.dockerjava.zerodep.ZerodepDockerHttpClient
 import dev.rightsize.RunId
 import dev.rightsize.core.BackendCapabilities
+import dev.rightsize.core.ContainerCopyException
 import dev.rightsize.core.ContainerSpec
 import dev.rightsize.core.ExecResult
 import dev.rightsize.core.PortBindConflictException
@@ -27,8 +29,11 @@ import dev.rightsize.core.SandboxHandle
 import dev.rightsize.core.WatchdogCommands
 import dev.rightsize.core.reuse.SandboxNameCollisionException
 import java.io.ByteArrayOutputStream
+import java.io.InputStream
+import java.nio.file.Path
 import java.time.Duration
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
 
 /**
  * Fallback backend for hosts without a microVM runtime (Intel Macs, Windows, no-KVM).
@@ -38,15 +43,20 @@ import java.util.concurrent.ConcurrentHashMap
 class DockerBackend : SandboxBackend {
     override val name = "docker"
     override val supportsNativeNetworks = true
-    // Containers share the host kernel (not hardware-isolated); a stopped container can be
-    // committed to an image, so checkpoint-style capture is possible here — see
-    // GenericContainer.checkpoint() and BackendCapabilities' doc comment.
-    override val capabilities = BackendCapabilities(hardwareIsolated = false, checkpoint = true)
+    // Containers share the host kernel (not hardware-isolated); a running container can be
+    // committed to an image without disturbing it, so checkpoint-style capture is possible here
+    // and never restarts the workload — see GenericContainer.checkpoint() and
+    // BackendCapabilities' doc comment.
+    override val capabilities = BackendCapabilities(
+        hardwareIsolated = false, checkpoint = true, checkpointRestartsWorkload = false)
 
     private companion object {
         val CONNECT_TIMEOUT: Duration = Duration.ofSeconds(10)
         val RESPONSE_TIMEOUT: Duration = Duration.ofMinutes(10)
         const val STOP_TIMEOUT_SEC = 10
+        // `docker cp`'s own timeout (see copyToContainer/copyFromContainer) — generous for a
+        // large directory copy, same order of magnitude as MsbCliBackend's EXEC_TIMEOUT_SEC.
+        const val COPY_TIMEOUT_SEC = 120L
         // Reuse container names are "rz-reuse-<12hex-of-hash>" — see docs/reuse.md.
         const val REUSE_NAME_PREFIX = "rz-reuse-"
     }
@@ -190,21 +200,93 @@ class DockerBackend : SandboxBackend {
      * Backs `GenericContainer.checkpoint()` via the engine's commit endpoint (docker-java's
      * `commitCmd`, `POST /commit?container=...&repo=...&tag=...`) — the container's current
      * filesystem becomes a new, ordinary image the daemon otherwise treats no differently from
-     * a pulled one. [imageRef] is always `repo:tag` shaped (minted by `GenericContainer.checkpoint`
-     * as `rightsize/checkpoint:<12-hex>`); [repoAndTag] does the split.
+     * a pulled one, and the container itself is left running undisturbed
+     * (`capabilities.checkpointRestartsWorkload = false`). [ref] is always `repo:tag` shaped
+     * (minted by `GenericContainer.checkpoint` as `rightsize/checkpoint:<12-hex>`); [repoAndTag]
+     * does the split.
      */
-    override fun commitToImage(handle: SandboxHandle, imageRef: String) {
-        val (repo, tag) = repoAndTag(imageRef)
+    override fun createCheckpoint(handle: SandboxHandle, ref: String) {
+        val (repo, tag) = repoAndTag(ref)
         client.commitCmd(handle.id).withRepository(repo).withTag(tag).exec()
     }
 
     /** `internal`, not `private`: unit-tested directly in [DockerBackendTest] without a daemon —
-     * everything else about [commitToImage] needs a real one. */
+     * everything else about [createCheckpoint] needs a real one. */
     internal fun repoAndTag(imageRef: String): Pair<String, String> {
         val idx = imageRef.indexOf(':')
         require(idx > 0) { "imageRef must be 'repo:tag', got '$imageRef'" }
         return imageRef.substring(0, idx) to imageRef.substring(idx + 1)
     }
+
+    /** Best-effort `docker rmi -f` of a checkpoint's image tag — "not found" is success, same
+     * contract as [removeByName]. Checkpoint images are never auto-pruned (see
+     * docs/checkpoints.md); this exists so tests can keep shared CI state clean. */
+    override fun removeCheckpoint(ref: String) {
+        runCatching { client.removeImageCmd(ref).withForce(true).exec() }
+    }
+
+    /**
+     * `docker image inspect <ref>` — a [NotFoundException] means the tag genuinely doesn't exist
+     * (`false`); any OTHER failure (daemon unreachable, a malformed ref, etc.) is not caught here
+     * and propagates instead, per the SPI contract (see docs/checkpoints.md) — unlike
+     * [removeCheckpoint]'s best-effort `runCatching`, a probe failure must never look like a
+     * definite "gone".
+     */
+    override fun hasCheckpoint(ref: String): Boolean = probeExists { client.inspectImageCmd(ref).exec() }
+
+    /**
+     * [hasCheckpoint]'s NotFoundException-only narrowing, pulled out from behind the real daemon
+     * call so it's unit-testable without a live `DockerClient` (see [DockerBackendTest]) —
+     * [inspect] is expected to throw [NotFoundException] for "genuinely absent" and let any other
+     * exception (daemon unreachable, etc.) propagate untouched. `internal`, not `private`, purely
+     * for that direct test access.
+     */
+    internal fun probeExists(inspect: () -> Unit): Boolean = try {
+        inspect()
+        true
+    } catch (e: NotFoundException) {
+        false
+    }
+
+    /**
+     * Runtime copy (see docs/copy.md), both directions: shells out to the `docker` CLI's own
+     * `cp` subcommand rather than driving the daemon's raw archive-extract API directly.
+     * `docker cp` implements `cp -r`-style destination-naming semantics (rename-on-extract for a
+     * nonexistent destination) client-side, ahead of the daemon call — reimplementing that
+     * correctly via `copyArchiveToContainerCmd`/`copyArchiveFromContainerCmd` would mean
+     * hand-rolling the same logic against a raw tar stream. The docker CLI is already a hard
+     * requirement for this backend (the reaper's watchdog commands shell out to it too), so this
+     * adds no new external dependency.
+     */
+    override fun copyToContainer(handle: SandboxHandle, hostPath: Path, containerPath: String) =
+        runDockerCli("cp", hostPath.toString(), "${handle.id}:$containerPath")
+
+    override fun copyFromContainer(handle: SandboxHandle, containerPath: String, hostPath: Path) =
+        runDockerCli("cp", "${handle.id}:$containerPath", hostPath.toString())
+
+    /** Runs a `docker` CLI invocation to completion, draining both streams concurrently (same
+     * shape as `MsbCliBackend`'s own `invoke` helper) to avoid deadlocking on a full pipe buffer.
+     * Throws [ContainerCopyException] carrying stderr on a non-zero exit or a timeout — a failed
+     * copy must never look like a silent success. */
+    private fun runDockerCli(vararg args: String) {
+        val proc = ProcessBuilder("docker", *args).start()
+        val stderr = StringBuilder()
+        val tOut = drain(proc.inputStream) {}
+        val tErr = drain(proc.errorStream) { stderr.appendLine(it) }
+        if (!proc.waitFor(COPY_TIMEOUT_SEC, TimeUnit.SECONDS)) {
+            proc.destroyForcibly()
+            throw ContainerCopyException("docker ${args.joinToString(" ")} timed out after ${COPY_TIMEOUT_SEC}s and was force-killed")
+        }
+        tOut.join(); tErr.join()
+        if (proc.exitValue() != 0) {
+            throw ContainerCopyException(
+                "docker ${args.joinToString(" ")} failed (exit ${proc.exitValue()}): ${stderr.toString().trim()}")
+        }
+    }
+
+    /** Drains [stream] on a daemon thread, one line per [onLine]; returns the thread for joining. */
+    private fun drain(stream: InputStream, onLine: (String) -> Unit): Thread =
+        Thread { stream.bufferedReader().forEachLine(onLine) }.apply { isDaemon = true; start() }
 
     override fun exec(handle: SandboxHandle, cmd: List<String>): ExecResult {
         val exec = client.execCreateCmd(handle.id).withCmd(*cmd.toTypedArray())

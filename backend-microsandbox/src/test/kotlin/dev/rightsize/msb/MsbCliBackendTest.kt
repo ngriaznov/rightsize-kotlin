@@ -27,10 +27,11 @@ class MsbCliBackendTest {
         assertDoesNotThrow { backend.removeByName("rz-doesnotexist-1") }
     }
 
-    @Test fun `capabilities is hardware-isolated but does not support checkpoint`() {
+    @Test fun `capabilities is hardware-isolated and supports checkpoint via disk snapshot, which restarts the workload`() {
         val capabilities = MsbCliBackend(msbPath).capabilities
         assertTrue(capabilities.hardwareIsolated, "each msb sandbox is its own microVM")
-        assertFalse(capabilities.checkpoint)
+        assertTrue(capabilities.checkpoint, "msb supports checkpoint via disk snapshot")
+        assertTrue(capabilities.checkpointRestartsWorkload, "the stop/snapshot/start cycle restarts the workload")
     }
 
     /** A fake `msb` executable that counts its own `rm` invocations in [counterFile] and, on

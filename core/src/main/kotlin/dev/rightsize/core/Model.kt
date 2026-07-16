@@ -1,5 +1,7 @@
 package dev.rightsize.core
 
+import dev.rightsize.core.checkpoint.CheckpointRegistry
+import dev.rightsize.core.checkpoint.validateCheckpointName
 import java.nio.file.Path
 
 /** A host↔guest port map entry: the runtime binds [hostPort] on loopback, forwards to [guestPort]. */
@@ -29,6 +31,15 @@ data class ContainerSpec(
      * `.sandboxes` file — a reuse sandbox must be structurally immune to any sweep.
      */
     val keepAlive: Boolean = false,
+    /**
+     * Set by `GenericContainer.fromCheckpoint` to the source [Checkpoint.ref] — docker ignores
+     * it (the ref already IS `image`, so the normal create path just works); msb boots via
+     * `msb run --snapshot <checkpointRef>` instead of its normal image boot when this is set,
+     * keeping every other flag (name, ports, env, memory) identical. Never part of reuse
+     * identity (see `dev.rightsize.core.reuse.ReuseFromCheckpointConflictException`) — reuse and
+     * `fromCheckpoint` are not a supported combination.
+     */
+    val checkpointRef: String? = null,
 )
 
 /** Opaque per-backend container reference; [id] is backend-native, [spec] is what created it. */
@@ -84,22 +95,99 @@ data class CheckpointSpec(
 
 /**
  * The result of `GenericContainer.checkpoint()`: a filesystem snapshot of a running container,
- * captured as a committed image ([imageRef], `rightsize/checkpoint:<12-hex>`, random per call)
- * plus enough of the source container's configuration ([spec]) to boot an equivalent one via
- * `GenericContainer.fromCheckpoint`. This is a filesystem capture, not a memory snapshot — a
- * restored container's processes restart from scratch. See docs/checkpoints.md.
+ * captured via whichever backend was active ([backend], `"docker"`/`"microsandbox"` — matching
+ * `RIGHTSIZE_BACKEND`) plus enough of the source container's configuration ([spec]) to boot an
+ * equivalent one via `GenericContainer.fromCheckpoint`. [ref]'s shape is backend-specific: a
+ * docker image tag (`rightsize/checkpoint:<12-hex>`) or an msb snapshot name
+ * (`rz-ckpt-<12-hex>`) for an unnamed checkpoint (random per call), or the same shapes with a
+ * caller-chosen name in place of the hex (`rightsize/checkpoint:<name>` / `rz-ckpt-<name>`) for
+ * `GenericContainer.checkpoint(name)`. This is a filesystem capture, not a memory snapshot — a
+ * restored container's processes restart from scratch. Restoring under a different active
+ * backend than the one that created it throws [CheckpointBackendMismatchException] before any
+ * backend call. See docs/checkpoints.md.
+ *
+ * [spec] is a [CheckpointSpec], never the full original [ContainerSpec] — this holds whether the
+ * [Checkpoint] came straight back from `GenericContainer.checkpoint()`/`checkpoint(name)` or was
+ * rediscovered later via `Checkpoint.find`/`Checkpoint.list`: only the restore-relevant fields
+ * `fromCheckpoint` actually reads (`env`, `command`, `exposedPorts`, `memoryLimitMb`) are ever
+ * carried, not the source container's name, host ports, mounts, network, or run id.
  */
-data class Checkpoint(val imageRef: String, val spec: CheckpointSpec)
+data class Checkpoint(val ref: String, val backend: String, val spec: CheckpointSpec) {
+    companion object {
+        /**
+         * Rediscovers the checkpoint created by `GenericContainer.checkpoint(name)` in ANY
+         * process — against the active backend (`Backends.active()`) and the real rightsize
+         * cache dir (`CacheDir.resolve()`) — see docs/checkpoints.md's "Reusing checkpoints
+         * across runs" section. `null` when no registry entry exists for [name], the entry is
+         * corrupt (best-effort cleaned up), or the entry's backend matches the active one but its
+         * artifact is gone (also cleaned up as stale). An entry recorded under a DIFFERENT
+         * backend than the active one is returned WITHOUT probing — restoring it still goes
+         * through `GenericContainer.fromCheckpoint`'s own [CheckpointBackendMismatchException]
+         * gate. See [CheckpointRegistry.find] for the actual logic, unit-tested there directly
+         * against fakes and a temp directory.
+         *
+         * [name] is validated (throwing [dev.rightsize.core.checkpoint.InvalidCheckpointNameException]
+         * on a non-matching shape) before either `Backends.active()` or `CacheDir.resolve()` runs
+         * — the same before-any-real-work placement `GenericContainer.checkpoint(name)` uses on
+         * the write path, not merely relying on [CheckpointRegistry.file]'s own boundary check
+         * (which still validates again regardless, in depth).
+         */
+        fun find(name: String): Checkpoint? {
+            validateCheckpointName(name)
+            return CheckpointRegistry(CacheDir.resolve()).find(Backends.active(), name)
+        }
+
+        /** Every named checkpoint currently in the registry — no artifact probing (unlike
+         * [find]), so a stale entry is still listed here; only [find]/[remove] resolve
+         * staleness. See [CheckpointRegistry.list]. */
+        fun list(): List<Checkpoint> = CheckpointRegistry(CacheDir.resolve()).list()
+
+        /** Best-effort removes [name]'s backend artifact (via the active backend's
+         * `removeCheckpoint`) and its registry entry. `true` only if a registry entry actually
+         * existed; idempotent either way — calling it again on the same [name] is always safe.
+         * [name] is validated the same way, at the same point, as [find]. See [CheckpointRegistry.remove]. */
+        fun remove(name: String): Boolean {
+            validateCheckpointName(name)
+            return CheckpointRegistry(CacheDir.resolve()).remove(Backends.active(), name)
+        }
+    }
+}
 
 /**
  * Thrown by `GenericContainer.checkpoint()` when the active backend's `capabilities.checkpoint`
- * is false — e.g. microsandbox, which has no upstream image-commit or snapshot primitive yet.
- * Raised before any backend call, same as [IsolationRequiredException]. Points at the docker
- * backend and the roadmap (native microVM memory snapshots, which need upstream microsandbox
- * support) as the remedy.
+ * is false. Raised before any backend call, same as [IsolationRequiredException]. Both real
+ * backends (docker, microsandbox) support checkpoint today — this only fires for a backend
+ * that doesn't declare the capability (e.g. a test double).
  */
 class CheckpointUnsupportedException(backend: String) : RuntimeException(
-    "checkpoint() requires a backend with checkpoint support, but the active backend is " +
-        "'$backend', which does not support it — set RIGHTSIZE_BACKEND=docker to use the docker " +
-        "backend, which implements checkpoint via image commit (native microVM memory snapshots for " +
-        "microsandbox are on the roadmap)")
+    "checkpoint() requires a backend with checkpoint support (capabilities.checkpoint), but the " +
+        "active backend is '$backend', which does not support it")
+
+/**
+ * Thrown by `GenericContainer.fromCheckpoint(cp).start()` when the active backend differs from
+ * the one that created [Checkpoint.ref] — an msb snapshot name is meaningless to docker and a
+ * docker image tag is meaningless to msb. Raised before any backend call, same as
+ * [IsolationRequiredException].
+ */
+class CheckpointBackendMismatchException(creatorBackend: String, activeBackend: String) : RuntimeException(
+    "This checkpoint was created by the '$creatorBackend' backend, but the active backend is " +
+        "'$activeBackend' — set RIGHTSIZE_BACKEND=$creatorBackend to restore it, or call " +
+        "checkpoint() again under '$activeBackend' to create one it can restore")
+
+/**
+ * Thrown by `GenericContainer.copyFileToContainer`/`copyContentToContainer`/
+ * `copyFileFromContainer` when the given container path is not absolute — both `msb copy` and
+ * `docker cp` require a `NAME:/abs/path` shape, so a relative path is rejected before any
+ * backend call. See docs/copy.md.
+ */
+class NonAbsoluteContainerPathException(path: String) : RuntimeException(
+    "Container path '$path' must be absolute (start with '/') — both backends require an " +
+        "absolute guest path for a runtime copy")
+
+/**
+ * Thrown when a backend's runtime copy ([dev.rightsize.core.SandboxBackend.copyToContainer]/
+ * [dev.rightsize.core.SandboxBackend.copyFromContainer]) fails — carries the underlying tool's
+ * stderr, so a failed copy (missing source in the guest, permission denied, etc.) is never a
+ * silent success. See docs/copy.md.
+ */
+class ContainerCopyException(message: String, cause: Throwable? = null) : RuntimeException(message, cause)

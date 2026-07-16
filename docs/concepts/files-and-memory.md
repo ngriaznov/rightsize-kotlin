@@ -3,8 +3,11 @@
 ## `MountableFile`
 
 `MountableFile` describes a file to mount into a container via
-`GenericContainer.withCopyFileToContainer(file, guestPath)`. Build one from either a
-host path or a classpath resource:
+`GenericContainer.withCopyFileToContainer(file, guestPath)`. This is a **start-time** mount,
+configured before `start()` — see [Copying Files](../copy.md) for the runtime equivalent
+(`copyFileToContainer`/`copyContentToContainer`/`copyFileFromContainer`), which acts on an
+already-running container in either direction. Build a `MountableFile` from either a host path or
+a classpath resource:
 
 ```kotlin
 val fromDisk = MountableFile.forHostPath("/absolute/or/relative/path/on/disk")

@@ -13,7 +13,7 @@ production).
 | Command | `start-dev` |
 | Env | `KC_BOOTSTRAP_ADMIN_USERNAME=admin`, `KC_BOOTSTRAP_ADMIN_PASSWORD=admin`, `KC_HEALTH_ENABLED=true` |
 | Memory limit | `withMemoryLimit(1024)` — see below |
-| Wait strategy | `Wait.forHttp("/health").forPort(9000).withStartupTimeout(Duration.ofSeconds(120))` |
+| Wait strategy | `Wait.forHttp("/health").forPort(9000).withStartupTimeout(Duration.ofSeconds(180))` |
 
 ## Helpers
 

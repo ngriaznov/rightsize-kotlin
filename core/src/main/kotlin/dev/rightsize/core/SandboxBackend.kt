@@ -1,5 +1,7 @@
 package dev.rightsize.core
 
+import java.nio.file.Path
+
 /** A tunnel/alias route: inside the consumer, `alias:guestPort` must reach `127.0.0.1:targetHostPort` on the host. */
 data class NetworkLink(val alias: String, val guestPort: Int, val targetHostPort: Int)
 
@@ -30,12 +32,21 @@ data class BackendCapabilities(
      * [dev.rightsize.core.IsolationRequiredException]/`GenericContainer.withRequireIsolation`. */
     val hardwareIsolated: Boolean,
     /**
-     * True when the backend can checkpoint/restore a running sandbox — Docker: `true`, via
-     * image commit; microsandbox: `false`, no upstream snapshot primitive yet. See
+     * True when the backend can checkpoint/restore a running sandbox — both real backends today:
+     * Docker via image commit, microsandbox via disk snapshot. See
      * [dev.rightsize.core.CheckpointUnsupportedException]/`GenericContainer.checkpoint` and
      * docs/checkpoints.md.
      */
     val checkpoint: Boolean,
+    /**
+     * True when a [checkpoint] cycle restarts the sandbox's workload — Docker: `false`, the
+     * container is committed and left running undisturbed; microsandbox: `true`, its disk
+     * snapshot needs the sandbox stopped, so the workload command re-runs from scratch once it
+     * resumes. `GenericContainer.checkpoint` re-applies the container's own wait strategy before
+     * returning when this is true, so a caller never gets back a false-ready container. Defaults
+     * to `false`, the safer assumption for a backend that hasn't declared it.
+     */
+    val checkpointRestartsWorkload: Boolean = false,
 )
 
 /**
@@ -92,17 +103,71 @@ interface SandboxBackend : AutoCloseable {
      * don't participate in reaping. */
     val watchdogCommands: WatchdogCommands get() = WatchdogCommands()
     /**
-     * Commits [handle]'s current filesystem to a new image tagged [imageRef] — the backend
+     * Captures [handle]'s current filesystem as a checkpoint identified by [ref] — the backend
      * primitive behind `GenericContainer.checkpoint()`. Only ever called when
      * [capabilities]`.checkpoint` is true: the generic layer gates on that flag BEFORE reaching
-     * this method, so a backend that doesn't support it (microsandbox today — no upstream
-     * image-commit or snapshot primitive) never needs a real implementation. Defaults to
-     * throwing [UnsupportedByBackendException] for exactly that reason — a defensive backstop,
-     * since the capability gate above should make this unreachable in practice.
+     * this method, so a backend that doesn't support it never needs a real implementation.
+     * [ref]'s shape is backend-specific and already minted by the generic layer before this
+     * call — a docker image tag (`rightsize/checkpoint:<12-hex>`) or an msb snapshot name
+     * (`rz-ckpt-<12-hex>`); this method does only the capture. Docker commits the running
+     * container to an image, leaving it undisturbed ([capabilities]`.checkpointRestartsWorkload`
+     * = `false`); microsandbox stops the sandbox, snapshots its disk, then resumes it
+     * (`checkpointRestartsWorkload = true`, since the resumed workload restarts from scratch —
+     * see docs/checkpoints.md). Defaults to throwing [UnsupportedByBackendException] — a
+     * defensive backstop, since the capability gate above should make this unreachable in
+     * practice.
      */
-    fun commitToImage(handle: SandboxHandle, imageRef: String): Unit =
+    fun createCheckpoint(handle: SandboxHandle, ref: String): Unit =
         throw UnsupportedByBackendException("checkpoint", name,
-            "use the docker backend, which implements checkpoint via image commit")
+            "the active backend must advertise capabilities.checkpoint to support this")
+    /**
+     * Best-effort removal of a checkpoint identified by [ref] — docker removes the tagged image
+     * (`docker rmi`), msb removes the snapshot (`msb snapshot rm`). "Not found" is treated as
+     * success, the same contract as [removeByName]. SPI-only: no public `GenericContainer`
+     * method calls this — checkpoint images/snapshots are not auto-pruned (see
+     * docs/checkpoints.md's manual cleanup one-liners for users); this exists as a
+     * backend-internal affordance so tests can keep shared CI state clean. Defaults to a no-op
+     * for backends that don't participate in checkpointing (e.g. test doubles).
+     */
+    fun removeCheckpoint(ref: String) {}
+    /**
+     * Probes whether a checkpoint identified by [ref] still exists — docker via image inspect,
+     * msb via `msb snapshot inspect`'s exit code, both through the same invocation plumbing every
+     * other SPI method already uses. Backs `Checkpoint.find`'s staleness check (see
+     * docs/checkpoints.md's "Reusing checkpoints across runs" section): unlike
+     * [removeByName]/[removeCheckpoint], a probe FAILURE must never be swallowed into `false` —
+     * only a definite "no such checkpoint" resolves to `false`; any other failure (the backend
+     * itself unreachable, a malformed [ref], etc.) must propagate, so `Checkpoint.find` never
+     * silently mistakes a broken host for a missing checkpoint. Defaults to throwing
+     * [UnsupportedByBackendException] for backends that don't implement it (e.g. test doubles) —
+     * the same defensive-backstop posture [createCheckpoint]'s default has.
+     */
+    fun hasCheckpoint(ref: String): Boolean =
+        throw UnsupportedByBackendException("checkpoint probe", name,
+            "the active backend must implement hasCheckpoint to support named-checkpoint rediscovery")
+    /**
+     * Copies [hostPath] (a file or directory) into the running container at [containerPath] —
+     * the backend primitive behind `GenericContainer.copyFileToContainer`/
+     * `copyContentToContainer`. By the time this is called, the generic layer has already
+     * verified the container is running, that [containerPath] is absolute, and created its
+     * parent directory in the guest (via the existing [exec] SPI) — this method does only the
+     * transfer. Directory-vs-file source and "copy into a nonexistent destination" naming follow
+     * the same `cp -r`-style semantics `docker cp`/`msb copy` already have (see docs/copy.md).
+     * Defaults to throwing [UnsupportedByBackendException] for backends that don't implement it
+     * (e.g. test doubles).
+     */
+    fun copyToContainer(handle: SandboxHandle, hostPath: Path, containerPath: String): Unit =
+        throw UnsupportedByBackendException("runtime copy", name)
+    /**
+     * Copies [containerPath] (a file or directory) out of the running container to [hostPath] —
+     * the backend primitive behind `GenericContainer.copyFileFromContainer`. By the time this is
+     * called, the generic layer has already verified the container is running, that
+     * [containerPath] is absolute, and created [hostPath]'s parent directory on the host — this
+     * method does only the transfer. Defaults to throwing [UnsupportedByBackendException] for
+     * backends that don't implement it (e.g. test doubles).
+     */
+    fun copyFromContainer(handle: SandboxHandle, containerPath: String, hostPath: Path): Unit =
+        throw UnsupportedByBackendException("runtime copy", name)
     /** Runs [cmd] inside the running container and returns its exit code plus captured output. */
     fun exec(handle: SandboxHandle, cmd: List<String>): ExecResult
     /** The container's full captured logs so far. */
