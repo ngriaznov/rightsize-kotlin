@@ -93,6 +93,26 @@ class CheckpointRegistry(cacheDir: Path) {
     }
 
     /**
+     * Reverse lookup: the full record of the entry (if any) whose [CheckpointRecord.ref] and
+     * [CheckpointRecord.backend] equal [ref]/[backendName] — used by
+     * [dev.rightsize.core.checkpoint.CheckpointArchiver.exportArchive] to recover a checkpoint's
+     * `name`/`createdIso` when exporting a bare `Checkpoint`, which carries neither itself. Same
+     * no-artifact-probing posture as [list] (this is metadata-only, not a staleness check); `null`
+     * when nothing matches, including the ordinary case of an unnamed checkpoint that was never
+     * registered under any name at all.
+     */
+    fun findByRef(ref: String, backendName: String): CheckpointRecord? {
+        if (!Files.isDirectory(dir)) return null
+        val files = runCatching {
+            Files.list(dir).use { it.filter { p -> p.toString().endsWith(".json") }.toList() }
+        }.getOrDefault(emptyList())
+        return files.firstNotNullOfOrNull { f ->
+            runCatching { Files.readString(f) }.getOrNull()?.let(CheckpointRecord::parse)
+                ?.takeIf { it.ref == ref && it.backend.equals(backendName, ignoreCase = true) }
+        }
+    }
+
+    /**
      * `Checkpoint.remove(name)`'s actual logic: best-effort backend-artifact removal (via
      * [SandboxBackend.removeCheckpoint], itself best-effort/idempotent on both real backends)
      * plus deleting the registry file. The artifact-removal call is gated on [record]'s `backend`

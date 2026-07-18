@@ -13,13 +13,15 @@ restarting it from a captured filesystem. That needs a memory-snapshot
 primitive upstream in microsandbox itself, beyond the disk-snapshot one it
 has today; once available, it would also make restore near-instant.
 
-## Portable checkpoint archives
+## Self-contained archives
 
-Named checkpoints (see [Checkpoint / Restore](checkpoints.md)) are rediscoverable across
-processes on the SAME machine, but the artifact itself — a docker image, an msb snapshot — never
-leaves it. Export/import (`docker save`/`docker load`, `msb snapshot export`/an equivalent
-import) would let a checkpoint travel between machines or ride along in a CI cache, rather than
-being re-seeded from scratch on every runner.
+Portable checkpoint archives have shipped (`exportTo`/`importFrom` — see
+[Checkpoint / Restore](checkpoints.md#moving-checkpoints-between-machines)), but neither backend
+bundles the container image itself: a restored container still pulls it normally on first boot.
+Bundling the OCI image into the archive too — so an archive boots offline, with no registry
+reachable at all — needs msb's `snapshot export --with-image` to stop failing its own import
+integrity check (a known issue as of 0.6.6) before it's viable there; the docker side is more
+tractable (an image `save` already exists) but only worth doing once both backends can offer it.
 
 ## Module breadth
 

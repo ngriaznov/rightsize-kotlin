@@ -146,6 +146,33 @@ interface SandboxBackend : AutoCloseable {
         throw UnsupportedByBackendException("checkpoint probe", name,
             "the active backend must implement hasCheckpoint to support named-checkpoint rediscovery")
     /**
+     * Writes checkpoint [ref]'s backend payload to [dest] — the artifact half of a portable
+     * checkpoint archive (see docs/checkpoints.md's "Moving checkpoints between machines"
+     * section) behind `Checkpoint.exportTo`: docker `docker save -o <dest> <ref>`, microsandbox
+     * `msb snapshot export <ref> <dest>` (never `--with-image`; its import fails an integrity
+     * check on msb 0.6.6, so archives never bundle the OCI image — the destination machine pulls
+     * it on the restored container's first boot instead). Only ever called after the generic
+     * layer's own backend-match and [hasCheckpoint] checks have both passed. Defaults to
+     * throwing [UnsupportedByBackendException] for backends that don't implement it.
+     */
+    fun exportCheckpoint(ref: String, dest: Path): Unit =
+        throw UnsupportedByBackendException("checkpoint export", name,
+            "the active backend must implement exportCheckpoint to support Checkpoint.exportTo")
+    /**
+     * Materializes an archive's extracted artifact payload at [src] as a checkpoint reachable by
+     * some ref, and returns that EFFECTIVE ref — behind `Checkpoint.importFrom`. This is not
+     * always [ref] itself: `docker load` preserves the original tag, so docker returns [ref]
+     * unchanged, but microsandbox's `msb snapshot import` mints a content-addressed digest-shaped
+     * ref of its own, discarding the original snapshot name entirely — treating an
+     * already-exists failure as success (the artifact is already present) either way. Only ever
+     * called after the generic layer's own archive validation (format version, name, backend
+     * match) has passed. Defaults to throwing [UnsupportedByBackendException] for backends that
+     * don't implement it.
+     */
+    fun importCheckpoint(src: Path, ref: String): String =
+        throw UnsupportedByBackendException("checkpoint import", name,
+            "the active backend must implement importCheckpoint to support Checkpoint.importFrom")
+    /**
      * Copies [hostPath] (a file or directory) into the running container at [containerPath] —
      * the backend primitive behind `GenericContainer.copyFileToContainer`/
      * `copyContentToContainer`. By the time this is called, the generic layer has already

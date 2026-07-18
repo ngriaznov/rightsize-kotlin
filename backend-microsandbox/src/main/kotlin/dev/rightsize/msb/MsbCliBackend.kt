@@ -45,6 +45,10 @@ class MsbCliBackend(internal val msb: Path) : SandboxBackend {
         // `msb snapshot create` writes a full disk image (sparse — a tiny alpine snapshot was
         // observed at 3.9 MB on disk despite a "4 GiB" nominal size) — generous but bounded.
         const val SNAPSHOT_TIMEOUT_SEC = 180L
+        // `msb snapshot export`/`import` (see exportCheckpoint/importCheckpoint) — same order of
+        // magnitude as SNAPSHOT_TIMEOUT_SEC, the artifact they move is the same payload.
+        const val SNAPSHOT_EXPORT_TIMEOUT_SEC = 300L
+        const val SNAPSHOT_IMPORT_TIMEOUT_SEC = 300L
         const val ATTACHED_PROC_STOP_TIMEOUT_SEC = 10L
         const val READER_JOIN_TIMEOUT_MS = 2000L
         const val TAIL_LINES = 50
@@ -341,6 +345,59 @@ class MsbCliBackend(internal val msb: Path) : SandboxBackend {
         error("msb snapshot inspect $ref failed (exit ${r.exitCode}): " +
             "${r.stderr.trim().ifEmpty { r.stdout.trim() }}")
     }
+
+    /**
+     * Backs `Checkpoint.exportTo` (see docs/checkpoints.md's "Moving checkpoints between
+     * machines" section): `msb snapshot export <ref> <dest>` writes [ref]'s `.tar.zst` artifact
+     * to [dest], byte-for-byte what [importCheckpoint]'s `snapshot import` reads back.
+     */
+    override fun exportCheckpoint(ref: String, dest: Path) {
+        val r = invoke(MsbCommands.snapshotExport(ref, dest), SNAPSHOT_EXPORT_TIMEOUT_SEC)
+        if (r.exitCode != 0) {
+            error("msb snapshot export $ref $dest failed (exit ${r.exitCode}): " +
+                "${r.stderr.trim().ifEmpty { r.stdout.trim() }}")
+        }
+    }
+
+    /**
+     * Backs `Checkpoint.importFrom`: `msb snapshot import <src>` unpacks [src] into a
+     * DIGEST-derived directory under `~/.microsandbox/snapshots/` — the original snapshot name
+     * ([ref]) is NOT preserved, so [ref] itself is unused beyond being part of this method's
+     * signature (the SPI contract every backend shares; docker's own [ref] IS its effective ref,
+     * unlike this one). Importing an archive whose digest already exists fails with msb's own
+     * `error: snapshot already exists: <path>` — for a content-addressed archive that IS success
+     * (the artifact is already present), so [isSnapshotAlreadyExists] treats it as one; any OTHER
+     * failure surfaces with stderr. Either way, the printed line ends with the artifact path
+     * whose basename is the digest-dir name ([parseImportedDigestDir]); [confirmDigestDirPresent]
+     * then cross-references `msb snapshot list --format json` to make sure that basename is
+     * genuinely registered. That digest-dir name (`sha256-<16hex>`) — NOT the full
+     * `sha256:<64hex>` digest — is the EFFECTIVE ref this returns: verified empirically that msb
+     * does not resolve the full digest as a snapshot ref at all (`msb snapshot inspect
+     * sha256:<full>` fails "snapshot not found", treating it as a literal path), while the
+     * digest-dir name resolves for `run --snapshot`, `snapshot rm`, and `snapshot inspect` alike.
+     */
+    override fun importCheckpoint(src: Path, ref: String): String {
+        val r = invoke(MsbCommands.snapshotImport(src), SNAPSHOT_IMPORT_TIMEOUT_SEC)
+        val alreadyExists = r.exitCode != 0 && isSnapshotAlreadyExists(r.stderr)
+        if (r.exitCode != 0 && !alreadyExists) {
+            error("msb snapshot import $src failed (exit ${r.exitCode}): " +
+                "${r.stderr.trim().ifEmpty { r.stdout.trim() }}")
+        }
+        val output = if (alreadyExists) r.stderr else r.stdout
+        val digestDir = parseImportedDigestDir(output)
+            ?: error("could not parse the imported snapshot's path from msb snapshot import output: ${output.trim()}")
+        if (!confirmDigestDirPresent(digestDir)) {
+            error("msb snapshot import reported digest-dir '$digestDir', but msb snapshot list --format json " +
+                "has no matching entry")
+        }
+        return digestDir
+    }
+
+    /** `msb snapshot list --format json` -> [MsbSnapshotListJson.contains], confirming
+     * [digestDir] (the basename [importCheckpoint] parsed from `snapshot import`'s own output) is
+     * a genuinely registered snapshot before it's handed back as the effective ref. */
+    private fun confirmDigestDirPresent(digestDir: String): Boolean =
+        MsbSnapshotListJson.contains(invoke(MsbCommands.snapshotList(), LOGS_TIMEOUT_SEC).stdout, digestDir)
 
     /**
      * Runtime copy (see docs/copy.md), both directions: `msb copy -q <src> <name>:<dst>` /
@@ -703,3 +760,34 @@ internal fun isMsbStateDbError(output: String): Boolean = "error: database error
  * returning `false` for it.
  */
 internal fun isCheckpointMiss(stderr: String): Boolean = "error: snapshot not found:" in stderr
+
+/**
+ * True if [stderr] (from `msb snapshot import`) names msb's own "already exists" outcome, as
+ * opposed to some other import failure. Observed verbatim against the real msb 0.6.6 binary:
+ *
+ * ```
+ * error: snapshot already exists: /path/to/.microsandbox/snapshots/sha256-b9c0448ee9d54e33
+ * ```
+ *
+ * For a content-addressed archive this IS success — the artifact is already present on this
+ * host, e.g. a re-run of the same import — so [MsbCliBackend.importCheckpoint] treats it as one
+ * rather than as a genuine failure; any exit-nonzero output that does NOT match this wording is
+ * a real import failure and surfaces with stderr instead.
+ */
+internal fun isSnapshotAlreadyExists(stderr: String): Boolean = "snapshot already exists:" in stderr
+
+/**
+ * Parses the digest-dir basename (e.g. `sha256-b9c0448ee9d54e33`) from `msb snapshot import`'s
+ * own output. Verified against msb 0.6.6: on both an ordinary success and the
+ * already-exists-as-success outcome ([isSnapshotAlreadyExists]), the last non-blank line ends
+ * with the artifact's full path under `~/.microsandbox/snapshots/<digest-dir>` — this takes that
+ * line's final whitespace-separated token as the path and returns its filename. `null` if
+ * [output] has no non-blank line at all, or that line's last token is empty. `internal` for
+ * direct unit-test access against captured sample output, without a real msb binary.
+ */
+internal fun parseImportedDigestDir(output: String): String? {
+    val lastLine = output.lines().map { it.trim() }.lastOrNull { it.isNotEmpty() } ?: return null
+    val token = lastLine.substringAfterLast(' ').trim()
+    if (token.isEmpty()) return null
+    return Path.of(token).fileName?.toString()
+}

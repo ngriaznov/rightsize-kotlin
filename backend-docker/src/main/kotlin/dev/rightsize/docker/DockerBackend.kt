@@ -59,6 +59,10 @@ class DockerBackend : SandboxBackend {
         const val COPY_TIMEOUT_SEC = 120L
         // Reuse container names are "rz-reuse-<12hex-of-hash>" — see docs/reuse.md.
         const val REUSE_NAME_PREFIX = "rz-reuse-"
+        // `docker save`/`docker load` (see exportCheckpoint/importCheckpoint) — a full image tar
+        // can be sizable; generous but bounded, same order of magnitude as MsbCliBackend's own
+        // SNAPSHOT_TIMEOUT_SEC.
+        const val SAVE_LOAD_TIMEOUT_SEC = 180L
     }
 
     private val client: DockerClient by lazy {
@@ -235,6 +239,29 @@ class DockerBackend : SandboxBackend {
     override fun hasCheckpoint(ref: String): Boolean = probeExists { client.inspectImageCmd(ref).exec() }
 
     /**
+     * Backs `Checkpoint.exportTo` (see docs/checkpoints.md's "Moving checkpoints between
+     * machines" section): `docker save -o <dest> <ref>` writes the image as a plain tar,
+     * byte-for-byte what [importCheckpoint]'s `docker load` reads back. Shells out to the
+     * `docker` CLI rather than docker-java's API, the same choice [copyToContainer]/
+     * [copyFromContainer] already made (the CLI is a hard dependency here regardless, via the
+     * reaper's watchdog commands).
+     */
+    override fun exportCheckpoint(ref: String, dest: Path) =
+        runDockerCli("save", "-o", dest.toString(), ref, timeoutSec = SAVE_LOAD_TIMEOUT_SEC, onFailure = { error(it) })
+
+    /**
+     * Backs `Checkpoint.importFrom`: `docker load -i <src>` preserves the image's original tag
+     * (`Loaded image: <tag>` — reloading over an existing tag re-points it), so the effective ref
+     * this returns is [ref] itself, unchanged — unlike microsandbox, whose `snapshot import`
+     * mints its own content-addressed ref (see `MsbCliBackend.importCheckpoint` in the sibling
+     * `backend-microsandbox` module).
+     */
+    override fun importCheckpoint(src: Path, ref: String): String {
+        runDockerCli("load", "-i", src.toString(), timeoutSec = SAVE_LOAD_TIMEOUT_SEC, onFailure = { error(it) })
+        return ref
+    }
+
+    /**
      * [hasCheckpoint]'s NotFoundException-only narrowing, pulled out from behind the real daemon
      * call so it's unit-testable without a live `DockerClient` (see [DockerBackendTest]) —
      * [inspect] is expected to throw [NotFoundException] for "genuinely absent" and let any other
@@ -266,21 +293,30 @@ class DockerBackend : SandboxBackend {
 
     /** Runs a `docker` CLI invocation to completion, draining both streams concurrently (same
      * shape as `MsbCliBackend`'s own `invoke` helper) to avoid deadlocking on a full pipe buffer.
-     * Throws [ContainerCopyException] carrying stderr on a non-zero exit or a timeout — a failed
-     * copy must never look like a silent success. */
-    private fun runDockerCli(vararg args: String) {
+     * [onFailure] is handed the message on a non-zero exit or a timeout and must never return —
+     * a failed invocation must never look like a silent success. [copyToContainer]/
+     * [copyFromContainer] use the default [ContainerCopyException]; [exportCheckpoint]/
+     * [importCheckpoint] pass a plain [error] instead, since that exception type's own contract
+     * is scoped to the copy operations. Streams are joined only after the process has actually
+     * exited (naturally or via [Process.destroyForcibly]) — joining first would block on a
+     * timed-out process that's still writing output. */
+    private fun runDockerCli(
+        vararg args: String,
+        timeoutSec: Long = COPY_TIMEOUT_SEC,
+        onFailure: (String) -> Nothing = { throw ContainerCopyException(it) },
+    ) {
         val proc = ProcessBuilder("docker", *args).start()
         val stderr = StringBuilder()
         val tOut = drain(proc.inputStream) {}
         val tErr = drain(proc.errorStream) { stderr.appendLine(it) }
-        if (!proc.waitFor(COPY_TIMEOUT_SEC, TimeUnit.SECONDS)) {
-            proc.destroyForcibly()
-            throw ContainerCopyException("docker ${args.joinToString(" ")} timed out after ${COPY_TIMEOUT_SEC}s and was force-killed")
-        }
+        val finished = proc.waitFor(timeoutSec, TimeUnit.SECONDS)
+        if (!finished) proc.destroyForcibly()
         tOut.join(); tErr.join()
+        if (!finished) {
+            onFailure("docker ${args.joinToString(" ")} timed out after ${timeoutSec}s and was force-killed")
+        }
         if (proc.exitValue() != 0) {
-            throw ContainerCopyException(
-                "docker ${args.joinToString(" ")} failed (exit ${proc.exitValue()}): ${stderr.toString().trim()}")
+            onFailure("docker ${args.joinToString(" ")} failed (exit ${proc.exitValue()}): ${stderr.toString().trim()}")
         }
     }
 

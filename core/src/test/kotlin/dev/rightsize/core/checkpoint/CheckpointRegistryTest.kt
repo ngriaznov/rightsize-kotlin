@@ -342,4 +342,48 @@ class CheckpointRegistryTest {
         assertTrue(backend.removedRefs.isEmpty(), "a different-backend entry must never reach removeCheckpoint")
         assertNull(registry.read("seeded-db"), "the registry entry must still be deleted regardless of the backend mismatch")
     }
+
+    // --- findByRef: the reverse lookup CheckpointArchiver.exportArchive uses to recover a bare
+    // Checkpoint's name/createdIso (see CheckpointArchiverTest) ---
+
+    @Test fun `findByRef returns null when the registry directory doesn't exist yet`(@TempDir tmp: Path) {
+        assertNull(CheckpointRegistry(tmp).findByRef("rightsize/checkpoint:0123456789ab", "docker"))
+    }
+
+    @Test fun `findByRef returns null when no entry matches the ref`(@TempDir tmp: Path) {
+        val registry = CheckpointRegistry(tmp)
+        registry.write("seeded-db", record("seeded-db", "rightsize/checkpoint:0123456789ab", "docker"))
+        assertNull(registry.findByRef("rightsize/checkpoint:other", "docker"))
+    }
+
+    @Test fun `findByRef returns the record whose ref and backend both match`(@TempDir tmp: Path) {
+        val registry = CheckpointRegistry(tmp)
+        val ref = "rightsize/checkpoint:0123456789ab"
+        val r = record("seeded-db", ref, "docker")
+        registry.write("seeded-db", r)
+        assertEquals(r, registry.findByRef(ref, "docker"))
+    }
+
+    @Test fun `findByRef matches the backend case-insensitively`(@TempDir tmp: Path) {
+        val registry = CheckpointRegistry(tmp)
+        val ref = "rightsize/checkpoint:0123456789ab"
+        registry.write("seeded-db", record("seeded-db", ref, "Docker"))
+        assertNotNull(registry.findByRef(ref, "docker"))
+    }
+
+    @Test fun `findByRef does not match an entry with the same ref but a different backend`(@TempDir tmp: Path) {
+        val registry = CheckpointRegistry(tmp)
+        val ref = "rz-ckpt-0123456789ab"
+        registry.write("seeded-db", record("seeded-db", ref, "microsandbox"))
+        assertNull(registry.findByRef(ref, "docker"))
+    }
+
+    @Test fun `findByRef skips a corrupt entry rather than throwing`(@TempDir tmp: Path) {
+        val registry = CheckpointRegistry(tmp)
+        val ref = "rightsize/checkpoint:0123456789ab"
+        registry.write("good", record("good", ref, "docker"))
+        Files.createDirectories(tmp.resolve("checkpoints"))
+        Files.writeString(registry.file("bad"), "{ not valid json")
+        assertEquals(ref, registry.findByRef(ref, "docker")?.ref)
+    }
 }

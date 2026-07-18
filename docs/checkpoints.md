@@ -288,3 +288,87 @@ docker rmi rightsize/checkpoint:<12-hex-or-name>
 # microsandbox
 msb snapshot rm rz-ckpt-<12-hex-or-name>
 ```
+
+## Moving checkpoints between machines
+
+Everything above rediscovers a checkpoint on the SAME machine that created it — the registry
+entry points at a local docker image or a local msb snapshot, neither of which travels on its
+own. `exportTo`/`importFrom` package a checkpoint into a single portable archive file, so it can
+ride along in a CI cache, an artifact store, or a plain `scp`, instead of being re-seeded from
+scratch on every runner:
+
+```kotlin
+val cp = db.checkpoint("seeded-db")
+cp.exportTo(Path.of("seeded-db.tar"))   // a plain tar: pinned metadata + the backend's own payload
+
+// ...on this machine later, or on another one running the SAME backend:
+val restored = Checkpoint.importFrom(Path.of("seeded-db.tar"))
+GenericContainer.fromCheckpoint(restored).start()
+```
+
+The CI-cache pattern this exists for: seed and `checkpoint("seeded-db")` once, `exportTo` the
+archive, cache the archive file across runs — every later run skips the seed step entirely by
+`importFrom`-ing the cached archive instead of re-seeding from scratch. `Checkpoint.find("seeded-db")`
+still works as the first line of defense (same machine, same process history); `importFrom` is
+what covers the cache-miss/fresh-runner case.
+
+### The archive format
+
+A plain tar with exactly two members at its root — no container-level compression (msb's payload
+is already zstd-compressed; a docker `save` tar compresses poorly enough not to matter here):
+
+- `checkpoint.json` — the same pinned shape as a [named checkpoint's registry entry](#the-registry),
+  plus a format version and a nullable `name` (an exported UNNAMED checkpoint carries `name: null`).
+- `artifact` — the backend's own payload file, byte-for-byte what the backend CLI produced: an
+  msb `snapshot export` `.tar.zst`, or a docker `save` tar.
+
+### Not bundled: the OCI image
+
+`exportTo` never bundles the container image itself, on either backend — a docker archive is the
+committed layer(s) on top of the base image, not the base image; an msb archive is the disk
+snapshot artifact alone (`msb snapshot export` deliberately never runs with `--with-image`, whose
+import fails an integrity check on msb 0.6.6). The destination machine pulls the image normally on
+the restored container's first boot, exactly as it would for any other container using that image
+— make sure it's reachable there (a private registry needs the same credentials it would for a
+fresh pull).
+
+### API
+
+- **`Checkpoint.exportTo(path)`** — requires the ACTIVE backend to equal the checkpoint's own
+  `backend`, or throws `CheckpointBackendMismatchException` before any backend or filesystem work
+  (the same typed mismatch `fromCheckpoint`/`checkpoint(name)`'s replace path already use).
+  Requires the backend artifact to still exist (`SandboxBackend.hasCheckpoint`), or throws a typed
+  error rather than writing a broken archive. `path`'s parent directories are created if missing;
+  an existing file there is overwritten.
+- **`Checkpoint.importFrom(path)`** — validates `checkpoint.json` (format version, `name` against
+  the checkpoint-name grammar when present, and its recorded `backend` against the active one)
+  entirely before any backend call; a missing file, a malformed archive, or a wrong-backend one
+  throws a typed error. On success, returns a `Checkpoint` carrying the backend's EFFECTIVE ref —
+  see below — and, for a NAMED archive, re-registers it under that name with the same replace
+  semantics `checkpoint(name)` uses (the old same-backend artifact is best-effort removed first).
+  A nameless archive returns an ephemeral `Checkpoint` with no registry write. Either way, the
+  returned `Checkpoint` restores via `GenericContainer.fromCheckpoint` exactly like any other —
+  refs are opaque, and nothing downstream cares how one was minted.
+
+### The effective ref: msb mints a digest, docker round-trips the tag
+
+The ref a checkpoint restores by is not always the archived one:
+
+| | docker | microsandbox |
+|---|---|---|
+| Import mechanism | `docker load -i <archive>` | `msb snapshot import <archive>` |
+| Effective ref after import | The original tag, unchanged (`Loaded image: <tag>`) | A fresh DIGEST — the original snapshot name is never preserved |
+
+An imported msb checkpoint therefore shows up in `Checkpoint.find`/`list` with a digest-shaped
+ref (e.g. `sha256-b9c0448ee9d54e33`) instead of the `rz-ckpt-<name-or-hex>` shape a locally created
+one has — harmless, since every backend operation that takes a checkpoint ref (`fromCheckpoint`,
+`snapshot rm`, `snapshot inspect`) resolves "path, name, or digest" identically. Importing an
+archive whose content already exists on the destination (matched by digest) is itself a success,
+not an error — the artifact is already there.
+
+### Archive size expectations
+
+msb archives are the zstd-compressed sparse disk snapshot — small for a lightly modified image (a
+tiny alpine snapshot's on-disk artifact was observed at a few MB despite a multi-GiB nominal disk
+size). docker archives are a full `docker save`, proportional to the image's own size plus
+whatever layers the checkpoint committed on top.

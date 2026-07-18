@@ -5,11 +5,11 @@
 **Testcontainers-style integration testing on microVMs. No Docker required.**
 
 rightsize runs your integration-test containers as hardware-isolated
-[microsandbox](https://github.com/superradcompany/microsandbox) microVMs — one microVM
-per container — behind a Testcontainers-shaped Kotlin API. The runtime self-provisions
+[microsandbox](https://github.com/superradcompany/microsandbox) microVMs - one microVM
+per container - behind a Testcontainers-shaped Kotlin API. The runtime self-provisions
 on first use (one Gradle dependency, zero install steps), and a Docker backend covers
 the platforms microVMs can't reach. If you know Testcontainers, you already know this
-API — that's deliberate.
+API - that's deliberate.
 
 ```kotlin
 @Sandboxed
@@ -41,8 +41,8 @@ class OrderServiceTest {
 | Image pulls | multi-arch (ArangoDB ≈ 600 MB) | single-arch layers (ArangoDB ≈ 203 MB) |
 | Wall-clock (real 14-class Spring Boot suite) | 165 s | **164 s** |
 
-The benchmark row is a real measured suite — fourteen `@SpringBootTest` classes booting
-ArangoDB, clustered Redis, Redpanda, and WireMock per class — run back-to-back on the
+The benchmark row is a real measured suite - fourteen `@SpringBootTest` classes booting
+ArangoDB, clustered Redis, Redpanda, and WireMock per class - run back-to-back on the
 same machine. MicroVM isolation costs nothing measurable end-to-end: lightweight
 containers boot in well under a second, heavyweight databases a couple of seconds slower
 than Docker, image pulls and container-to-container tests faster.
@@ -108,13 +108,13 @@ Preconfigured containers with sensible waits and connection helpers. Each is a
 | `FlinkContainer` | `restUrl`; `withTaskManager()` for a full session cluster — **Docker only**¹ |
 
 Some modules raise a memory floor for their image (`withMemoryLimit`): heavyweight JVM
-images — SpringCloudConfig, Keycloak, Neo4j, Flink (1024 MB) and Pinot's multi-JVM
-QuickStart cluster (4096 MB) — need more than the microVM default. That's baked into
+images - SpringCloudConfig, Keycloak, Neo4j, Flink (1024 MB) and Pinot's multi-JVM
+QuickStart cluster (4096 MB) - need more than the microVM default. That's baked into
 the module; you don't set it. Each module's KDoc documents its exact image tag, wait
 strategy, and the measured reasoning behind these choices.
 
 ¹ `withTaskManager()` throws `UnsupportedByBackendException` on microsandbox (the Flink
-image carries no `nc`/busybox for network-link emulation — see [Networking](#networking));
+image carries no `nc`/busybox for network-link emulation - see [Networking](#networking));
 a bare JobManager still runs on microsandbox. Run TaskManager topologies under
 `RIGHTSIZE_BACKEND=docker`.
 
@@ -138,15 +138,15 @@ names the exact precondition (see ᵇ) instead of a generic failure.
 ᵇ Force with `RIGHTSIZE_BACKEND=docker`, or enable WHP: run `msb doctor --fix` in an
 elevated terminal (may require a reboot).
 
-Both backends satisfy one behavioral contract, verified by a shared test suite — the
+Both backends satisfy one behavioral contract, verified by a shared test suite - the
 tests you write run unchanged on either. That same contract holds across languages, too:
 rightsize's Kotlin, Rust, and Node libraries behave identically for the same container
-spec, verified by each repo's own contract suite — see [Cross-Language
+spec, verified by each repo's own contract suite - see [Cross-Language
 Parity](https://ngriaznov.github.io/rightsize-kotlin/parity/). A few edges are
 backend-specific rather than behavioral divergences:
 
 - **Network-alias tunnels on microsandbox have real limits** versus Docker's native
-  bridge networking — see [Networking](#networking).
+  bridge networking - see [Networking](#networking).
 - **Read-only file mounts aren't enforced in-guest on microsandbox 0.6.2.**
   `FileMount.readOnly` is honored by Docker; on microsandbox the guest currently gets a
   writable mount regardless. Don't rely on guest-side write protection under
@@ -171,8 +171,8 @@ val app = GenericContainer("my-service:latest")
 ```
 
 `Network.resolve(alias, port)` returns `alias:port` on **both** backends. On Docker that's
-a native network alias. On microsandbox — where microVMs are fully isolated from each
-other — rightsize transparently installs an `/etc/hosts` entry plus a TCP relay tunneled
+a native network alias. On microsandbox - where microVMs are fully isolated from each
+other - rightsize transparently installs an `/etc/hosts` entry plus a TCP relay tunneled
 over the sandbox's exec channel.
 
 The microVM emulation has limits worth knowing: start dependencies before their consumers,
@@ -182,25 +182,26 @@ actionable error.
 
 ## Reliability & lifecycle
 
-- **Orphan reaping.** A crashed or `SIGKILL`ed process can't leak sandboxes — every process
+- **Orphan reaping.** A crashed or `SIGKILL`ed process can't leak sandboxes - every process
   writes a small ownership ledger, and an always-on init-time sweep plus an optional per-run
   watchdog reap a dead run's leftovers, on both backends. Controlled by `RIGHTSIZE_REAPER`.
 - **Container reuse.** `withReuse()` plus the `RIGHTSIZE_REUSE` opt-in keeps a container
-  running across `stop()` and process exit; the next equivalent container — this process or
-  a later one — adopts it instead of booting fresh, identity decided by a cross-language
+  running across `stop()` and process exit; the next equivalent container - this process or
+  a later one - adopts it instead of booting fresh, identity decided by a cross-language
   identity hash over the container's config.
-- **Failure diagnostics.** `Diagnostics.report()` — and the `@Sandboxed` extension
-  automatically on test failure — prints every currently-live container's state, mapped
+- **Failure diagnostics.** `Diagnostics.report()` - and the `@Sandboxed` extension
+  automatically on test failure - prints every currently-live container's state, mapped
   ports, and last 50 log lines.
 - **Isolation requirement.** `withRequireIsolation()` fails `start()` immediately when the
   active backend isn't hardware-isolated, instead of silently running untrusted code under
   Docker's weaker guarantee.
-- **Checkpoint / restore.** `checkpoint()` captures a running container's filesystem — a new
+- **Checkpoint / restore.** `checkpoint()` captures a running container's filesystem - a new
   image on Docker, a disk snapshot on microsandbox; `fromCheckpoint(cp)` boots an ordinary
-  container from it — seed a fixture once per suite, restore it once per test instead of
+  container from it - seed a fixture once per suite, restore it once per test instead of
   re-running migrations every time. Pass a name (`checkpoint("seeded-db")`) to make it durable
-  and reusable across runs — later processes find it again via `Checkpoint.find`/`list`/`remove`
-  instead of re-seeding.
+  and reusable across runs - later processes find it again via `Checkpoint.find`/`list`/`remove`
+  instead of re-seeding. `exportTo`/`importFrom` package a checkpoint into a portable archive
+  file, for moving one to another machine or caching it across CI runs.
 - **Runtime file copy.** `copyFileToContainer`/`copyContentToContainer`/`copyFileFromContainer`
   move files, directories, or in-memory content into or out of an already-running container on
   both backends, parent directories created automatically on either side.
@@ -209,13 +210,13 @@ actionable error.
 
 - **Self-provisioning runtime.** A pinned `msb` release (binary + libkrunfw) is downloaded
   once, SHA-256-verified against the release manifest, and installed atomically under
-  `~/.cache/rightsize/` (`%LOCALAPPDATA%\rightsize` on Windows) — the binary lands last,
+  `~/.cache/rightsize/` (`%LOCALAPPDATA%\rightsize` on Windows) - the binary lands last,
   so a crashed install is detected and repaired, never half-trusted. A cross-process file
   lock keeps parallel Gradle workers from racing.
 - **Attached-mode supervision.** Each container is a held child process supervising its
   microVM; the image's ENTRYPOINT runs exactly as it would under Docker.
 - **Pre-allocated ports.** Host ports are chosen before boot, so brokers like
-  Redpanda/Kafka get their advertised listeners baked in — no restart dance.
+  Redpanda/Kafka get their advertised listeners baked in - no restart dance.
 - **One SPI, two backends.** `SandboxBackend` is a small interface; the shared contract
   suite is the referee, with the Docker backend doubling as the correctness oracle for the
   microVM backend.
@@ -234,7 +235,7 @@ actionable error.
 ## Examples
 
 Runnable, minimally-commented examples live under [`examples/`](examples), a Gradle
-subproject (not published — see its `build.gradle.kts`) covering the plain API, the JUnit
+subproject (not published - see its `build.gradle.kts`) covering the plain API, the JUnit
 `@Sandboxed` extension, and multi-container networking:
 
 ```bash
@@ -243,7 +244,7 @@ subproject (not published — see its `build.gradle.kts`) covering the plain API
 ./gradlew :examples:runNetwork   # two containers on a Network, reached by alias
 ```
 
-Like everything else in this repo, they run on either backend — force one with
+Like everything else in this repo, they run on either backend - force one with
 `RIGHTSIZE_BACKEND=microsandbox|docker` prefixed on any of the commands above.
 
 ## Development
@@ -254,8 +255,8 @@ RIGHTSIZE_BACKEND=microsandbox ./gradlew integrationTest   # needs Apple Silicon
 RIGHTSIZE_BACKEND=docker ./gradlew integrationTest         # needs any Docker-compatible daemon
 ```
 
-CI runs the matrix on Linux (KVM), Windows (WHP), and a Docker-only job. There is
-no macOS job — GitHub's hosted Apple Silicon runners cannot nest virtualization —
+CI runs the matrix on Linux (KVM), Windows (WHP), and a Docker-only job. There's
+no macOS job - GitHub's hosted Apple Silicon runners cannot nest virtualization -
 so macOS is verified on real hardware.
 
 ## Documentation
@@ -267,5 +268,3 @@ built from [`docs/`](docs) by MkDocs.
 ## License
 
 [Apache-2.0](LICENSE)
-</content>
-</invoke>

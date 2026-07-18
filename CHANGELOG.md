@@ -7,7 +7,21 @@ reaches its first tagged release.
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- **Checkpoint export/import (portable archives).** `Checkpoint.exportTo(path)`/`Checkpoint.importFrom(path)`
+  package a checkpoint into a single portable tar (pinned `checkpoint.json` metadata plus the
+  backend's own artifact — a docker `save` tar or an msb `snapshot export` `.tar.zst`) so it can
+  ride along in a CI cache or move between machines running the same backend, instead of being
+  re-seeded from scratch on every runner. `exportTo` requires the active backend to match the
+  checkpoint's own and the artifact to still exist, both checked before any backend or filesystem
+  work; `importFrom` validates the archive (format version, name grammar, backend match) before
+  any backend call, then re-registers a NAMED archive with the same replace semantics
+  `checkpoint(name)` uses. The image itself is never bundled — the destination pulls it on the
+  restored container's first boot. `SandboxBackend.exportCheckpoint`/`importCheckpoint` are the
+  new backend-side SPI primitives; on microsandbox, import mints a fresh digest-shaped effective
+  ref (the original snapshot name is never preserved), while docker's `load` round-trips the
+  original tag unchanged. See [Checkpoint / Restore](https://ngriaznov.github.io/rightsize-kotlin/checkpoints/#moving-checkpoints-between-machines).
 
 ## [0.3.0] - 2026-07-16
 

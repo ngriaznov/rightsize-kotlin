@@ -1,5 +1,6 @@
 package dev.rightsize.core
 
+import dev.rightsize.core.checkpoint.CheckpointArchiver
 import dev.rightsize.core.checkpoint.CheckpointRegistry
 import dev.rightsize.core.checkpoint.validateCheckpointName
 import java.nio.file.Path
@@ -113,6 +114,23 @@ data class CheckpointSpec(
  * carried, not the source container's name, host ports, mounts, network, or run id.
  */
 data class Checkpoint(val ref: String, val backend: String, val spec: CheckpointSpec) {
+    /**
+     * Writes this checkpoint out as a portable archive at [path] — a plain tar containing
+     * `checkpoint.json` (this checkpoint's metadata, plus a format version) and `artifact` (the
+     * backend's own payload: a docker `save` tar or an msb `snapshot export` `.tar.zst`) — see
+     * docs/checkpoints.md's "Moving checkpoints between machines" section. Requires the ACTIVE
+     * backend (`Backends.active()`) to equal [backend], or this throws
+     * [CheckpointBackendMismatchException] before any backend or filesystem work; requires the
+     * artifact to still exist (`SandboxBackend.hasCheckpoint`), or this throws
+     * [dev.rightsize.core.checkpoint.StaleCheckpointException] rather than writing a broken
+     * archive. [path]'s parent directories are created if missing; an existing file there is
+     * overwritten. See [dev.rightsize.core.checkpoint.CheckpointArchiver.exportArchive] for the
+     * actual logic, unit-tested there directly against a fake backend and a temp directory.
+     */
+    fun exportTo(path: Path) {
+        CheckpointArchiver(CheckpointRegistry(CacheDir.resolve())).exportArchive(this, Backends.active(), path)
+    }
+
     companion object {
         /**
          * Rediscovers the checkpoint created by `GenericContainer.checkpoint(name)` in ANY
@@ -150,6 +168,28 @@ data class Checkpoint(val ref: String, val backend: String, val spec: Checkpoint
             validateCheckpointName(name)
             return CheckpointRegistry(CacheDir.resolve()).remove(Backends.active(), name)
         }
+
+        /**
+         * Materializes the archive at [path] (written by [exportTo], on this machine or another
+         * one running the same backend) as a restorable [Checkpoint] — against the active
+         * backend (`Backends.active()`) and the real rightsize cache dir (`CacheDir.resolve()`).
+         * `checkpoint.json` is validated (format version, its `name` against the checkpoint-name
+         * grammar when non-null, and its recorded `backend` against the active one) entirely
+         * before any backend call — a missing file, a malformed archive, or a wrong-backend one
+         * throws a typed error ([dev.rightsize.core.checkpoint.MalformedCheckpointArchiveException]
+         * / [CheckpointBackendMismatchException]) and never reaches `SandboxBackend.importCheckpoint`.
+         * The returned [Checkpoint] carries the backend's own EFFECTIVE ref (not necessarily the
+         * archived one — see `SandboxBackend.importCheckpoint`'s doc), and for a NAMED archive
+         * that's also what the registry entry is rewritten to point at — replace semantics
+         * matching `GenericContainer.checkpoint(name)`'s own (the old same-backend artifact is
+         * best-effort removed first). A nameless archive returns an ephemeral [Checkpoint] with
+         * no registry write. Named `importFrom`, not `import` (a reserved word in several of the
+         * sibling rightsize libraries) — the pinned name across all three. See
+         * [dev.rightsize.core.checkpoint.CheckpointArchiver.importArchive] for the actual logic,
+         * unit-tested there directly against a fake backend and a temp directory.
+         */
+        fun importFrom(path: Path): Checkpoint =
+            CheckpointArchiver(CheckpointRegistry(CacheDir.resolve())).importArchive(Backends.active(), path)
     }
 }
 

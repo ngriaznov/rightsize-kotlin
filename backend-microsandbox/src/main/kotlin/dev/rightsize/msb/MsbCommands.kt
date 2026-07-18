@@ -43,6 +43,26 @@ object MsbCommands {
     fun snapshotInspect(name: String) = listOf("snapshot", "inspect", name)
 
     /**
+     * `msb snapshot export <ref> <dest>` — writes a `.tar.zst` artifact archive for [ref] to
+     * [dest]; the artifact half of a portable checkpoint archive (see
+     * [MsbCliBackend.exportCheckpoint], docs/checkpoints.md's "Moving checkpoints between
+     * machines" section). Deliberately never `--with-image`: its import fails an integrity check
+     * ("raw manifest digest mismatch") on msb 0.6.6, so the destination machine pulls the OCI
+     * image on the restored container's first boot instead.
+     */
+    fun snapshotExport(ref: String, dest: Path) = listOf("snapshot", "export", ref, dest.toString())
+
+    /** `msb snapshot import <archive>` — unpacks [archive] into a digest-derived directory under
+     * `~/.microsandbox/snapshots/`, discarding the original snapshot name entirely (see
+     * [MsbCliBackend.importCheckpoint]). */
+    fun snapshotImport(archive: Path) = listOf("snapshot", "import", archive.toString())
+
+    /** `msb snapshot list --format json` — the only way to confirm the digest-dir basename
+     * `snapshot import` itself prints is genuinely registered (see
+     * [MsbCliBackend.importCheckpoint] and [MsbSnapshotListJson]). */
+    fun snapshotList() = listOf("snapshot", "list", "--format", "json")
+
+    /**
      * `msb copy -q <src> <name>:<dst>` — copies a host file or directory into the running
      * sandbox at [containerPath]; `-q` suppresses msb's own progress output (this backend never
      * reads copy's stdout, only its exit code and stderr on failure). See docs/copy.md.
@@ -96,4 +116,42 @@ internal object MsbLsJson {
     }.getOrDefault(emptyList()).mapNotNull { entry ->
         entry.name?.takeIf { entry.status == "Running" }
     }.toSet()
+}
+
+/** One entry of `msb snapshot list --format json`'s output — only the fields
+ * [MsbSnapshotListJson.contains] reads; `created_at`/`digest` (and anything a future msb version
+ * adds) are ignored by the `ignoreUnknownKeys` [Json] instance. `artifact_path` names the on-disk
+ * snapshot directory (whose basename is the digest-dir name `msb snapshot import` itself
+ * prints); `name` was confirmed to carry that same digest-dir value against msb 0.6.6 for an
+ * imported snapshot — matching on both `name` and `artifact_path`'s basename covers whichever
+ * one a future msb version favors.
+ */
+@Serializable
+private data class SnapshotEntry(
+    val name: String? = null,
+    val artifact_path: String? = null,
+)
+
+/**
+ * Parses `msb snapshot list --format json`, used to confirm the digest-dir basename `msb
+ * snapshot import`'s own output names is genuinely a registered snapshot (see
+ * [MsbCliBackend.importCheckpoint]). The FULL `sha256:<64hex>` `digest` field is deliberately
+ * never surfaced here: msb does not resolve it as a snapshot ref (`msb snapshot inspect
+ * sha256:<full>` fails "snapshot not found", treating it as a literal path) — only the
+ * digest-dir name (`sha256-<16hex>`) does, for `inspect`, `rm`, and `run --snapshot` alike.
+ *
+ * PIN: keep this in sync with `msb snapshot list --format json`'s actual shape if msb changes it
+ * — the msb `sandbox-it` lane is the only guard on that short of a live-CLI shape drift, same as
+ * [MsbLsJson]'s own pin.
+ */
+internal object MsbSnapshotListJson {
+    private val json = Json { ignoreUnknownKeys = true }
+
+    /** True if an entry's `name` equals [digestDir], or its `artifact_path`'s basename does —
+     * `false` if no entry matches or [json] isn't the documented array shape. */
+    fun contains(json: String, digestDir: String): Boolean = runCatching {
+        this.json.decodeFromString<List<SnapshotEntry>>(json)
+    }.getOrDefault(emptyList()).any { entry ->
+        entry.name == digestDir || entry.artifact_path?.let { Path.of(it).fileName?.toString() } == digestDir
+    }
 }
