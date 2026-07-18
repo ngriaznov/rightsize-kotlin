@@ -7,6 +7,10 @@ reaches its first tagged release.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.4.0] - 2026-07-18
+
 ### Added
 
 - **Checkpoint export/import (portable archives).** `Checkpoint.exportTo(path)`/`Checkpoint.importFrom(path)`

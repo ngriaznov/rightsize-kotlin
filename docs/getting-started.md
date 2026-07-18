@@ -11,7 +11,7 @@ consuming project needs.
 
 ```kotlin
 // build.gradle.kts
-testImplementation(platform("dev.rightsize:bom:0.3.0"))
+testImplementation(platform("dev.rightsize:bom:0.4.0"))
 testImplementation("dev.rightsize:core")
 testImplementation("dev.rightsize:modules")
 testRuntimeOnly("dev.rightsize:backend-microsandbox")

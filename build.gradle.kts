@@ -51,7 +51,7 @@ fun MavenPublication.applyRightsizePom(moduleName: String) = pom {
 
 subprojects {
     group = "dev.rightsize"
-    version = "0.4.0-SNAPSHOT"
+    version = "0.4.0"
 
     // examples/ is consumer-facing showcase code, not a published artifact: it's excluded from
     // maven-publish (and thus from the BOM's constraints) entirely, unlike every other subproject.
