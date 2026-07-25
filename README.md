@@ -89,6 +89,7 @@ Preconfigured containers with sensible waits and connection helpers. Each is a
 | Module | Helpers |
 |---|---|
 | `RedisContainer` | `uri` |
+| `ValkeyContainer` | `uri` — `redis://` scheme (RESP-compatible with Redis clients) |
 | `MemcachedContainer` | `address` |
 | `ArangoContainer` | `endpoint`; `withRootPassword(…)` to enable auth (default: no-auth) |
 | `MongoDBContainer` | `connectionString`, `replicaSetUrl` (alias) — single-node replica set, auto-initiated |
@@ -106,12 +107,14 @@ Preconfigured containers with sensible waits and connection helpers. Each is a
 | `SpringCloudConfigContainer` | `uri` |
 | `FlociContainer` | `FlociContainer.aws()`/`.azure()`/`.gcp()` factories, `endpointUrl` — [floci.io](https://floci.io) cloud emulators (unsigned REST, no SDK needed) |
 | `FlinkContainer` | `restUrl`; `withTaskManager()` for a full session cluster — **Docker only**¹ |
+| `MinIOContainer` | `endpointUrl`, `username`, `password`; `withUsername/withPassword(…)` — S3 API on port 9000 |
+| `CassandraContainer` | `contactPoint`, `cqlPort`, `localDatacenter` |
 
 Some modules raise a memory floor for their image (`withMemoryLimit`): heavyweight JVM
-images - SpringCloudConfig, Keycloak, Neo4j, Flink (1024 MB) and Pinot's multi-JVM
-QuickStart cluster (4096 MB) - need more than the microVM default. That's baked into
-the module; you don't set it. Each module's KDoc documents its exact image tag, wait
-strategy, and the measured reasoning behind these choices.
+images - SpringCloudConfig, Keycloak, Neo4j, Flink (1024 MB), Cassandra (2560 MB) and
+Pinot's multi-JVM QuickStart cluster (4096 MB) - need more than the microVM default.
+That's baked into the module; you don't set it. Each module's KDoc documents its exact
+image tag, wait strategy, and the measured reasoning behind these choices.
 
 ¹ `withTaskManager()` throws `UnsupportedByBackendException` on microsandbox (the Flink
 image carries no `nc`/busybox for network-link emulation - see [Networking](#networking));

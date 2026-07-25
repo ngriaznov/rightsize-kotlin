@@ -67,6 +67,7 @@ nav:
   - Modules:
       - Overview: modules/index.md
       - Redis: modules/redis.md
+      - Valkey: modules/valkey.md
       - ArangoDB: modules/arangodb.md
       - Memcached: modules/memcached.md
       - MongoDB: modules/mongodb.md
@@ -84,6 +85,8 @@ nav:
       - Neo4j: modules/neo4j.md
       - Floci: modules/floci.md
       - Flink: modules/flink.md
+      - MinIO: modules/minio.md
+      - Cassandra: modules/cassandra.md
   - Troubleshooting: troubleshooting.md
   - How It Works: how-it-works.md
   - Roadmap: roadmap.md

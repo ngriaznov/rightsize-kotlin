@@ -14,6 +14,7 @@ testImplementation("dev.rightsize:modules")
 | Module | Default image | Helpers |
 |---|---|---|
 | [`RedisContainer`](redis.md) | `redis:8.6-alpine` | `uri` |
+| [`ValkeyContainer`](valkey.md) | `valkey/valkey:9.1-alpine` | `uri` |
 | [`ArangoContainer`](arangodb.md) | `arangodb:3.11` | `endpoint`, `withRootPassword(...)` |
 | [`MemcachedContainer`](memcached.md) | `memcached:1.6-alpine` | `address` |
 | [`MongoDBContainer`](mongodb.md) | `mongo:8.0` | `connectionString`, `replicaSetUrl` (single-node replica set, auto-initiated) |
@@ -31,6 +32,8 @@ testImplementation("dev.rightsize:modules")
 | [`Neo4jContainer`](neo4j.md) | `neo4j:5-community` | `httpUrl`, `boltUrl`, `username`, `password`, `withPassword(...)` |
 | [`FlociContainer`](floci.md) | `floci/floci(-az\|-gcp)` | `FlociContainer.aws()`/`.azure()`/`.gcp()`, `endpointUrl` |
 | [`FlinkContainer`](flink.md) | `flink:1.20.5` | `restUrl`, `withTaskManager()` (docker only) |
+| [`MinIOContainer`](minio.md) | `minio/minio:RELEASE.2025-09-07T16-13-09Z` | `endpointUrl`, `username`, `password`, `withUsername/withPassword(...)` |
+| [`CassandraContainer`](cassandra.md) | `cassandra:5.0.8` | `contactPoint`, `cqlPort`, `localDatacenter` |
 
 Every module page includes: the default image and how to override it, the field
 defaults, every helper method, a complete copy-paste JUnit 5 test, and any
