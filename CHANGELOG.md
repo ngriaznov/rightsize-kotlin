@@ -9,6 +9,25 @@ reaches its first tagged release.
 
 Nothing yet.
 
+## [0.5.0] - 2026-07-25
+
+### Added
+
+- **`ValkeyContainer`** — a single-node Valkey container, the Redis-protocol-compatible
+  fork. Readiness is anchored on Valkey's own `Ready to accept connections` log line, and
+  `uri` returns a `redis://` URI because that is the scheme every Redis-protocol client
+  parses.
+- **`MinIOContainer`** — a single-node MinIO server, S3-compatible object storage. The
+  image needs an explicit `server /data --console-address :9001` command, which this module
+  always sets; readiness is MinIO's own `/minio/health/live` probe on the S3 API port.
+  Defaults to a `testuser`/`testpassword` root pair, since MinIO rejects a root password
+  shorter than eight characters.
+- **`CassandraContainer`** — a single-node Apache Cassandra, ready-checked on its
+  `Starting listening for CQL clients` log line. The module overrides the image's baked
+  `GPG_KEYS` value, which contains a tab: the microsandbox backend aborts before the VM
+  starts on any image whose baked environment carries one. `GPG_KEYS` is consumed only at
+  image-build time, so the override has no effect on the running server.
+
 ## [0.4.0] - 2026-07-18
 
 ### Added
@@ -324,7 +343,9 @@ Initial public release.
   exactly once; any other failure, or a second failure after the heal,
   propagates unchanged.
 
-[Unreleased]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.1.1...v0.1.2
