@@ -1,11 +1,23 @@
 package dev.rightsize.modules
 
 import dev.rightsize.GenericContainer
+import dev.rightsize.core.image.DockerImageName
 import dev.rightsize.core.wait.Wait
 import java.time.Duration
 
 /**
  * A single-node Cassandra container.
+ *
+ * ### Defaults to `cassandra:latest` — this image's floating reference
+ *
+ * With no image given, this module tracks upstream's `latest` tag rather than a version this
+ * library pins, so the version moves with Cassandra's own releases instead of this library's
+ * release cycle. Every fact below — the `GPG_KEYS` bug, the memory ladder, the readiness log line
+ * and its timing — was verified against `cassandra:5.0.8` specifically; pass that image
+ * explicitly to pin it: `CassandraContainer("cassandra:5.0.8")`. The `GPG_KEYS` override is kept
+ * unconditionally on the floating default too — whether a future Cassandra release still bakes a
+ * tab into that value has not been re-verified, so this module does not gate the override on the
+ * image chosen.
  *
  * ### `GPG_KEYS` must be overridden to a tab-free value — the difference between booting and aborting
  *
@@ -49,8 +61,12 @@ import java.time.Duration
  * returned the inserted row, run through `exec` on the started container using the `cqlsh` binary
  * the image already bundles. This module and its tests pull in no Cassandra driver dependency.
  */
-class CassandraContainer(image: String = "cassandra:5.0.8") : GenericContainer<CassandraContainer>(image) {
+class CassandraContainer(image: DockerImageName) : GenericContainer<CassandraContainer>(image.toString()) {
+    /** Defaults to `cassandra:latest` — this image's floating reference (see the class doc). */
+    constructor(image: String = "cassandra:latest") : this(DockerImageName.parse(image))
+
     init {
+        image.assertCompatibleWith(EXPECTED_REPOSITORY)
         withExposedPorts(CQL_PORT)
         // Baked GPG_KEYS contains a TAB; msb 0.6.6 SIGABRTs on any TAB in an image's baked env
         // before the guest is reachable. See the class doc for the exact panic signature.
@@ -71,5 +87,6 @@ class CassandraContainer(image: String = "cassandra:5.0.8") : GenericContainer<C
 
     private companion object {
         const val CQL_PORT = 9042
+        const val EXPECTED_REPOSITORY = "cassandra"
     }
 }

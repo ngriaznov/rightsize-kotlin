@@ -1,6 +1,7 @@
 package dev.rightsize.modules
 
 import dev.rightsize.GenericContainer
+import dev.rightsize.core.image.DockerImageName
 import dev.rightsize.core.wait.Wait
 import java.time.Duration
 
@@ -9,6 +10,16 @@ import java.time.Duration
  * an embedded ZooKeeper, all as one process tree inside one image, started with `QuickStart -type
  * EMPTY` (a clean cluster with no demo tables — this module is a real-cluster smoke fixture, not
  * a data-loading harness).
+ *
+ * ### Defaults to `apachepinot/pinot:latest` — this image's floating reference
+ *
+ * With no image given, this module tracks upstream's `latest` tag rather than a version this
+ * library pins, so the version moves with Pinot's own releases instead of this library's release
+ * cycle. Every fact below — the port assignments and, especially, the 4096 MB memory floor tied
+ * to this image's own baked `-Xmx4G` — was measured against `apachepinot/pinot:1.5.1`
+ * specifically; a future Pinot release could change its baked heap request and shift where that
+ * floor actually needs to sit. Pass that image explicitly to pin the measured version:
+ * `PinotContainer("apachepinot/pinot:1.5.1")`.
  *
  * ### Ports — empirically verified, not the QuickStart docs' assumption
  *
@@ -52,8 +63,12 @@ import java.time.Duration
  * the image's own 4 GiB heap request, not merely enough to avoid the OOM killer. Verified stable
  * on both Docker and microsandbox.
  */
-class PinotContainer(image: String = "apachepinot/pinot:1.5.1") : GenericContainer<PinotContainer>(image) {
+class PinotContainer(image: DockerImageName) : GenericContainer<PinotContainer>(image.toString()) {
+    /** Defaults to `apachepinot/pinot:latest` — this image's floating reference (see the class doc). */
+    constructor(image: String = "apachepinot/pinot:latest") : this(DockerImageName.parse(image))
+
     init {
+        image.assertCompatibleWith(EXPECTED_REPOSITORY)
         withExposedPorts(CONTROLLER_PORT, BROKER_PORT)
         withCommand("QuickStart", "-type", "EMPTY")
         // Four JVMs (ZK, controller, broker, server/minion) in one container, image bakes in
@@ -74,5 +89,6 @@ class PinotContainer(image: String = "apachepinot/pinot:1.5.1") : GenericContain
     private companion object {
         const val CONTROLLER_PORT = 9000
         const val BROKER_PORT = 8000
+        const val EXPECTED_REPOSITORY = "apachepinot/pinot"
     }
 }

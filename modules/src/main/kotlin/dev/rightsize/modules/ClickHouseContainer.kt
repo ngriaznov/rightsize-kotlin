@@ -1,18 +1,27 @@
 package dev.rightsize.modules
 
 import dev.rightsize.GenericContainer
+import dev.rightsize.core.image.DockerImageName
 import dev.rightsize.core.wait.Wait
 import java.time.Duration
 
 /**
  * A single-node ClickHouse container, queried over its HTTP interface (port 8123). The native
  * protocol port (9000) is exposed too, but this module's helpers are HTTP-first: the HTTP
- * interface needs no client dependency in either language (`java.net.http.HttpClient` /
- * `ureq`), matching the house convention for HTTP-first modules like [PinotContainer].
+ * interface needs no client dependency at all (`java.net.http.HttpClient` covers it), matching
+ * the house convention for HTTP-first modules like [PinotContainer].
  *
  * Defaults to a `test`/`test` user/password pair and a `test` database so [httpUrl] plus basic
  * auth is usable with zero configuration; call [withUsername]/[withPassword]/[withDatabase]
  * before [start] to override any of them.
+ *
+ * ### Defaults to `clickhouse/clickhouse-server:latest` — this image's floating reference
+ *
+ * With no image given, this module tracks upstream's `latest` tag rather than a version this
+ * library pins, so the version moves with ClickHouse's own releases instead of this library's
+ * release cycle. The facts below were verified against `clickhouse/clickhouse-server:25.8` (LTS)
+ * specifically — pass that image explicitly to pin it:
+ * `ClickHouseContainer("clickhouse/clickhouse-server:25.8")`.
  *
  * ### Env var names — verified against a real boot
  *
@@ -35,13 +44,17 @@ import java.time.Duration
  * ~12s IT round-trip on msb, no memory-ladder escalation needed) — a single-node ClickHouse
  * server, unlike Pinot's four-JVM QuickStart cluster, is not a JVM process at all.
  */
-class ClickHouseContainer(image: String = "clickhouse/clickhouse-server:25.8") :
-    GenericContainer<ClickHouseContainer>(image) {
+class ClickHouseContainer(image: DockerImageName) :
+    GenericContainer<ClickHouseContainer>(image.toString()) {
+    /** Defaults to `clickhouse/clickhouse-server:latest` — this image's floating reference (see the class doc). */
+    constructor(image: String = "clickhouse/clickhouse-server:latest") : this(DockerImageName.parse(image))
+
     private var usernameState = "test"
     private var passwordState = "test"
     private var databaseState = "test"
 
     init {
+        image.assertCompatibleWith(EXPECTED_REPOSITORY)
         withExposedPorts(HTTP_PORT, NATIVE_PORT)
         withEnv("CLICKHOUSE_USER", usernameState)
         withEnv("CLICKHOUSE_PASSWORD", passwordState)
@@ -86,5 +99,6 @@ class ClickHouseContainer(image: String = "clickhouse/clickhouse-server:25.8") :
     private companion object {
         const val HTTP_PORT = 8123
         const val NATIVE_PORT = 9000
+        const val EXPECTED_REPOSITORY = "clickhouse/clickhouse-server"
     }
 }

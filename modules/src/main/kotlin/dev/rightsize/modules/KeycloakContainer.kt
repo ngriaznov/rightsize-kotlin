@@ -1,12 +1,23 @@
 package dev.rightsize.modules
 
 import dev.rightsize.GenericContainer
+import dev.rightsize.core.image.DockerImageName
 import dev.rightsize.core.wait.Wait
 import java.time.Duration
 
 /**
  * A single-node Keycloak container in `start-dev` mode (in-memory H2, no external database —
  * fine for tests, never for production).
+ *
+ * ### Defaults to `quay.io/keycloak/keycloak:latest` — this image's floating reference
+ *
+ * With no image given, this module tracks upstream's `latest` tag rather than a version this
+ * library pins, so the version moves with Keycloak's own releases instead of this library's
+ * release cycle. Every fact below — the admin bootstrap env names, the management-port health
+ * path, the memory ladder — was verified against `quay.io/keycloak/keycloak:26.4` specifically;
+ * pass that image explicitly to pin it: `KeycloakContainer("quay.io/keycloak/keycloak:26.4")`.
+ * The compatibility check strips the `quay.io` registry host and expects the repository
+ * `keycloak/keycloak`.
  *
  * ### Admin bootstrap env — 26.x renamed these, verified against the pinned tag
  *
@@ -35,12 +46,15 @@ import java.time.Duration
  * No control characters were found in the image's baked env (checked via `docker
  * inspect`), so no env override is needed here.
  */
-class KeycloakContainer(image: String = "quay.io/keycloak/keycloak:26.4") :
-    GenericContainer<KeycloakContainer>(image) {
+class KeycloakContainer(image: DockerImageName) : GenericContainer<KeycloakContainer>(image.toString()) {
+    /** Defaults to `quay.io/keycloak/keycloak:latest` — this image's floating reference (see the class doc). */
+    constructor(image: String = "quay.io/keycloak/keycloak:latest") : this(DockerImageName.parse(image))
+
     private var adminUsernameState = "admin"
     private var adminPasswordState = "admin"
 
     init {
+        image.assertCompatibleWith(EXPECTED_REPOSITORY)
         withExposedPorts(HTTP_PORT, MANAGEMENT_PORT)
         withCommand("start-dev")
         withEnv("KC_BOOTSTRAP_ADMIN_USERNAME", adminUsernameState)
@@ -77,5 +91,6 @@ class KeycloakContainer(image: String = "quay.io/keycloak/keycloak:26.4") :
     private companion object {
         const val HTTP_PORT = 8080
         const val MANAGEMENT_PORT = 9000
+        const val EXPECTED_REPOSITORY = "keycloak/keycloak"
     }
 }

@@ -10,11 +10,21 @@ exposed and its URI available via `boltUrl` for callers who do want a real drive
 
 | | |
 |---|---|
-| Default image | `neo4j:5-community` |
+| Default image | `neo4j:latest` — this image's floating reference (see below) |
 | Exposed ports | `7474` (HTTP — what the helpers use), `7687` (bolt, exposed but not wrapped by a helper) |
 | Env | `NEO4J_AUTH=neo4j/rightsize-test` |
 | Memory limit | `withMemoryLimit(1024)` — see below |
 | Wait strategy | `Wait.forLogMessage(".*Started\\..*", 1).withStartupTimeout(Duration.ofSeconds(120))` |
+
+With no image given, this module tracks upstream's `latest` tag rather than a version
+this library pins, so the version moves with Neo4j's own releases instead of this
+library's release cycle. The facts below (the captured log excerpt, the memory-refusal
+behavior) were verified against `neo4j:5-community` specifically — pass that image
+explicitly to pin it:
+
+```kotlin
+Neo4jContainer("neo4j:5-community")
+```
 
 ## Helpers
 
@@ -110,3 +120,20 @@ with no memory cap sits at ~468 MiB RSS (`docker stats`), just over that default
 budget. Retried with `-m 1024M`: boots clean, the HTTP Cypher endpoint answers within
 the startup timeout. This module ships with `withMemoryLimit(1024)` for exactly this
 reason, the same number as [Keycloak](keycloak.md).
+
+## Compatibility checking
+
+Passing an explicit image checks its repository against the one this module
+understands (`neo4j`) before any port, wait-strategy, or backend work runs — a
+mismatched image fails fast with a typed `IncompatibleImageException` naming both
+repositories, rather than degrading into a bare wait-strategy timeout. To use a
+differently-named image on purpose (a private mirror, a hardened rebuild), wrap it
+with the escape hatch:
+
+```kotlin
+Neo4jContainer(
+    DockerImageName.parse("mycorp/neo4j-hardened:5-community")
+        .asCompatibleSubstituteFor("neo4j"))
+```
+
+See [Core Concepts](../concepts/containers.md) for `DockerImageName` itself.

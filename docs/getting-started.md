@@ -86,7 +86,7 @@ work as plain objects:
 import dev.rightsize.GenericContainer
 import dev.rightsize.core.wait.Wait
 
-val arango = GenericContainer("arangodb:3.11")
+val arango = GenericContainer("arangodb:latest")
     .withEnv("ARANGO_NO_AUTH", "1")
     .withExposedPorts(8529)
     .waitingFor(Wait.forHttp("/_api/version").forPort(8529))

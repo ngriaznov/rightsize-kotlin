@@ -8,12 +8,25 @@ production).
 
 | | |
 |---|---|
-| Default image | `quay.io/keycloak/keycloak:26.4` |
+| Default image | `quay.io/keycloak/keycloak:latest` — this image's floating reference (see below) |
 | Exposed ports | `8080` (HTTP / auth server), `9000` (management — health lives here, see below) |
 | Command | `start-dev` |
 | Env | `KC_BOOTSTRAP_ADMIN_USERNAME=admin`, `KC_BOOTSTRAP_ADMIN_PASSWORD=admin`, `KC_HEALTH_ENABLED=true` |
 | Memory limit | `withMemoryLimit(1024)` — see below |
 | Wait strategy | `Wait.forHttp("/health").forPort(9000).withStartupTimeout(Duration.ofSeconds(180))` |
+
+With no image given, this module tracks upstream's `latest` tag rather than a version
+this library pins, so the version moves with Keycloak's own releases instead of this
+library's release cycle. Every fact below — the admin bootstrap env names, the
+management-port health path, the memory ladder — was verified against
+`quay.io/keycloak/keycloak:26.4` specifically; pass that image explicitly to pin it:
+
+```kotlin
+KeycloakContainer("quay.io/keycloak/keycloak:26.4")
+```
+
+The compatibility check strips the `quay.io` registry host and expects the repository
+`keycloak/keycloak`.
 
 ## Helpers
 
@@ -98,3 +111,20 @@ Paketo/Quarkus-on-microVM story as
 [Spring Cloud Config](spring-cloud-config.md#backend-notes). Retried with `-m 1024M`:
 boots clean, `/health` reports `200` well within the startup timeout. This module
 ships with `withMemoryLimit(1024)` for exactly this reason.
+
+## Compatibility checking
+
+Passing an explicit image checks its repository — with any registry host stripped —
+against the one this module understands (`keycloak/keycloak`) before any port,
+wait-strategy, or backend work runs — a mismatched image fails fast with a typed
+`IncompatibleImageException` naming both repositories, rather than degrading into a
+bare wait-strategy timeout. To use a differently-named image on purpose (a private
+mirror, a hardened rebuild), wrap it with the escape hatch:
+
+```kotlin
+KeycloakContainer(
+    DockerImageName.parse("mycorp/keycloak-hardened:26.4")
+        .asCompatibleSubstituteFor("keycloak/keycloak"))
+```
+
+See [Core Concepts](../concepts/containers.md) for `DockerImageName` itself.

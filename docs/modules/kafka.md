@@ -7,10 +7,20 @@ ZooKeeper).
 
 | | |
 |---|---|
-| Default image | `apache/kafka:4.0.0` |
+| Default image | `apache/kafka:latest` — this image's floating reference (see below) |
 | Exposed port | `9092` |
 | Env | KRaft single-node config (`KAFKA_PROCESS_ROLES=broker,controller`, `KAFKA_NODE_ID=1`, etc.); `KAFKA_HEAP_OPTS=-Xmx256M -Xms256M` (see below) |
 | Wait strategy | `Wait.forLogMessage(".*Kafka Server started.*")` |
+
+With no image given, this module tracks upstream's `latest` tag rather than a version
+this library pins, so the version moves with Kafka's own releases instead of this
+library's release cycle. This module previously pinned `apache/kafka:4.0.0`, the
+version the `KAFKA_HEAP_OPTS` override below was verified against; pass that image
+explicitly to pin it:
+
+```kotlin
+KafkaContainer("apache/kafka:4.0.0")
+```
 
 ## Helpers
 
@@ -91,3 +101,20 @@ KRaft dev broker runs comfortably in a 256 MB heap, so this module sets
 which isn't memory-constrained the same way, and necessary on microsandbox. If you
 override the image and hit an OOM/insufficient-memory abort on microsandbox, check
 whether the image bakes in a large default heap the way this one did.
+
+## Compatibility checking
+
+Passing an explicit image checks its repository against the one this module
+understands (`apache/kafka`) before any port, wait-strategy, or backend work runs — a
+mismatched image fails fast with a typed `IncompatibleImageException` naming both
+repositories, rather than degrading into a bare wait-strategy timeout. To use a
+differently-named image on purpose (a private mirror, a hardened rebuild), wrap it
+with the escape hatch:
+
+```kotlin
+KafkaContainer(
+    DockerImageName.parse("mycorp/kafka-hardened:4.0.0")
+        .asCompatibleSubstituteFor("apache/kafka"))
+```
+
+See [Core Concepts](../concepts/containers.md) for `DockerImageName` itself.

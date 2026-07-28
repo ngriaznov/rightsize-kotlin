@@ -68,6 +68,21 @@ class IsolationRequiredException(backend: String) : RuntimeException(
         "which runs each sandbox in its own microVM")
 
 /**
+ * Thrown by a module's constructor (via
+ * [dev.rightsize.core.image.DockerImageName.assertCompatibleWith]) when an explicitly supplied
+ * image's repository doesn't match the repository the module declares it understands — e.g.
+ * `PostgreSQLContainer("mysql:8")`. Raised from the module's `init` block, before any port,
+ * wait-strategy, or backend work, so a mismatched image never degrades into a bare
+ * wait-strategy timeout against the wrong server. To use a differently-named image on purpose —
+ * a private mirror, a hardened rebuild, a rename — wrap it first:
+ * `DockerImageName.parse("mycorp/pg-hardened:16").asCompatibleSubstituteFor("postgres")`.
+ */
+class IncompatibleImageException(suppliedRepository: String, expectedRepository: String) : RuntimeException(
+    "Image repository '$suppliedRepository' is not compatible with the expected repository " +
+        "'$expectedRepository' — if this is intentional, wrap it first: " +
+        "DockerImageName.parse(\"$suppliedRepository...\").asCompatibleSubstituteFor(\"$expectedRepository\")")
+
+/**
  * Signals that a backend's `start()` failed because a host port it tried to bind was already in
  * use by something else. Backend authors should throw this directly when they can positively
  * identify the condition (e.g. from a structured error the runtime returns), so

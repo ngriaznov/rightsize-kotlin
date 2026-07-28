@@ -1,12 +1,13 @@
 package dev.rightsize.modules
 
 import dev.rightsize.GenericContainer
+import dev.rightsize.core.image.DockerImageName
 import dev.rightsize.core.wait.Wait
 import java.time.Duration
 
 /**
  * A single-node Neo4j Community container, queried over its HTTP Cypher transaction endpoint
- * (`/db/neo4j/tx/commit`) — no bolt driver dependency needed in either language, matching the
+ * (`/db/neo4j/tx/commit`) — no bolt driver dependency needed, matching the
  * house convention for HTTP-first modules ([ClickHouseContainer], [PinotContainer]). The bolt
  * port (7687) is still exposed and its URI available via [boltUrl] for callers who do want a
  * real driver.
@@ -15,6 +16,14 @@ import java.time.Duration
  * under 8 characters — `neo4j`/`neo4j` is rejected at boot) so [httpUrl] plus basic auth is
  * usable with zero configuration; call [withPassword] before [start] to override it. The
  * username is fixed by the image at `neo4j` — there is no env var to change it.
+ *
+ * ### Defaults to `neo4j:latest` — this image's floating reference
+ *
+ * With no image given, this module tracks upstream's `latest` tag rather than a version this
+ * library pins, so the version moves with Neo4j's own releases instead of this library's release
+ * cycle. The facts below (the captured log excerpt, the memory-refusal behavior) were verified
+ * against `neo4j:5-community` specifically — pass that image explicitly to pin it:
+ * `Neo4jContainer("neo4j:5-community")`.
  *
  * ### Readiness — `Started.` is the exact log line, verified against a real boot
  *
@@ -45,10 +54,14 @@ import java.time.Duration
  * No control characters were found in the image's baked env (checked via `docker image
  * inspect`), so no env override is needed here.
  */
-class Neo4jContainer(image: String = "neo4j:5-community") : GenericContainer<Neo4jContainer>(image) {
+class Neo4jContainer(image: DockerImageName) : GenericContainer<Neo4jContainer>(image.toString()) {
+    /** Defaults to `neo4j:latest` — this image's floating reference (see the class doc). */
+    constructor(image: String = "neo4j:latest") : this(DockerImageName.parse(image))
+
     private var passwordState = "rightsize-test"
 
     init {
+        image.assertCompatibleWith(EXPECTED_REPOSITORY)
         withExposedPorts(HTTP_PORT, BOLT_PORT)
         withEnv("NEO4J_AUTH", authEnvValue())
         // Single JVM, boots clean at 1024M — see the class doc for the measured
@@ -78,5 +91,6 @@ class Neo4jContainer(image: String = "neo4j:5-community") : GenericContainer<Neo
     private companion object {
         const val HTTP_PORT = 7474
         const val BOLT_PORT = 7687
+        const val EXPECTED_REPOSITORY = "neo4j"
     }
 }

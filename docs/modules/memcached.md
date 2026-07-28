@@ -7,9 +7,19 @@ ready-checked with a protocol-level `version` probe rather than a bare port chec
 
 | | |
 |---|---|
-| Default image | `memcached:1.6-alpine` |
+| Default image | `memcached:latest` — this image's floating reference (see below) |
 | Exposed port | `11211` |
 | Wait strategy | Custom (`MemcachedResponds`, see below) |
+
+With no image given, this module tracks upstream's `latest` tag rather than a version
+this library pins. This module previously pinned `memcached:1.6-alpine`; `latest` is
+the Debian-based variant, not Alpine — functionally equivalent for the `version` probe
+below, just a larger pull. Pass an explicit tag (Alpine or otherwise) to pin a specific
+version:
+
+```kotlin
+MemcachedContainer("memcached:1.6-alpine")
+```
 
 ## Helpers
 
@@ -55,3 +65,20 @@ waits for a `VERSION`-prefixed reply, which only a fully-initialized server prod
 See [Wait Strategies](../concepts/wait-strategies.md#writing-a-custom-wait-strategy-abstractwaitstrategy)
 for the full source of `MemcachedResponds`, which is a good template if you're writing
 a wait strategy of your own for a text-protocol server.
+
+## Compatibility checking
+
+Passing an explicit image checks its repository against the one this module
+understands (`memcached`) before any port, wait-strategy, or backend work runs — a
+mismatched image fails fast with a typed `IncompatibleImageException` naming both
+repositories, rather than degrading into a bare wait-strategy timeout. To use a
+differently-named image on purpose (a private mirror, a hardened rebuild), wrap it
+with the escape hatch:
+
+```kotlin
+MemcachedContainer(
+    DockerImageName.parse("mycorp/memcached-hardened:1.6")
+        .asCompatibleSubstituteFor("memcached"))
+```
+
+See [Core Concepts](../concepts/containers.md) for `DockerImageName` itself.

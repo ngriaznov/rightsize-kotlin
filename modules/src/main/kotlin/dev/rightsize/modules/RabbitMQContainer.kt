@@ -1,12 +1,26 @@
 package dev.rightsize.modules
 
 import dev.rightsize.GenericContainer
+import dev.rightsize.core.image.DockerImageName
 import dev.rightsize.core.wait.Wait
 
 /**
  * A single-node RabbitMQ container with the management plugin enabled. Defaults to a
  * `guest`/`guest` credential pair (the image's own default) so [amqpUrl] is usable with zero
  * configuration; call [withUsername]/[withPassword] before [start] to override either.
+ *
+ * ### Defaults to `rabbitmq:management`, not `rabbitmq:latest`
+ *
+ * Every other module in this library floats to a plain `:latest` tag. This one does not: plain
+ * `rabbitmq:latest` does not carry the management plugin at all, and this module is built around
+ * it — [managementUrl], the readiness log line captured below, and the whole point of pulling
+ * this module over a bare RabbitMQ image all depend on it being installed. `rabbitmq:management`
+ * is RabbitMQ's own floating tag for "latest release, management plugin included", so this module
+ * still tracks upstream releases the same way the rest of the catalog does; it just floats to a
+ * different tag. This module previously pinned `rabbitmq:4-management-alpine` — the version the
+ * facts below (the captured log excerpt, the 4.x `transient_nonexcl_queues` behavior) were
+ * verified against, and also an Alpine base, unlike the Debian-based `rabbitmq:management`; pass
+ * that image explicitly to pin it: `RabbitMQContainer("rabbitmq:4-management-alpine")`.
  *
  * ### Readiness — verified against a real 4.x boot
  *
@@ -45,12 +59,18 @@ import dev.rightsize.core.wait.Wait
  * this module's pinned image. Declare durable, non-exclusive queues (or exclusive transient ones)
  * from client code exercising this container; this module itself declares no queues.
  */
-class RabbitMQContainer(image: String = "rabbitmq:4-management-alpine") :
-    GenericContainer<RabbitMQContainer>(image) {
+class RabbitMQContainer(image: DockerImageName) : GenericContainer<RabbitMQContainer>(image.toString()) {
+    /**
+     * Defaults to `rabbitmq:management` — not `:latest` (see the class doc for why plain
+     * `latest` cannot be used here).
+     */
+    constructor(image: String = "rabbitmq:management") : this(DockerImageName.parse(image))
+
     private var usernameState = "guest"
     private var passwordState = "guest"
 
     init {
+        image.assertCompatibleWith(EXPECTED_REPOSITORY)
         withExposedPorts(AMQP_PORT, MANAGEMENT_PORT)
         withEnv("RABBITMQ_DEFAULT_USER", usernameState)
         withEnv("RABBITMQ_DEFAULT_PASS", passwordState)
@@ -83,5 +103,6 @@ class RabbitMQContainer(image: String = "rabbitmq:4-management-alpine") :
     private companion object {
         const val AMQP_PORT = 5672
         const val MANAGEMENT_PORT = 15672
+        const val EXPECTED_REPOSITORY = "rabbitmq"
     }
 }

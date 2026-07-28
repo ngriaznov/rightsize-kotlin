@@ -118,6 +118,36 @@ class OrderServiceTest {
 }
 ```
 
+## Image compatibility checking
+
+A module container understands one repository (`PostgreSQLContainer` expects
+`postgres`, `QdrantContainer` expects `qdrant/qdrant`). When you pass an explicit
+image, the module checks its repository against that before any port,
+wait-strategy, or backend work runs — a mismatch fails fast with a typed
+`IncompatibleImageException` naming both the repository you supplied and the one the
+module expects, instead of degrading into a bare wait-strategy timeout against the
+wrong server.
+
+`dev.rightsize.core.image.DockerImageName` is the type behind this:
+
+```kotlin
+PostgreSQLContainer("postgres:16")                                    // checked, common case
+PostgreSQLContainer(DockerImageName.parse("mycorp/pg-hardened:16")
+    .asCompatibleSubstituteFor("postgres"))                           // explicit override
+```
+
+`DockerImageName.parse` splits a reference into registry, repository, tag, and
+digest. Registry-host stripping follows the Docker convention: the first path
+segment (before the first `/`) is a registry only if it contains a `.` or a `:`, or
+is exactly `localhost` — so `quay.io/keycloak/keycloak` and `localhost/keycloak`
+strip down to the repositories `keycloak/keycloak` and `keycloak`, while
+`floci/floci` (no dot, colon, or `localhost` in `floci`) stays whole.
+`asCompatibleSubstituteFor` is the escape hatch for a private mirror, a hardened
+rebuild, or a rename: it declares the image a deliberate stand-in for the named
+repository, so the compatibility check passes without changing what's actually
+passed to the backend — an explicitly supplied image is always used verbatim, never
+tag-rewritten or substituted on its own.
+
 ## Backend override for tests
 
 `GenericContainer` exposes an `internal` backend-override seam

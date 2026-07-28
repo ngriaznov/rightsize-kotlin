@@ -11,21 +11,34 @@ and guest port.
 
 | | |
 |---|---|
-| Default images | `floci/floci:1.5.30` (AWS), `floci/floci-az:0.8.0` (Azure), `floci/floci-gcp:0.4.0` (GCP) |
+| Default images | `floci/floci:latest` (AWS), `floci/floci-az:latest` (Azure), `floci/floci-gcp:latest` (GCP) — each variant's own floating reference, see below |
 | Exposed ports | `4566` (AWS), `4577` (Azure), `4588` (GCP) — one per variant |
 | Wait strategy | `Wait.forHttp("/health").forPort(<variant port>)` |
+
+With no image given, each factory tracks its own image's `latest` tag rather than a
+version this library pins, so the version moves with that variant's own releases
+instead of this library's release cycle. Every fact below was verified against
+`floci/floci:1.5.30`, `floci/floci-az:0.8.0`, and `floci/floci-gcp:0.4.0` specifically
+— pass one of those explicitly to pin the measured version:
+
+```kotlin
+FlociContainer.aws("floci/floci:1.5.30")
+FlociContainer.azure("floci/floci-az:0.8.0")
+FlociContainer.gcp("floci/floci-gcp:0.4.0")
+```
 
 ## Helpers
 
 | Member | Returns |
 |---|---|
-| `FlociContainer.aws(image: String = "floci/floci:1.5.30"): FlociContainer` | The AWS emulator — S3, DynamoDB, SQS, etc. |
-| `FlociContainer.azure(image: String = "floci/floci-az:0.8.0"): FlociContainer` | The Azure emulator |
-| `FlociContainer.gcp(image: String = "floci/floci-gcp:0.4.0"): FlociContainer` | The GCP emulator |
+| `FlociContainer.aws(image: String = "floci/floci:latest"): FlociContainer` | The AWS emulator — S3, DynamoDB, SQS, etc. |
+| `FlociContainer.azure(image: String = "floci/floci-az:latest"): FlociContainer` | The Azure emulator |
+| `FlociContainer.gcp(image: String = "floci/floci-gcp:latest"): FlociContainer` | The GCP emulator |
 | `endpointUrl: String` | This variant's REST endpoint — the base URI for every emulated API call |
 
 There's no constructor to call directly — always go through one of the three
-factory functions, which pin the right image and guest port for that provider.
+factory functions, which pin the right port (and check the right repository) for
+that provider.
 
 ## Example
 
@@ -98,3 +111,20 @@ No `withMemoryLimit` override is needed for any variant — all three images are
 native (GraalVM) Quarkus binaries that settle at roughly 11–27 MiB RSS (`docker
 stats`, real boot), and each boots and answers `/health` under msb's default
 microVM RAM with no memory-ladder escalation.
+
+## Compatibility checking
+
+Each factory checks the image passed to it against its own repository — `aws` expects
+`floci/floci`, `azure` expects `floci/floci-az`, `gcp` expects `floci/floci-gcp` —
+before any port, wait-strategy, or backend work runs, so passing an AWS-shaped image to
+`azure()` (or vice versa) fails fast with a typed `IncompatibleImageException` naming
+both repositories, rather than booting the wrong emulator. To use a differently-named
+image on purpose (a private mirror, a hardened rebuild), wrap it with the escape hatch:
+
+```kotlin
+FlociContainer.aws(
+    DockerImageName.parse("mycorp/floci-hardened:1.5.30")
+        .asCompatibleSubstituteFor("floci/floci"))
+```
+
+See [Core Concepts](../concepts/containers.md) for `DockerImageName` itself.

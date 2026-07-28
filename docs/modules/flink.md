@@ -9,11 +9,24 @@ only accept/reject submissions, never execute them).
 
 | | |
 |---|---|
-| Default image | `flink:1.20.5` |
+| Default image | `flink:latest` — this image's floating reference (see below) |
 | Exposed ports | `8081` (REST), `6123` (RPC — only meaningful once a TaskManager joins) |
 | Command | `jobmanager` |
 | Memory limit | `withMemoryLimit(1024)` — see below |
 | Wait strategy | `Wait.forHttp("/overview").forPort(8081).withStartupTimeout(Duration.ofSeconds(120))` |
+
+With no image given, this module tracks upstream's `latest` tag rather than a version
+this library pins, so the version moves with Flink's own releases instead of this
+library's release cycle. Every fact below — the Pekko/Akka remoting behavior, the
+`nc`/busybox gap on microsandbox, the memory floor — was verified against
+`flink:1.20.5` specifically; pass that image explicitly to pin it:
+
+```kotlin
+FlinkContainer("flink:1.20.5")
+```
+
+`withTaskManager()` boots its companion from the same image the `FlinkContainer` was
+constructed with, so pinning the JobManager pins the TaskManager too.
 
 ## Helpers
 
@@ -142,3 +155,20 @@ gated to docker.
 *individually*, and this module runs the JobManager on msb too (see above), so
 `withMemoryLimit(1024)` is this module's default for both roles, matching the
 family's established single-JVM floor ([Keycloak](keycloak.md), [Neo4j](neo4j.md)).
+
+## Compatibility checking
+
+Passing an explicit image checks its repository against the one this module
+understands (`flink`) before any port, wait-strategy, or backend work runs — a
+mismatched image fails fast with a typed `IncompatibleImageException` naming both
+repositories, rather than degrading into a bare wait-strategy timeout. To use a
+differently-named image on purpose (a private mirror, a hardened rebuild), wrap it
+with the escape hatch:
+
+```kotlin
+FlinkContainer(
+    DockerImageName.parse("mycorp/flink-hardened:1.20.5")
+        .asCompatibleSubstituteFor("flink"))
+```
+
+See [Core Concepts](../concepts/containers.md) for `DockerImageName` itself.

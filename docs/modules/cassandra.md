@@ -6,11 +6,25 @@
 
 | | |
 |---|---|
-| Default image | `cassandra:5.0.8` |
+| Default image | `cassandra:latest` — this image's floating reference (see below) |
 | Exposed port | `9042` |
 | Env | `GPG_KEYS=` (empty — see below), `MAX_HEAP_SIZE=512M`, `HEAP_NEWSIZE=128M` |
 | Memory limit | `withMemoryLimit(2560)` |
 | Wait strategy | `Wait.forLogMessage(".*Starting listening for CQL clients.*", 1).withStartupTimeout(Duration.ofSeconds(300))` |
+
+With no image given, this module tracks upstream's `latest` tag rather than a version
+this library pins, so the version moves with Cassandra's own releases instead of this
+library's release cycle. Every fact below — the `GPG_KEYS` bug, the memory ladder, the
+readiness log line and its timing — was verified against `cassandra:5.0.8` specifically;
+pass that image explicitly to pin it:
+
+```kotlin
+CassandraContainer("cassandra:5.0.8")
+```
+
+The `GPG_KEYS` override below is kept unconditionally on the floating default too —
+whether a future Cassandra release still bakes a tab into that value has not been
+re-verified, so this module does not gate the override on the image chosen.
 
 ## Helpers
 
@@ -92,3 +106,20 @@ is 300s.
 A `cqlsh -e "..."` round-trip — `CREATE KEYSPACE` → `CREATE TABLE` → `INSERT` →
 `SELECT` — returned the inserted row, run through `exec` on the started container
 using the `cqlsh` binary the image already bundles.
+
+## Compatibility checking
+
+Passing an explicit image checks its repository against the one this module
+understands (`cassandra`) before any port, wait-strategy, or backend work runs — a
+mismatched image fails fast with a typed `IncompatibleImageException` naming both
+repositories, rather than degrading into a bare wait-strategy timeout. To use a
+differently-named image on purpose (a private mirror, a hardened rebuild), wrap it
+with the escape hatch:
+
+```kotlin
+CassandraContainer(
+    DockerImageName.parse("mycorp/cassandra-hardened:5.0.8")
+        .asCompatibleSubstituteFor("cassandra"))
+```
+
+See [Core Concepts](../concepts/containers.md) for `DockerImageName` itself.

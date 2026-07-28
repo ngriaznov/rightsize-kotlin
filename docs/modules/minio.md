@@ -8,11 +8,21 @@ credential pair.
 
 | | |
 |---|---|
-| Default image | `minio/minio:RELEASE.2025-09-07T16-13-09Z` |
+| Default image | `minio/minio:latest` — this image's floating reference (see below) |
 | Exposed ports | `9000` (S3 API — what the helpers use), `9001` (console, exposed but not wrapped by a helper) |
 | Command | `server /data --console-address :9001` |
 | Env | `MINIO_ROOT_USER=testuser`, `MINIO_ROOT_PASSWORD=testpassword` |
 | Wait strategy | `Wait.forHttp("/minio/health/live").forPort(9000)` |
+
+With no image given, this module tracks upstream's `latest` tag rather than a version
+this library pins, so the version moves with MinIO's own releases instead of this
+library's release cycle. The facts below were verified against
+`minio/minio:RELEASE.2025-09-07T16-13-09Z` specifically — pass that image explicitly to
+pin it:
+
+```kotlin
+MinIOContainer("minio/minio:RELEASE.2025-09-07T16-13-09Z")
+```
 
 ## Helpers
 
@@ -98,3 +108,20 @@ actually enforced rather than merely configured.
 any floor is needed at all under this backend's default allocation is not yet
 established, so this module sets no `withMemoryLimit` override; callers who hit
 memory pressure can call it themselves.
+
+## Compatibility checking
+
+Passing an explicit image checks its repository against the one this module
+understands (`minio/minio`) before any port, wait-strategy, or backend work runs — a
+mismatched image fails fast with a typed `IncompatibleImageException` naming both
+repositories, rather than degrading into a bare wait-strategy timeout. To use a
+differently-named image on purpose (a private mirror, a hardened rebuild), wrap it
+with the escape hatch:
+
+```kotlin
+MinIOContainer(
+    DockerImageName.parse("mycorp/minio-hardened:RELEASE.2025-09-07T16-13-09Z")
+        .asCompatibleSubstituteFor("minio/minio"))
+```
+
+See [Core Concepts](../concepts/containers.md) for `DockerImageName` itself.

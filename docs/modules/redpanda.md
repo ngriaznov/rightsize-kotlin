@@ -7,9 +7,19 @@
 
 | | |
 |---|---|
-| Default image | `redpandadata/redpanda:v24.2.4` |
+| Default image | `redpandadata/redpanda:latest` — this image's floating reference (see below) |
 | Exposed ports | `9092` (Kafka API), `9093` (internal listener), `8081` (schema registry) |
 | Wait strategy | `Wait.forLogMessage(".*Successfully started Redpanda.*")` |
+
+With no image given, this module tracks upstream's `latest` tag rather than a version
+this library pins, so the version moves with Redpanda's own releases instead of this
+library's release cycle. This module previously pinned `redpandadata/redpanda:v24.2.4`
+— note the `v` prefix Redpanda's own version tags carry, unlike `latest` — pass that
+image explicitly to pin it:
+
+```kotlin
+RedpandaContainer("redpandadata/redpanda:v24.2.4")
+```
 
 ## Helpers
 
@@ -106,3 +116,20 @@ serves identical images but rate-limits anonymous pulls aggressively enough to b
 CI runs. If you hit persistent pull failures, seed the image into your local `msb` cache
 ahead of time (`docker save <img> -o /tmp/img.tar && msb load -i /tmp/img.tar -t <img>`) rather than retrying the pull
 indefinitely.
+
+## Compatibility checking
+
+Passing an explicit image checks its repository against the one this module
+understands (`redpandadata/redpanda`) before any port, wait-strategy, or backend work
+runs — a mismatched image fails fast with a typed `IncompatibleImageException` naming
+both repositories, rather than degrading into a bare wait-strategy timeout. To use a
+differently-named image on purpose (a private mirror, a hardened rebuild), wrap it
+with the escape hatch:
+
+```kotlin
+RedpandaContainer(
+    DockerImageName.parse("mycorp/redpanda-hardened:v24.2.4")
+        .asCompatibleSubstituteFor("redpandadata/redpanda"))
+```
+
+See [Core Concepts](../concepts/containers.md) for `DockerImageName` itself.

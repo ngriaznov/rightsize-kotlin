@@ -8,10 +8,20 @@ queried over its HTTP interface. Defaults to a `test`/`test` user/password pair 
 
 | | |
 |---|---|
-| Default image | `clickhouse/clickhouse-server:25.8` |
+| Default image | `clickhouse/clickhouse-server:latest` — this image's floating reference (see below) |
 | Exposed ports | `8123` (HTTP interface — what the helpers use), `9000` (native protocol, exposed but not wrapped by a helper) |
 | Env | `CLICKHOUSE_USER=test`, `CLICKHOUSE_PASSWORD=test`, `CLICKHOUSE_DB=test` |
 | Wait strategy | `Wait.forHttp("/ping").forPort(8123)` |
+
+With no image given, this module tracks upstream's `latest` tag rather than a version
+this library pins, so the version moves with ClickHouse's own releases instead of this
+library's release cycle. The facts below were verified against
+`clickhouse/clickhouse-server:25.8` (LTS) specifically — pass that image explicitly to
+pin it:
+
+```kotlin
+ClickHouseContainer("clickhouse/clickhouse-server:25.8")
+```
 
 ## Helpers
 
@@ -89,3 +99,20 @@ process at all, so it has none of the Paketo/QuickStart-style fixed-heap-region
 problems that [Spring Cloud Config](spring-cloud-config.md) and [Pinot](pinot.md) ran
 into (observed ~12s integration-test round-trip on the microsandbox backend with no
 memory-ladder escalation needed).
+
+## Compatibility checking
+
+Passing an explicit image checks its repository against the one this module
+understands (`clickhouse/clickhouse-server`) before any port, wait-strategy, or backend
+work runs — a mismatched image fails fast with a typed `IncompatibleImageException`
+naming both repositories, rather than degrading into a bare wait-strategy timeout. To
+use a differently-named image on purpose (a private mirror, a hardened rebuild), wrap
+it with the escape hatch:
+
+```kotlin
+ClickHouseContainer(
+    DockerImageName.parse("mycorp/clickhouse-hardened:25.8")
+        .asCompatibleSubstituteFor("clickhouse/clickhouse-server"))
+```
+
+See [Core Concepts](../concepts/containers.md) for `DockerImageName` itself.

@@ -3,6 +3,7 @@ package dev.rightsize.modules
 import dev.rightsize.GenericContainer
 import dev.rightsize.Network
 import dev.rightsize.core.UnsupportedByBackendException
+import dev.rightsize.core.image.DockerImageName
 import dev.rightsize.core.wait.Wait
 import java.time.Duration
 
@@ -10,6 +11,16 @@ import java.time.Duration
  * An Apache Flink **JobManager**, optionally paired with a companion **TaskManager** via
  * [withTaskManager] for a real session cluster that can actually run jobs (a bare JobManager has
  * zero task slots and can only accept/reject submissions, never execute them).
+ *
+ * ### Defaults to `flink:latest` — this image's floating reference
+ *
+ * With no image given, this module tracks upstream's `latest` tag rather than a version this
+ * library pins, so the version moves with Flink's own releases instead of this library's release
+ * cycle. Every fact below — the Pekko/Akka remoting behavior, the `nc`/busybox gap on
+ * microsandbox, the memory floor — was verified against `flink:1.20.5` specifically; pass that
+ * image explicitly to pin it: `FlinkContainer("flink:1.20.5")`. [withTaskManager] boots its
+ * companion from the same image the JobManager was constructed with, so pinning the JobManager
+ * pins the TaskManager too.
  *
  * ### Topology
  *
@@ -58,13 +69,17 @@ import java.time.Duration
  * No control characters were found in the image's baked env (checked via `docker image
  * inspect`).
  */
-class FlinkContainer(image: String = "flink:1.20.5") : GenericContainer<FlinkContainer>(image) {
+class FlinkContainer(image: DockerImageName) : GenericContainer<FlinkContainer>(image.toString()) {
+    /** Defaults to `flink:latest` — this image's floating reference (see the class doc). */
+    constructor(image: String = "flink:latest") : this(DockerImageName.parse(image))
+
     private val jobManagerAlias = "jobmanager"
     private var network: Network? = null
     private var taskManager: GenericContainer<*>? = null
-    private val taskManagerImage = image
+    private val taskManagerImage = image.toString()
 
     init {
+        image.assertCompatibleWith(EXPECTED_REPOSITORY)
         withExposedPorts(REST_PORT, RPC_PORT)
         withCommand("jobmanager")
         withMemoryLimit(1024)
@@ -125,5 +140,6 @@ class FlinkContainer(image: String = "flink:1.20.5") : GenericContainer<FlinkCon
     private companion object {
         const val REST_PORT = 8081
         const val RPC_PORT = 6123
+        const val EXPECTED_REPOSITORY = "flink"
     }
 }

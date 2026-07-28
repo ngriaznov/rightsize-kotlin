@@ -10,11 +10,23 @@ data-loading harness.
 
 | | |
 |---|---|
-| Default image | `apachepinot/pinot:1.5.1` |
+| Default image | `apachepinot/pinot:latest` — this image's floating reference (see below) |
 | Exposed ports | `9000` (controller REST API), `8000` (broker query port — see below) |
 | Command | `QuickStart -type EMPTY` |
 | Memory limit | `withMemoryLimit(4096)` — measured, not guessed; see below |
 | Wait strategy | `Wait.forHttp("/health").forPort(9000).withStartupTimeout(Duration.ofSeconds(180))` |
+
+With no image given, this module tracks upstream's `latest` tag rather than a version
+this library pins, so the version moves with Pinot's own releases instead of this
+library's release cycle. Every fact below — the port assignments and, especially, the
+4096 MB memory floor tied to this image's own baked `-Xmx4G` — was measured against
+`apachepinot/pinot:1.5.1` specifically; a future Pinot release could change its baked
+heap request and shift where that floor actually needs to sit. Pass that image
+explicitly to pin the measured version:
+
+```kotlin
+PinotContainer("apachepinot/pinot:1.5.1")
+```
 
 ## Helpers
 
@@ -142,3 +154,20 @@ ready" race. The example above does this with `retryUntil200`.
 A four-JVM cluster booting cold on a laptop is also just legitimately slow — expect
 60–120 seconds, which is why this module's wait strategy is configured with a 180s
 timeout rather than the 120-second default.
+
+## Compatibility checking
+
+Passing an explicit image checks its repository against the one this module
+understands (`apachepinot/pinot`) before any port, wait-strategy, or backend work runs
+— a mismatched image fails fast with a typed `IncompatibleImageException` naming both
+repositories, rather than degrading into a bare wait-strategy timeout. To use a
+differently-named image on purpose (a private mirror, a hardened rebuild), wrap it
+with the escape hatch:
+
+```kotlin
+PinotContainer(
+    DockerImageName.parse("mycorp/pinot-hardened:1.5.1")
+        .asCompatibleSubstituteFor("apachepinot/pinot"))
+```
+
+See [Core Concepts](../concepts/containers.md) for `DockerImageName` itself.

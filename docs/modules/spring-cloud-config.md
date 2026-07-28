@@ -12,6 +12,10 @@ container, ready-checked via its actuator health endpoint.
 | Memory limit | `withMemoryLimit(1024)` — see below |
 | Wait strategy | `Wait.forHttp("/actuator/health").forPort(8888)` |
 
+Already defaulted to `hyness/spring-cloud-config-server:latest` before this library's
+other modules adopted floating references, so this default is unchanged — no version
+was pinned here to move away from.
+
 ## Helpers
 
 | Member | Returns |
@@ -77,3 +81,20 @@ general pattern and [Pinot](pinot.md) for a much larger version of the same prob
 **First boot is genuinely slow.** A JVM Spring Boot image on a first (cold) pull is one
 of the slower boots in the module catalog — the example above raises the wait timeout
 to 180 seconds for this reason.
+
+## Compatibility checking
+
+Passing an explicit image checks its repository against the one this module
+understands (`hyness/spring-cloud-config-server`) before any port, wait-strategy, or
+backend work runs — a mismatched image fails fast with a typed
+`IncompatibleImageException` naming both repositories, rather than degrading into a
+bare wait-strategy timeout. To use a differently-named image on purpose (a private
+mirror, a hardened rebuild), wrap it with the escape hatch:
+
+```kotlin
+SpringCloudConfigContainer(
+    DockerImageName.parse("mycorp/spring-cloud-config-hardened:latest")
+        .asCompatibleSubstituteFor("hyness/spring-cloud-config-server"))
+```
+
+See [Core Concepts](../concepts/containers.md) for `DockerImageName` itself.

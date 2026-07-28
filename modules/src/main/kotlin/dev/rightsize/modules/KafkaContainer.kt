@@ -2,11 +2,26 @@ package dev.rightsize.modules
 
 import dev.rightsize.GenericContainer
 import dev.rightsize.core.ContainerSpec
+import dev.rightsize.core.image.DockerImageName
 import dev.rightsize.core.wait.Wait
 
-/** A single-node Kafka broker (KRaft mode, no ZooKeeper). */
-class KafkaContainer(image: String = "apache/kafka:4.0.0") : GenericContainer<KafkaContainer>(image) {
+/**
+ * A single-node Kafka broker (KRaft mode, no ZooKeeper).
+ *
+ * ### Defaults to `apache/kafka:latest` — this image's floating reference
+ *
+ * With no image given, this module tracks upstream's `latest` tag rather than a version this
+ * library pins, so the version moves with Kafka's own releases instead of this library's release
+ * cycle. This module previously pinned `apache/kafka:4.0.0`, the version the `KAFKA_HEAP_OPTS`
+ * override below was verified against; pass that image explicitly to pin it:
+ * `KafkaContainer("apache/kafka:4.0.0")`.
+ */
+class KafkaContainer(image: DockerImageName) : GenericContainer<KafkaContainer>(image.toString()) {
+    /** Defaults to `apache/kafka:latest` — this image's floating reference (see the class doc). */
+    constructor(image: String = "apache/kafka:latest") : this(DockerImageName.parse(image))
+
     init {
+        image.assertCompatibleWith(EXPECTED_REPOSITORY)
         withExposedPorts(9092)
         withEnv("KAFKA_NODE_ID", "1")
         withEnv("KAFKA_PROCESS_ROLES", "broker,controller")
@@ -29,4 +44,8 @@ class KafkaContainer(image: String = "apache/kafka:4.0.0") : GenericContainer<Ka
         spec.copy(env = spec.env + ("KAFKA_ADVERTISED_LISTENERS" to "PLAINTEXT://127.0.0.1:${mapped(9092)}"))
     /** The `PLAINTEXT://` bootstrap-servers address for the running broker. */
     val bootstrapServers: String get() = "PLAINTEXT://$host:${getMappedPort(9092)}"
+
+    private companion object {
+        const val EXPECTED_REPOSITORY = "apache/kafka"
+    }
 }

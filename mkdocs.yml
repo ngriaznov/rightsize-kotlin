@@ -87,6 +87,8 @@ nav:
       - Flink: modules/flink.md
       - MinIO: modules/minio.md
       - Cassandra: modules/cassandra.md
+      - Elasticsearch: modules/elasticsearch.md
+      - Qdrant: modules/qdrant.md
   - Troubleshooting: troubleshooting.md
   - How It Works: how-it-works.md
   - Roadmap: roadmap.md

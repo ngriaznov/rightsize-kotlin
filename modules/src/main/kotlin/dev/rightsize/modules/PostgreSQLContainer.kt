@@ -1,6 +1,7 @@
 package dev.rightsize.modules
 
 import dev.rightsize.GenericContainer
+import dev.rightsize.core.image.DockerImageName
 import dev.rightsize.core.wait.Wait
 import java.time.Duration
 
@@ -8,13 +9,25 @@ import java.time.Duration
  * A single-node PostgreSQL container. Defaults to a `test`/`test`/`test` user/password/database
  * trio so [jdbcUrl] is usable with zero configuration; call [withUsername]/[withPassword]/
  * [withDatabase] before [start] to override any of them.
+ *
+ * ### Defaults to `postgres:latest` — this image's floating reference, now Debian-based
+ *
+ * With no image given, this module tracks upstream's `latest` tag rather than a version this
+ * library pins, so the version moves with Postgres's own releases instead of this library's
+ * release cycle. This module previously pinned `postgres:18-alpine`; `latest` is the Debian-based
+ * variant, not Alpine — functionally equivalent for everything this module exercises, just a
+ * larger pull. Pass that image explicitly to pin it: `PostgreSQLContainer("postgres:18-alpine")`.
  */
-class PostgreSQLContainer(image: String = "postgres:18-alpine") : GenericContainer<PostgreSQLContainer>(image) {
+class PostgreSQLContainer(image: DockerImageName) : GenericContainer<PostgreSQLContainer>(image.toString()) {
+    /** Defaults to `postgres:latest` — this image's floating reference (see the class doc). */
+    constructor(image: String = "postgres:latest") : this(DockerImageName.parse(image))
+
     private var usernameState = "test"
     private var passwordState = "test"
     private var databaseState = "test"
 
     init {
+        image.assertCompatibleWith(EXPECTED_REPOSITORY)
         withExposedPorts(5432)
         withEnv("POSTGRES_USER", usernameState)
         withEnv("POSTGRES_PASSWORD", passwordState)
@@ -25,7 +38,10 @@ class PostgreSQLContainer(image: String = "postgres:18-alpine") : GenericContain
         // ever starts (reproduced with zero rightsize-set env vars — it's the image, not us).
         // Docker is unaffected. Overriding the var here wins over the image default in both
         // backends' env-merge order and is a no-op for the build the image already baked, so it's
-        // a safe, backend-portable fix rather than an msb-only special case.
+        // a safe, backend-portable fix rather than an msb-only special case. This override was
+        // verified against the alpine variant specifically; whether the Debian-based `latest` this
+        // module now defaults to bakes the same tab-containing value has not been re-verified, so
+        // the override is left in place unconditionally rather than gated on the image chosen.
         withEnv("DOCKER_PG_LLVM_DEPS", "")
         // The postgres entrypoint starts the server once to run initdb scripts against it, shuts
         // it down, then starts it again for real — printing "database system is ready to accept
@@ -65,4 +81,8 @@ class PostgreSQLContainer(image: String = "postgres:18-alpine") : GenericContain
 
     /** A `jdbc:postgresql://` URL for the running container's [databaseName]. */
     val jdbcUrl: String get() = "jdbc:postgresql://$host:${getMappedPort(5432)}/$databaseName"
+
+    private companion object {
+        const val EXPECTED_REPOSITORY = "postgres"
+    }
 }

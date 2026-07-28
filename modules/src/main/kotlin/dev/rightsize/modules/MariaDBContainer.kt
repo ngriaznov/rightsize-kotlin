@@ -1,6 +1,7 @@
 package dev.rightsize.modules
 
 import dev.rightsize.GenericContainer
+import dev.rightsize.core.image.DockerImageName
 import dev.rightsize.core.wait.Wait
 import java.time.Duration
 
@@ -8,6 +9,14 @@ import java.time.Duration
  * A single-node MariaDB container. Defaults to a `test`/`test`/`test` user/password/database trio
  * (plus `MARIADB_ROOT_PASSWORD=test`) so [jdbcUrl] is usable with zero configuration; call
  * [withUsername]/[withPassword]/[withDatabase] before [start] to override any of them.
+ *
+ * ### Defaults to `mariadb:latest` — this image's floating reference
+ *
+ * With no image given, this module tracks upstream's `latest` tag rather than a version this
+ * library pins, so the version moves with MariaDB's own releases instead of this library's
+ * release cycle. The facts below (the captured log excerpt, the env var names) were verified
+ * against `mariadb:11.4` specifically — pass that image explicitly to pin it:
+ * `MariaDBContainer("mariadb:11.4")`.
  *
  * ### Env var names — verified against a real boot
  *
@@ -42,12 +51,16 @@ import java.time.Duration
  * regex on the literal `port: 3306` of the real server's line, so the wait is robust to the
  * temp-server line's exact wording even if a future MariaDB point release changes it.
  */
-class MariaDBContainer(image: String = "mariadb:11.4") : GenericContainer<MariaDBContainer>(image) {
+class MariaDBContainer(image: DockerImageName) : GenericContainer<MariaDBContainer>(image.toString()) {
+    /** Defaults to `mariadb:latest` — this image's floating reference (see the class doc). */
+    constructor(image: String = "mariadb:latest") : this(DockerImageName.parse(image))
+
     private var usernameState = "test"
     private var passwordState = "test"
     private var databaseState = "test"
 
     init {
+        image.assertCompatibleWith(EXPECTED_REPOSITORY)
         withExposedPorts(3306)
         withEnv("MARIADB_USER", usernameState)
         withEnv("MARIADB_PASSWORD", passwordState)
@@ -90,4 +103,8 @@ class MariaDBContainer(image: String = "mariadb:11.4") : GenericContainer<MariaD
 
     /** A `jdbc:mariadb://` URL for the running container's [databaseName]. */
     val jdbcUrl: String get() = "jdbc:mariadb://$host:${getMappedPort(3306)}/$databaseName"
+
+    private companion object {
+        const val EXPECTED_REPOSITORY = "mariadb"
+    }
 }

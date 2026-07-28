@@ -7,10 +7,28 @@ management plugin enabled. Defaults to the image's own `guest`/`guest` credentia
 
 | | |
 |---|---|
-| Default image | `rabbitmq:4-management-alpine` |
+| Default image | `rabbitmq:management` — not `:latest`; see below |
 | Exposed ports | `5672` (AMQP), `15672` (management UI/API) |
 | Env | `RABBITMQ_DEFAULT_USER=guest`, `RABBITMQ_DEFAULT_PASS=guest` |
 | Wait strategy | `Wait.forLogMessage(".*Server startup complete.*", times = 1)` |
+
+### Why `rabbitmq:management`, not `rabbitmq:latest`
+
+Every other module in this library floats to a plain `:latest` tag. This one does not:
+plain `rabbitmq:latest` does not carry the management plugin at all, and this module is
+built around it — `managementUrl`, the readiness log line below, and the whole point of
+reaching for this module over a bare RabbitMQ image all depend on it being installed.
+`rabbitmq:management` is RabbitMQ's own floating tag for "latest release, management
+plugin included", so this module still tracks upstream releases the same way the rest
+of the catalog does; it just floats to a different tag. This module previously pinned
+`rabbitmq:4-management-alpine` — the version the facts below (the captured log excerpt,
+the 4.x `transient_nonexcl_queues` behavior) were verified against, and also an Alpine
+base, unlike the Debian-based `rabbitmq:management`; pass that image explicitly to pin
+it:
+
+```kotlin
+RabbitMQContainer("rabbitmq:4-management-alpine")
+```
 
 ## Helpers
 
@@ -88,3 +106,20 @@ be rejected outright with `reply-code=541 INTERNAL_ERROR`, reproduced directly a
 this module's pinned image. Declare durable, non-exclusive queues (or exclusive
 transient ones) from your own test/client code — the example above does exactly that
 (`queueDeclare("q1", true, false, false, null)`).
+
+## Compatibility checking
+
+Passing an explicit image checks its repository against the one this module
+understands (`rabbitmq`) before any port, wait-strategy, or backend work runs — a
+mismatched image fails fast with a typed `IncompatibleImageException` naming both
+repositories, rather than degrading into a bare wait-strategy timeout. To use a
+differently-named image on purpose (a private mirror, a hardened rebuild), wrap it
+with the escape hatch:
+
+```kotlin
+RabbitMQContainer(
+    DockerImageName.parse("mycorp/rabbitmq-hardened:4-management")
+        .asCompatibleSubstituteFor("rabbitmq"))
+```
+
+See [Core Concepts](../concepts/containers.md) for `DockerImageName` itself.

@@ -66,7 +66,7 @@ Use the JUnit 5 extension as in the example above (`@Sandboxed` on the class,
 `@Container` on the fields), or drive containers by hand:
 
 ```kotlin
-val arango = GenericContainer("arangodb:3.11")
+val arango = GenericContainer("arangodb:latest")
     .withEnv("ARANGO_NO_AUTH", "1")
     .withExposedPorts(8529)
     .waitingFor(Wait.forHttp("/_api/version").forPort(8529))
@@ -109,12 +109,22 @@ Preconfigured containers with sensible waits and connection helpers. Each is a
 | `FlinkContainer` | `restUrl`; `withTaskManager()` for a full session cluster — **Docker only**¹ |
 | `MinIOContainer` | `endpointUrl`, `username`, `password`; `withUsername/withPassword(…)` — S3 API on port 9000 |
 | `CassandraContainer` | `contactPoint`, `cqlPort`, `localDatacenter` |
+| `ElasticsearchContainer` | `restUrl` — no no-arg constructor, Elastic publishes no floating tag; an explicit image is required |
+| `QdrantContainer` | `restUrl` — vector search engine |
 
 Some modules raise a memory floor for their image (`withMemoryLimit`): heavyweight JVM
-images - SpringCloudConfig, Keycloak, Neo4j, Flink (1024 MB), Cassandra (2560 MB) and
-Pinot's multi-JVM QuickStart cluster (4096 MB) - need more than the microVM default.
-That's baked into the module; you don't set it. Each module's KDoc documents its exact
-image tag, wait strategy, and the measured reasoning behind these choices.
+images - SpringCloudConfig, Keycloak, Neo4j, Flink (1024 MB), Cassandra and
+Elasticsearch (2560 MB each) and Pinot's multi-JVM QuickStart cluster (4096 MB) - need
+more than the microVM default. That's baked into the module; you don't set it. Each
+module's KDoc documents its exact image tag, wait strategy, and the measured reasoning
+behind these choices.
+
+Every module constructor also accepts a `DockerImageName` in place of a plain `String`,
+and checks the supplied image's repository against the one it declares — a mismatch
+throws `IncompatibleImageException` before any port, wait-strategy, or backend work
+runs, with an `asCompatibleSubstituteFor(...)` escape hatch for a verified compatible
+mirror or rebuild. See [Image compatibility
+checking](https://ngriaznov.github.io/rightsize-kotlin/concepts/containers/#image-compatibility-checking).
 
 ¹ `withTaskManager()` throws `UnsupportedByBackendException` on microsandbox (the Flink
 image carries no `nc`/busybox for network-link emulation - see [Networking](#networking));

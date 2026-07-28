@@ -40,6 +40,11 @@ class MsbCliBackend(internal val msb: Path) : SandboxBackend {
         // startup dwarfs this either way.
         const val STATE_DB_RETRY_DELAY_MS = 500L
         const val EXEC_TIMEOUT_SEC = 120L
+        // How long exec keeps retrying while the guest agent's endpoint has not appeared yet,
+        // and how long it pauses between attempts — see [isAgentEndpointNotReady]. Zero cost on
+        // the ordinary path, where the first attempt connects.
+        const val AGENT_ENDPOINT_RETRY_BUDGET_MS = 30_000L
+        const val AGENT_ENDPOINT_RETRY_DELAY_MS = 250L
         const val LOGS_TIMEOUT_SEC = 30L
         const val COPY_TIMEOUT_SEC = 120L
         // `msb snapshot create` writes a full disk image (sparse — a tiny alpine snapshot was
@@ -449,8 +454,28 @@ class MsbCliBackend(internal val msb: Path) : SandboxBackend {
     internal fun runningSandboxNames(): Set<String> =
         MsbLsJson.runningNames(invoke(MsbCommands.ls(), LOGS_TIMEOUT_SEC).stdout)
 
-    override fun exec(handle: SandboxHandle, cmd: List<String>): ExecResult =
-        invoke(MsbCommands.exec(handle.id, cmd), timeoutSec = EXEC_TIMEOUT_SEC)
+    /**
+     * Runs [cmd] in the guest, retrying while msb reports it cannot reach the guest agent's
+     * endpoint yet (see [isAgentEndpointNotReady]). [awaitRunning]'s readiness check is the
+     * sandbox process reaching Running in `msb ls`, which says nothing about the in-guest agent
+     * having created the endpoint this method's `msb exec` connects to — a caller that execs
+     * immediately after [start] returns can arrive before that endpoint exists. The retry closes
+     * that window here rather than leaving every caller to rediscover it. Only that one
+     * signature is retried: a guest command's own non-zero exit returns on the first attempt,
+     * unchanged.
+     */
+    override fun exec(handle: SandboxHandle, cmd: List<String>): ExecResult {
+        val argv = MsbCommands.exec(handle.id, cmd)
+        val deadline = System.currentTimeMillis() + AGENT_ENDPOINT_RETRY_BUDGET_MS
+        while (true) {
+            val result = invoke(argv, timeoutSec = EXEC_TIMEOUT_SEC)
+            if (result.exitCode == 0 || !isAgentEndpointNotReady(result.stderr) ||
+                System.currentTimeMillis() >= deadline) {
+                return result
+            }
+            Thread.sleep(AGENT_ENDPOINT_RETRY_DELAY_MS)
+        }
+    }
 
     /**
      * A fresh `msb logs <name> --tail 1000` invocation, same on every platform. This is the
@@ -742,6 +767,32 @@ internal class MsbStateDbException(val output: String) :
  * propagates the failure with both attempts' output.
  */
 internal fun isMsbStateDbError(output: String): Boolean = "error: database error:" in output
+
+/**
+ * True if [stderr] (an `msb exec` invocation's stderr) says msb could not reach the guest
+ * agent's endpoint at all, as distinct from the guest command itself failing.
+ *
+ * A sandbox reaches Running in `msb ls` before the in-guest agent has necessarily created the
+ * endpoint `msb exec` connects to — Running is a statement about the sandbox process, not about
+ * that endpoint. The two are ordinarily separated by enough wall-clock that nothing notices:
+ * every wait strategy blocks on a log line, an HTTP probe, or a port before anyone execs. A
+ * caller that execs immediately after [MsbCliBackend.start] returns has no such gap, and on
+ * Windows — where the endpoint is a named pipe rather than a unix socket — loses the race
+ * outright:
+ *
+ * ```
+ * error: agent client error: connect \\.\pipe\msb-agent-e7779577a75cc1f89f66c534458bf8fd: The
+ * system cannot find the file specified. (os error 2)
+ * ```
+ *
+ * Captured verbatim from a windows-2025 hosted runner exec'ing into a sandbox restored from a
+ * checkpoint archive. Matches on msb's own `agent client error` framing plus `connect`, so a
+ * failure *after* the connection is established — a real agent error worth surfacing — is never
+ * mistaken for this, the same substring-classifier discipline [isImageCacheCorruption] and
+ * [isMsbStateDbError] already use.
+ */
+internal fun isAgentEndpointNotReady(stderr: String): Boolean =
+    "agent client error" in stderr && "connect" in stderr
 
 /**
  * True if [stderr] (from `msb snapshot inspect <ref>`) names msb's own "no such snapshot"

@@ -1,12 +1,21 @@
 package dev.rightsize.modules
 
 import dev.rightsize.GenericContainer
+import dev.rightsize.core.image.DockerImageName
 import dev.rightsize.core.wait.Wait
 
 /**
  * A single-node MinIO container, an S3-compatible object store. Exposes the S3 API (port 9000 —
  * what [endpointUrl] wraps) and the console (port 9001, exposed but not wrapped by a helper, the
  * same "exposed but unwrapped" treatment [ClickHouseContainer] gives its native-protocol port).
+ *
+ * ### Defaults to `minio/minio:latest` — this image's floating reference
+ *
+ * With no image given, this module tracks upstream's `latest` tag rather than a version this
+ * library pins, so the version moves with MinIO's own releases instead of this library's release
+ * cycle. The facts below were verified against `minio/minio:RELEASE.2025-09-07T16-13-09Z`
+ * specifically — pass that image explicitly to pin it:
+ * `MinIOContainer("minio/minio:RELEASE.2025-09-07T16-13-09Z")`.
  *
  * ### The default entrypoint does not serve — a command is required
  *
@@ -45,12 +54,15 @@ import dev.rightsize.core.wait.Wait
  * all under this backend's default allocation is not yet established, so this module sets no
  * [withMemoryLimit] override; callers who hit memory pressure can call it themselves.
  */
-class MinIOContainer(image: String = "minio/minio:RELEASE.2025-09-07T16-13-09Z") :
-    GenericContainer<MinIOContainer>(image) {
+class MinIOContainer(image: DockerImageName) : GenericContainer<MinIOContainer>(image.toString()) {
+    /** Defaults to `minio/minio:latest` — this image's floating reference (see the class doc). */
+    constructor(image: String = "minio/minio:latest") : this(DockerImageName.parse(image))
+
     private var usernameState = "testuser"
     private var passwordState = "testpassword"
 
     init {
+        image.assertCompatibleWith(EXPECTED_REPOSITORY)
         withExposedPorts(API_PORT, CONSOLE_PORT)
         withCommand("server", "/data", "--console-address", ":$CONSOLE_PORT")
         withEnv("MINIO_ROOT_USER", usernameState)
@@ -83,5 +95,6 @@ class MinIOContainer(image: String = "minio/minio:RELEASE.2025-09-07T16-13-09Z")
     private companion object {
         const val API_PORT = 9000
         const val CONSOLE_PORT = 9001
+        const val EXPECTED_REPOSITORY = "minio/minio"
     }
 }

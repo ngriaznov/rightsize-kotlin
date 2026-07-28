@@ -8,10 +8,19 @@ with zero configuration.
 
 | | |
 |---|---|
-| Default image | `postgres:18-alpine` |
+| Default image | `postgres:latest` — this image's floating reference (see below) |
 | Exposed port | `5432` |
 | Env | `POSTGRES_USER=test`, `POSTGRES_PASSWORD=test`, `POSTGRES_DB=test`, `DOCKER_PG_LLVM_DEPS=""` (see below) |
 | Wait strategy | `Wait.forLogMessage(".*database system is ready to accept connections.*", times = 2)` |
+
+With no image given, this module tracks upstream's `latest` tag rather than a version
+this library pins. This module previously pinned `postgres:18-alpine`; `latest` is the
+Debian-based variant, not Alpine — functionally equivalent for everything this module
+exercises, just a larger pull. Pass that image explicitly to pin it:
+
+```kotlin
+PostgreSQLContainer("postgres:18-alpine")
+```
 
 ## Helpers
 
@@ -79,6 +88,27 @@ before the guest ever boots — reproduced with zero rightsize-set env vars, so 
 purely an artifact of the image, not anything this library added. Docker is
 unaffected. This module overrides the variable to an empty string
 (`withEnv("DOCKER_PG_LLVM_DEPS", "")`), which is a no-op on Docker and the fix on
-microsandbox. If you hit a similar `InvalidAscii` panic with an image this module
-doesn't cover, look for a baked env var with an unusual byte in it — see
-[Troubleshooting](../troubleshooting.md) for the general pattern.
+microsandbox. This override was verified against the alpine variant specifically;
+whether the Debian-based `latest` this module now defaults to bakes the same
+tab-containing value has not been re-verified, so the override stays in place
+unconditionally rather than being gated on the image chosen. If you hit a similar
+`InvalidAscii` panic with an image this module doesn't cover, look for a baked env var
+with an unusual byte in it — see [Troubleshooting](../troubleshooting.md) for the
+general pattern.
+
+## Compatibility checking
+
+Passing an explicit image checks its repository against the one this module
+understands (`postgres`) before any port, wait-strategy, or backend work runs — a
+mismatched image fails fast with a typed `IncompatibleImageException` naming both
+repositories, rather than degrading into a bare wait-strategy timeout. To use a
+differently-named image on purpose (a private mirror, a hardened rebuild), wrap it
+with the escape hatch:
+
+```kotlin
+PostgreSQLContainer(
+    DockerImageName.parse("mycorp/pg-hardened:18")
+        .asCompatibleSubstituteFor("postgres"))
+```
+
+See [Core Concepts](../concepts/containers.md) for `DockerImageName` itself.

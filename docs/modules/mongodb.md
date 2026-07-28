@@ -10,10 +10,19 @@ not-yet-a-primary window yourself.
 
 | | |
 |---|---|
-| Default image | `mongo:8.0` |
+| Default image | `mongo:latest` — this image's floating reference (see below) |
 | Exposed port | `27017` |
 | Command | `mongod --replSet docker-rs --bind_ip_all` |
 | Wait strategy | `Wait.forListeningPort()`, followed by a post-start replica-set-init hook |
+
+With no image given, this module tracks upstream's `latest` tag rather than a version
+this library pins, so the version moves with MongoDB's own releases instead of this
+library's release cycle. This module previously pinned `mongo:8.0`; pass that image
+explicitly to pin it:
+
+```kotlin
+MongoDBContainer("mongo:8.0")
+```
 
 ## Helpers
 
@@ -61,3 +70,20 @@ polling every 500ms. Only once a primary is confirmed elected does `start()` ret
 This two-stage approach (raw port ready, then a domain-specific liveness check before
 handing control back to your test) is the same shape `PinotContainer` uses for its
 `/health`-then-schema-POST race — see [Apache Pinot](pinot.md) for that parallel case.
+
+## Compatibility checking
+
+Passing an explicit image checks its repository against the one this module
+understands (`mongo`) before any port, wait-strategy, or backend work runs — a
+mismatched image fails fast with a typed `IncompatibleImageException` naming both
+repositories, rather than degrading into a bare wait-strategy timeout. To use a
+differently-named image on purpose (a private mirror, a hardened rebuild), wrap it
+with the escape hatch:
+
+```kotlin
+MongoDBContainer(
+    DockerImageName.parse("mycorp/mongo-hardened:8.0")
+        .asCompatibleSubstituteFor("mongo"))
+```
+
+See [Core Concepts](../concepts/containers.md) for `DockerImageName` itself.

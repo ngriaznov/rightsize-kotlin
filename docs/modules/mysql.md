@@ -8,10 +8,20 @@ configuration.
 
 | | |
 |---|---|
-| Default image | `mysql:8.4` |
+| Default image | `mysql:latest` — this image's floating reference (see below) |
 | Exposed port | `3306` |
 | Env | `MYSQL_USER=test`, `MYSQL_PASSWORD=test`, `MYSQL_DATABASE=test`, `MYSQL_ROOT_PASSWORD=test` |
 | Wait strategy | `Wait.forLogMessage(".*mysqld: ready for connections.*port: 3306($\|[^0-9]).*", times = 1)` |
+
+With no image given, this module tracks upstream's `latest` tag rather than a version
+this library pins, so the version moves with MySQL's own releases instead of this
+library's release cycle. The facts below (the captured log excerpt, the readiness
+regex's exact false-match trap) were verified against `mysql:8.4` specifically — pass
+that image explicitly to pin it:
+
+```kotlin
+MySQLContainer("mysql:8.4")
+```
 
 ## Helpers
 
@@ -91,3 +101,20 @@ If you're writing a `GenericContainer` wait strategy for a different MySQL-famil
 image, or extending this pattern elsewhere, capture a real boot log first rather than
 assuming a single readiness line — see [MariaDB](mariadb.md) for the sibling case that
 follows the same precedent.
+
+## Compatibility checking
+
+Passing an explicit image checks its repository against the one this module
+understands (`mysql`) before any port, wait-strategy, or backend work runs — a
+mismatched image fails fast with a typed `IncompatibleImageException` naming both
+repositories, rather than degrading into a bare wait-strategy timeout. To use a
+differently-named image on purpose (a private mirror, a hardened rebuild), wrap it
+with the escape hatch:
+
+```kotlin
+MySQLContainer(
+    DockerImageName.parse("mycorp/mysql-hardened:8.4")
+        .asCompatibleSubstituteFor("mysql"))
+```
+
+See [Core Concepts](../concepts/containers.md) for `DockerImageName` itself.

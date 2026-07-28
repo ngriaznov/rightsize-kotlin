@@ -1,6 +1,7 @@
 package dev.rightsize.modules
 
 import dev.rightsize.GenericContainer
+import dev.rightsize.core.image.DockerImageName
 import dev.rightsize.core.wait.Wait
 import java.time.Duration
 
@@ -8,6 +9,14 @@ import java.time.Duration
  * A single-node MySQL container. Defaults to a `test`/`test`/`test` user/password/database trio
  * (plus `MYSQL_ROOT_PASSWORD=test`) so [jdbcUrl] is usable with zero configuration; call
  * [withUsername]/[withPassword]/[withDatabase] before [start] to override any of them.
+ *
+ * ### Defaults to `mysql:latest` — this image's floating reference
+ *
+ * With no image given, this module tracks upstream's `latest` tag rather than a version this
+ * library pins, so the version moves with MySQL's own releases instead of this library's release
+ * cycle. The facts below (the captured log excerpt, the readiness regex's exact false-match trap)
+ * were verified against `mysql:8.4` specifically — pass that image explicitly to pin it:
+ * `MySQLContainer("mysql:8.4")`.
  *
  * ### Readiness — empirically pinned, not guessed
  *
@@ -37,12 +46,16 @@ import java.time.Duration
  * cannot match `33060`, and `times=1` is then unambiguous (that exact line appears once, only
  * after the real server is up).
  */
-class MySQLContainer(image: String = "mysql:8.4") : GenericContainer<MySQLContainer>(image) {
+class MySQLContainer(image: DockerImageName) : GenericContainer<MySQLContainer>(image.toString()) {
+    /** Defaults to `mysql:latest` — this image's floating reference (see the class doc). */
+    constructor(image: String = "mysql:latest") : this(DockerImageName.parse(image))
+
     private var usernameState = "test"
     private var passwordState = "test"
     private var databaseState = "test"
 
     init {
+        image.assertCompatibleWith(EXPECTED_REPOSITORY)
         withExposedPorts(3306)
         withEnv("MYSQL_USER", usernameState)
         withEnv("MYSQL_PASSWORD", passwordState)
@@ -89,4 +102,8 @@ class MySQLContainer(image: String = "mysql:8.4") : GenericContainer<MySQLContai
 
     /** A `jdbc:mysql://` URL for the running container's [databaseName]. */
     val jdbcUrl: String get() = "jdbc:mysql://$host:${getMappedPort(3306)}/$databaseName"
+
+    private companion object {
+        const val EXPECTED_REPOSITORY = "mysql"
+    }
 }

@@ -2,19 +2,33 @@ package dev.rightsize.modules
 
 import dev.rightsize.GenericContainer
 import dev.rightsize.core.ContainerSpec
+import dev.rightsize.core.image.DockerImageName
 import dev.rightsize.core.wait.Wait
 
-/** A single-node Redpanda broker (Kafka API-compatible) with its schema registry enabled. */
-class RedpandaContainer(image: String = "redpandadata/redpanda:v24.2.4") :
-    GenericContainer<RedpandaContainer>(image) {
+/**
+ * A single-node Redpanda broker (Kafka API-compatible) with its schema registry enabled.
+ *
+ * ### Defaults to `redpandadata/redpanda:latest` — this image's floating reference
+ *
+ * With no image given, this module tracks upstream's `latest` tag rather than a version this
+ * library pins, so the version moves with Redpanda's own releases instead of this library's
+ * release cycle. This module previously pinned `redpandadata/redpanda:v24.2.4` — note the `v`
+ * prefix Redpanda's own version tags carry, unlike `latest` — pass that image explicitly to pin
+ * it: `RedpandaContainer("redpandadata/redpanda:v24.2.4")`.
+ */
+class RedpandaContainer(image: DockerImageName) : GenericContainer<RedpandaContainer>(image.toString()) {
+    /** Defaults to `redpandadata/redpanda:latest` — this image's floating reference (see the class doc). */
+    constructor(image: String = "redpandadata/redpanda:latest") : this(DockerImageName.parse(image))
 
     private companion object {
         // The alias siblings resolve INTERNAL through — native docker networks, or the msb
         // exec-tunnel alias emulation (best-effort; mirage has no sibling Kafka consumers).
         const val INTERNAL_ALIAS = "redpanda"
+        const val EXPECTED_REPOSITORY = "redpandadata/redpanda"
     }
 
     init {
+        image.assertCompatibleWith(EXPECTED_REPOSITORY)
         withExposedPorts(9092, 9093, 8081)
         waitingFor(Wait.forLogMessage(".*Successfully started Redpanda.*"))
     }
