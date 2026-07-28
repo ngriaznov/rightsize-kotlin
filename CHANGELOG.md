@@ -7,6 +7,33 @@ reaches its first tagged release.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.6.0] - 2026-07-28
+
+### Upgrading from 0.5.0
+
+Two changes affect existing code.
+
+**Modules no longer pin an image version.** `RedisContainer()` previously booted
+`redis:8.6-alpine`; it now boots `redis:latest`. Your tests will run whatever version
+upstream currently publishes, which is the point — the version tracks the image's own
+releases rather than this library's. To keep a specific version, name it:
+`RedisContainer("redis:8.6-alpine")`. Redis, Valkey, PostgreSQL, and Memcached
+additionally move from an Alpine variant to the Debian-based `latest`: functionally
+equivalent, noticeably larger to pull.
+
+**`ElasticsearchContainer` has no no-arg constructor.** Elastic publishes no floating
+tag — `elasticsearch:latest`, `:9`, and `:8` are all `404` on Docker Hub — so an
+explicit version is required and there is nothing this module could pick on your
+behalf: `ElasticsearchContainer("elasticsearch:9.4.4")`.
+
+An explicitly supplied image is also now checked against the repository the module
+understands, so passing an unrelated image fails immediately with
+`IncompatibleImageException` instead of timing out against the wrong server. If the
+image really is a drop-in replacement, say so:
+`DockerImageName.parse("mycorp/pg-hardened:16").asCompatibleSubstituteFor("postgres")`.
+
 ### Added
 
 - **`DockerImageName`** (`dev.rightsize.core.image`) — a parsed Docker image reference
@@ -38,6 +65,19 @@ reaches its first tagged release.
   No env var, port, wait strategy, memory limit, or command changed — each module's own
   KDoc/docs page states which pinned version its readiness signal, memory floor, and timing
   facts were verified against.
+
+### Fixed
+
+- **An `exec` issued immediately after `start()` could fail to reach the guest.** A
+  sandbox reports `Running` before the in-guest agent has created the endpoint `exec`
+  connects to; the gap is invisible whenever a wait strategy runs first, which is every
+  module, but a caller that starts and execs at once could lose the race — reliably so on
+  Windows, where the endpoint is a named pipe. `exec` now retries on that one signature.
+  A guest command's own non-zero exit, and any agent error raised after connecting, still
+  return on the first attempt.
+- **`MongoDBContainer`'s replica-set budget is now 180s**, up from 60s. `rs.initiate`
+  was observed failing at exactly the 60s mark on a loaded Windows CI runner against the
+  floating default, matching the budget MySQL and ClickHouse already carry.
 
 ## [0.5.0] - 2026-07-25
 
@@ -373,7 +413,8 @@ Initial public release.
   exactly once; any other failure, or a second failure after the heal,
   propagates unchanged.
 
-[Unreleased]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.2.0...v0.3.0
