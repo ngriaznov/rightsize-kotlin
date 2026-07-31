@@ -29,6 +29,7 @@ import java.net.HttpURLConnection
 import java.net.URI
 import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.attribute.PosixFilePermissions
 import java.time.Duration
 import java.time.Instant
 import java.util.concurrent.CopyOnWriteArrayList
@@ -84,12 +85,15 @@ private fun randomHex(): String {
 abstract class BackendContractTest {
 
     /**
-     * Whether this backend actually enforces [dev.rightsize.core.FileMount.readOnly] as a
-     * guest-side write block. Overridden `false` by msb: its `--mount-file SOURCE:DEST:ro`
-     * reports the mount `ro` in `mount(8)` output but does not reject in-guest writes — a
-     * real backend asymmetry the read-only-mount test below pins. Re-check this override if
-     * MsbCliBackend/MsbCommands mount plumbing changes or a new msb release fixes enforcement.
+     * No longer consulted by any test in this suite, and overriding it has no effect.
+     *
+     * It recorded that a backend did not enforce [dev.rightsize.core.FileMount.readOnly] as a
+     * guest-side write block, which was only ever true of microsandbox — and only because the
+     * flag was never passed to it. Every backend honours it now, so there is nothing left to
+     * parameterize. Kept, deprecated, so an existing subclass that overrides it still compiles;
+     * delete the override.
      */
+    @Deprecated("No longer consulted: every backend enforces FileMount.readOnly. Remove the override.")
     protected open val readOnlyMountEnforced: Boolean = true
 
     @Test fun `container publishes TCP port to host loopback`() {
@@ -175,24 +179,41 @@ abstract class BackendContractTest {
         } finally { c.stop(); Files.deleteIfExists(hostFile) }
     }
 
-    // Read-only mount default (FileMount.readOnly == true unless overridden) is honored.
-    @Test fun `withCopyFileToContainer default read-only mount rejects an in-guest write`() {
-        val hostFile = Files.createTempFile("rightsize-ro-", ".txt")
+    // A mount made through the builder is read-write (FileMount.readOnly's default), and the
+    // same holds on every backend. The mount is a view of the host file rather than a copy of
+    // it — Docker binds the host path directly, microsandbox hard-links it into its staging
+    // directory — so the guest and the host share one inode. Callers who need the host copy
+    // protected construct the mount with readOnly = true.
+    @Test fun `withCopyFileToContainer mounts read-write by default`() {
+        val hostFile = Files.createTempFile("rightsize-rw-", ".txt")
         Files.writeString(hostFile, "seed\n")
+        // Two fixture choices keep this test measuring the mount's access mode and nothing else —
+        // both denials below are EACCES, where a read-only mount denies with EROFS, so leaving
+        // either in place would let a permission failure impersonate `:ro` (exactly what this
+        // test's predecessor did).
+        //
+        // World-writable host file (no-op on Windows, which has no POSIX view): a docker daemon
+        // running rootless or with userns-remap maps container root to an unprivileged host uid,
+        // which the default 0600 temp-file mode would block.
+        runCatching {
+            Files.setPosixFilePermissions(hostFile, PosixFilePermissions.fromString("rw-rw-rw-"))
+        }
+        // Guest path outside /tmp: alpine's /tmp is a world-writable sticky directory, and Ubuntu
+        // kernels ship fs.protected_regular, which denies the shell redirection's O_CREAT open of
+        // another uid's file in such a directory — for root too, mode bits notwithstanding.
+        // Reproduced directly: root, a 0666 file owned by another uid, sysctl 2 — `> /tmp/f` is
+        // EACCES while the same write to /srv succeeds.
         val c = GenericContainer("alpine:3.19")
-            .withCopyFileToContainer(MountableFile.forHostPath(hostFile.toString()), "/tmp/ro.txt")
+            .withCopyFileToContainer(MountableFile.forHostPath(hostFile.toString()), "/srv/mounted.txt")
             .withCommand("sleep", "120")
             .waitingFor(Wait.forLogMessage(".*", 0).withStartupTimeout(Duration.ofSeconds(30)))
         c.start()
         try {
-            val write = c.execInContainer("sh", "-c", "echo overwritten > /tmp/ro.txt")
-            if (readOnlyMountEnforced) {
-                assertNotEquals(0, write.exitCode, "expected read-only mount to reject the write; stderr=${write.stderr}")
-            } else {
-                // Pinned current msb behavior (see readOnlyMountEnforced doc above): the write
-                // succeeds despite the mount being flagged `ro` in the guest's mount table.
-                assertEquals(0, write.exitCode, "msb read-only-mount write behavior changed — update readOnlyMountEnforced pin")
-            }
+            val write = c.execInContainer("sh", "-c", "echo overwritten > /srv/mounted.txt && sync")
+            assertEquals(0, write.exitCode, "a default mount must accept an in-guest write; stderr=${write.stderr}")
+            val readBack = c.execInContainer("cat", "/srv/mounted.txt")
+            assertTrue(readBack.stdout.contains("overwritten"),
+                "the write must be visible in the guest: ${readBack.stdout}")
         } finally { c.stop(); Files.deleteIfExists(hostFile) }
     }
 

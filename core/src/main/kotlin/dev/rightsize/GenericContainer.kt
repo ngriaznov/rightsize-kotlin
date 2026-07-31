@@ -82,7 +82,12 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
     fun withNetwork(net: Network): SELF { network = net; return this as SELF }
     /** Names this container is reachable as on its [Network] (see [Network.resolve]). */
     fun withNetworkAliases(vararg names: String): SELF { aliases += names; return this as SELF }
-    /** Mounts [file] read-only into the guest at [guestPath]; takes effect at the next [start]. */
+    /**
+     * Mounts [file] into the guest at [guestPath]; takes effect at the next [start]. The mount is
+     * read-write ([dev.rightsize.core.FileMount.readOnly]'s default) and is a view of the host
+     * file rather than a copy of it, so a guest write reaches the host file itself. A mount
+     * constructed with `readOnly = true` is enforced on both backends as a guest-side write block.
+     */
     fun withCopyFileToContainer(file: MountableFile, guestPath: String): SELF {
         mounts += FileMount(file.path, guestPath); return this as SELF
     }
@@ -115,7 +120,7 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
     fun withRequireIsolation(): SELF { requireIsolationRequested = true; return this as SELF }
     internal fun withBackend(b: SandboxBackend): SELF { backendOverride = b; return this as SELF }
     /** Internal factory seam: `fromCheckpoint` sets [checkpointRef] (msb boots via
-     * `msb run --snapshot <ref>` instead of its normal image path — see `MsbCommands.run`) and
+     * `msb run --from-snapshot <ref>` instead of its normal image path — see `MsbCommands.run`) and
      * [checkpointCreatorBackend] (checked at [start], before any backend call — see
      * [CheckpointBackendMismatchException]). Not a public `withX` builder: restoring from a
      * checkpoint is only ever reached through [fromCheckpoint] itself. */

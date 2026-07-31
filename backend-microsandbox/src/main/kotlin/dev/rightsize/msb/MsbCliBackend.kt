@@ -4,18 +4,37 @@ import dev.rightsize.RunId
 import dev.rightsize.core.*
 import dev.rightsize.core.reuse.SandboxNameCollisionException
 import java.io.InputStream
+import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.StandardCopyOption
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedDeque
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
-class MsbCliBackend(internal val msb: Path) : SandboxBackend {
+/**
+ * [windowsHost] is the host-OS switch for the two paths that behave differently there
+ * ([followLogs]'s polling variant and [exportCheckpoint]'s salvage of a save that failed its
+ * fsync). It exists so tests can drive those branches from a POSIX machine — a real Windows
+ * host is CI-only, so without this seam they would ship with no unit coverage at all.
+ *
+ * The seam is deliberately kept off the public surface entirely. The two-argument
+ * constructor is `private` — `internal` would still emit a public constructor into the
+ * bytecode and so remain callable from Java — and tests reach it through [forHost], whose
+ * name Kotlin mangles for the same reason. `MsbCliBackend(Path)` stays the only public
+ * entry point, exactly as before.
+ */
+class MsbCliBackend private constructor(
+    internal val msb: Path,
+    private val windowsHost: Boolean,
+) : SandboxBackend {
+    constructor(msb: Path) : this(msb, Platform.current()?.isWindows == true)
+
     override val name = "microsandbox"
     override val supportsNativeNetworks = false   // networks emulated via exec-tunnels
     // Each sandbox is its own microVM (hardware-isolated); checkpoint is backed by msb's disk
-    // snapshot primitives (stop -> snapshot create -> rm -> run --snapshot), which restarts the
+    // snapshot primitives (stop -> snapshot create -> rm -> run --from-snapshot), which restarts the
     // workload, hence checkpointRestartsWorkload = true (see docs/checkpoints.md and
     // BackendCapabilities' doc).
     override val capabilities = BackendCapabilities(
@@ -27,40 +46,21 @@ class MsbCliBackend(internal val msb: Path) : SandboxBackend {
         val resources = CopyOnWriteArrayList<AutoCloseable>()  // tunnels etc.
     }
 
-    private companion object {
-        // Permissive DNS-label charset: aliases are interpolated into a `sh -c` /etc/hosts
-        // echo, so this exists to reject shell-breaking characters, not to enforce a strict
-        // hostname grammar.
-        val ALIAS_CHARSET = Regex("[A-Za-z0-9._-]+")
-        const val FIRST_RUN_PULL_TIMEOUT_MS = 600_000L   // first run may pull the image
-        const val READINESS_POLL_MS = 300L
-        const val STOP_TIMEOUT_SEC = 60L
-        // Before retrying a boot that hit msb's state-database error — enough for a winning
-        // concurrent invocation's migration transaction to commit; the retry's own `msb run`
-        // startup dwarfs this either way.
-        const val STATE_DB_RETRY_DELAY_MS = 500L
-        const val EXEC_TIMEOUT_SEC = 120L
-        // How long exec keeps retrying while the guest agent's endpoint has not appeared yet,
-        // and how long it pauses between attempts — see [isAgentEndpointNotReady]. Zero cost on
-        // the ordinary path, where the first attempt connects.
-        const val AGENT_ENDPOINT_RETRY_BUDGET_MS = 30_000L
-        const val AGENT_ENDPOINT_RETRY_DELAY_MS = 250L
-        const val LOGS_TIMEOUT_SEC = 30L
-        const val COPY_TIMEOUT_SEC = 120L
-        // `msb snapshot create` writes a full disk image (sparse — a tiny alpine snapshot was
-        // observed at 3.9 MB on disk despite a "4 GiB" nominal size) — generous but bounded.
-        const val SNAPSHOT_TIMEOUT_SEC = 180L
-        // `msb snapshot export`/`import` (see exportCheckpoint/importCheckpoint) — same order of
-        // magnitude as SNAPSHOT_TIMEOUT_SEC, the artifact they move is the same payload.
-        const val SNAPSHOT_EXPORT_TIMEOUT_SEC = 300L
-        const val SNAPSHOT_IMPORT_TIMEOUT_SEC = 300L
-        const val ATTACHED_PROC_STOP_TIMEOUT_SEC = 10L
-        const val READER_JOIN_TIMEOUT_MS = 2000L
-        const val TAIL_LINES = 50
+    // The companion holds ONLY the test seam. An internal companion object is a public
+    // class in the bytecode, so anything else placed in it — even members that were
+    // package-private while the companion itself was — would become Java-reachable; the
+    // tuning constants therefore live as file-private top-level declarations below the
+    // class, where no bytecode-public accessor is ever emitted for them.
+    internal companion object {
+        /**
+         * Builds a backend pinned to [windowsHost] rather than to the real platform — the
+         * test-only seam described on this class. `internal`, so Kotlin mangles its name in
+         * the bytecode and it never becomes a Java-callable entry point either.
+         */
+        internal fun forHost(msb: Path, windowsHost: Boolean) = MsbCliBackend(msb, windowsHost)
     }
 
     private val startedNames = ConcurrentHashMap.newKeySet<String>()
-    private val windowsHost = Platform.current()?.isWindows == true
     init { Runtime.getRuntime().addShutdownHook(Thread { startedNames.forEach { silently(it) } }) }
 
     /** Test-only view of the own-run-cleanup tracking set — asserts that [start] does (or, for
@@ -120,6 +120,26 @@ class MsbCliBackend(internal val msb: Path) : SandboxBackend {
     private fun spawnAndAwaitRunning(handle: Handle, spec: ContainerSpec): Process {
         val firstOutput = try {
             return bootOnce(handle, spec)
+        } catch (locked: MsbInstallLockException) {
+            // msb refuses `run` outright while its internal install lock is held (see
+            // [isMsbInstallLockActive]). The message names a deadline ~30 minutes out, but
+            // both captured occurrences cleared within the same test run — boots seconds
+            // later succeeded — so this polls briefly rather than trusting the deadline.
+            // The budget expiring surfaces the last refusal as-is: at that point the lock
+            // is genuinely long-lived and waiting here would only hide it.
+            val deadline = System.nanoTime() + INSTALL_LOCK_RETRY_BUDGET_MS * 1_000_000
+            var last = locked
+            while (System.nanoTime() < deadline) {
+                Thread.sleep(INSTALL_LOCK_RETRY_DELAY_MS)
+                try {
+                    return bootOnce(handle, spec)
+                } catch (again: MsbInstallLockException) {
+                    last = again
+                }
+            }
+            error("msb run for sandbox ${handle.id} was refused for ${INSTALL_LOCK_RETRY_BUDGET_MS / 1000}s " +
+                "by msb's install-operation lock — both observed occurrences cleared within seconds, so a " +
+                "lock held this long looks like a genuinely stuck msb install on this host.\n${last.output}")
         } catch (race: MsbStateDbException) {
             // Usually the startup-migration race, transient by construction (see
             // [isMsbStateDbError]): the winning msb invocation's migration commits and a
@@ -208,6 +228,7 @@ class MsbCliBackend(internal val msb: Path) : SandboxBackend {
                 val output = tail.joinToString("\n")
                 if (isImageCacheCorruption(output)) throw ImageCacheCorruptionException(output)
                 if (isMsbStateDbError(output)) throw MsbStateDbException(output)
+                if (isMsbInstallLockActive(output)) throw MsbInstallLockException(output)
                 if (isPortBindConflict(output)) {
                     throw PortBindConflictException(
                         "msb run for sandbox ${handle.id} could not bind a host port: $output")
@@ -281,12 +302,12 @@ class MsbCliBackend(internal val msb: Path) : SandboxBackend {
      * breakaway rights, which is exactly the case when this JVM is itself a child of a Gradle
      * test process or a CI runner's job. That denial is deterministic, not transient, so no
      * retry ever clears it. Attached `msb run` — this backend's ordinary boot, no creation
-     * flags — works everywhere, including a `--snapshot` boot, so the resume step here is
+     * flags — works everywhere, including a `--from-snapshot` boot, so the resume step here is
      * instead: remove the stopped sandbox (its disk state now lives entirely in the snapshot)
      * and boot a fresh attached sandbox from that snapshot under the SAME name/ports/env/memory
      * limit, via [spawnAndAwaitRunning] — the exact boot path [start] itself uses, just fed
      * [handle]'s own spec with `checkpointRef` set to the new ref (`MsbCommands.run` then emits
-     * `--snapshot <ref>` in place of the image arg). [Handle.attached] is swapped to the new
+     * `--from-snapshot <ref>` in place of the image arg). [Handle.attached] is swapped to the new
      * child; `id`/`spec` — the ledger-relevant identity — are untouched.
      *
      * `capabilities.checkpointRestartsWorkload = true` is exactly why: the rebooted workload
@@ -353,19 +374,32 @@ class MsbCliBackend(internal val msb: Path) : SandboxBackend {
 
     /**
      * Backs `Checkpoint.exportTo` (see docs/checkpoints.md's "Moving checkpoints between
-     * machines" section): `msb snapshot export <ref> <dest>` writes [ref]'s `.tar.zst` artifact
-     * to [dest], byte-for-byte what [importCheckpoint]'s `snapshot import` reads back.
+     * machines" section): `msb snapshot save <ref> <dest>` writes [ref]'s `.tar.zst` artifact
+     * to [dest], byte-for-byte what [importCheckpoint]'s `snapshot load` reads back.
+     *
+     * On Windows, a failure carrying the access-denied errno is finished by hand instead of
+     * surfaced: msb 0.6.7/0.6.8 writes the whole archive to a staging file next to [dest] and
+     * then fsyncs it through a read-only handle, which can never succeed on Windows, so every
+     * save fails there one step short of renaming the finished archive into place (see
+     * [isSnapshotSaveAccessDenied] for the mechanics). [salvageStagedArchive] performs exactly
+     * that rename, and only when the staging directory holds exactly one candidate. Anything
+     * else — a non-Windows host, any other stderr, an unrecognizable staging directory —
+     * surfaces msb's own error unchanged.
+     *
+     * This needs no version check against the pinned msb release and carries no removal
+     * condition: it can only run when msb fails this specific way, so a fixed msb simply stops
+     * reaching it.
      */
     override fun exportCheckpoint(ref: String, dest: Path) {
         val r = invoke(MsbCommands.snapshotExport(ref, dest), SNAPSHOT_EXPORT_TIMEOUT_SEC)
-        if (r.exitCode != 0) {
-            error("msb snapshot export $ref $dest failed (exit ${r.exitCode}): " +
-                "${r.stderr.trim().ifEmpty { r.stdout.trim() }}")
-        }
+        if (r.exitCode == 0) return
+        if (windowsHost && isSnapshotSaveAccessDenied(r.stderr) && salvageStagedArchive(dest)) return
+        error("msb snapshot save $ref $dest failed (exit ${r.exitCode}): " +
+            "${r.stderr.trim().ifEmpty { r.stdout.trim() }}")
     }
 
     /**
-     * Backs `Checkpoint.importFrom`: `msb snapshot import <src>` unpacks [src] into a
+     * Backs `Checkpoint.importFrom`: `msb snapshot load <src>` unpacks [src] into a
      * DIGEST-derived directory under `~/.microsandbox/snapshots/` — the original snapshot name
      * ([ref]) is NOT preserved, so [ref] itself is unused beyond being part of this method's
      * signature (the SPI contract every backend shares; docker's own [ref] IS its effective ref,
@@ -379,27 +413,27 @@ class MsbCliBackend(internal val msb: Path) : SandboxBackend {
      * `sha256:<64hex>` digest — is the EFFECTIVE ref this returns: verified empirically that msb
      * does not resolve the full digest as a snapshot ref at all (`msb snapshot inspect
      * sha256:<full>` fails "snapshot not found", treating it as a literal path), while the
-     * digest-dir name resolves for `run --snapshot`, `snapshot rm`, and `snapshot inspect` alike.
+     * digest-dir name resolves for `run --from-snapshot`, `snapshot rm`, and `snapshot inspect` alike.
      */
     override fun importCheckpoint(src: Path, ref: String): String {
         val r = invoke(MsbCommands.snapshotImport(src), SNAPSHOT_IMPORT_TIMEOUT_SEC)
         val alreadyExists = r.exitCode != 0 && isSnapshotAlreadyExists(r.stderr)
         if (r.exitCode != 0 && !alreadyExists) {
-            error("msb snapshot import $src failed (exit ${r.exitCode}): " +
+            error("msb snapshot load $src failed (exit ${r.exitCode}): " +
                 "${r.stderr.trim().ifEmpty { r.stdout.trim() }}")
         }
         val output = if (alreadyExists) r.stderr else r.stdout
         val digestDir = parseImportedDigestDir(output)
-            ?: error("could not parse the imported snapshot's path from msb snapshot import output: ${output.trim()}")
+            ?: error("could not parse the imported snapshot's path from msb snapshot load output: ${output.trim()}")
         if (!confirmDigestDirPresent(digestDir)) {
-            error("msb snapshot import reported digest-dir '$digestDir', but msb snapshot list --format json " +
+            error("msb snapshot load reported digest-dir '$digestDir', but msb snapshot list --format json " +
                 "has no matching entry")
         }
         return digestDir
     }
 
     /** `msb snapshot list --format json` -> [MsbSnapshotListJson.contains], confirming
-     * [digestDir] (the basename [importCheckpoint] parsed from `snapshot import`'s own output) is
+     * [digestDir] (the basename [importCheckpoint] parsed from `snapshot load`'s own output) is
      * a genuinely registered snapshot before it's handed back as the effective ref. */
     private fun confirmDigestDirPresent(digestDir: String): Boolean =
         MsbSnapshotListJson.contains(invoke(MsbCommands.snapshotList(), LOGS_TIMEOUT_SEC).stdout, digestDir)
@@ -706,6 +740,44 @@ class MsbCliBackend(internal val msb: Path) : SandboxBackend {
         Thread { stream.bufferedReader().forEachLine(onLine) }.apply { isDaemon = true; start() }
 }
 
+// [MsbCliBackend]'s tuning constants — file-private top level rather than companion members,
+// so nothing bytecode-public is emitted for them (see the note on the companion).
+
+// Permissive DNS-label charset: aliases are interpolated into a `sh -c` /etc/hosts
+// echo, so this exists to reject shell-breaking characters, not to enforce a strict
+// hostname grammar.
+private val ALIAS_CHARSET = Regex("[A-Za-z0-9._-]+")
+private const val FIRST_RUN_PULL_TIMEOUT_MS = 600_000L   // first run may pull the image
+private const val READINESS_POLL_MS = 300L
+private const val STOP_TIMEOUT_SEC = 60L
+// Before retrying a boot that hit msb's state-database error — enough for a winning
+// concurrent invocation's migration transaction to commit; the retry's own `msb run`
+// startup dwarfs this either way.
+private const val STATE_DB_RETRY_DELAY_MS = 500L
+// msb's install-operation lock (see [isMsbInstallLockActive]): observed clearing within
+// seconds despite its message's ~30-minute deadline, so poll a short budget and give up
+// loudly after it — a lock outliving this really is stuck.
+private const val INSTALL_LOCK_RETRY_BUDGET_MS = 30_000L
+private const val INSTALL_LOCK_RETRY_DELAY_MS = 2_000L
+private const val EXEC_TIMEOUT_SEC = 120L
+// How long exec keeps retrying while the guest agent's endpoint has not appeared yet,
+// and how long it pauses between attempts — see [isAgentEndpointNotReady]. Zero cost on
+// the ordinary path, where the first attempt connects.
+private const val AGENT_ENDPOINT_RETRY_BUDGET_MS = 30_000L
+private const val AGENT_ENDPOINT_RETRY_DELAY_MS = 250L
+private const val LOGS_TIMEOUT_SEC = 30L
+private const val COPY_TIMEOUT_SEC = 120L
+// `msb snapshot create` writes a full disk image (sparse — a tiny alpine snapshot was
+// observed at 3.9 MB on disk despite a "4 GiB" nominal size) — generous but bounded.
+private const val SNAPSHOT_TIMEOUT_SEC = 180L
+// `msb snapshot save`/`import` (see exportCheckpoint/importCheckpoint) — same order of
+// magnitude as SNAPSHOT_TIMEOUT_SEC, the artifact they move is the same payload.
+private const val SNAPSHOT_EXPORT_TIMEOUT_SEC = 300L
+private const val SNAPSHOT_IMPORT_TIMEOUT_SEC = 300L
+private const val ATTACHED_PROC_STOP_TIMEOUT_SEC = 10L
+private const val READER_JOIN_TIMEOUT_MS = 2000L
+private const val TAIL_LINES = 50
+
 /** The one boot failure [MsbCliBackend] heals and retries — carries the `msb run` child's
  * combined output for the second-failure diagnostic. Internal to the boot path: never
  * escapes `start()`, which converts a repeat failure into a plain error naming the heal. */
@@ -742,6 +814,30 @@ internal fun isImageCacheCorruption(output: String): Boolean =
  * sibling above. */
 internal class MsbStateDbException(val output: String) :
     RuntimeException("msb state-database error:\n$output")
+
+/**
+ * True if `output` (an `msb run` invocation's combined output) is msb refusing to run
+ * anything while its internal install lock is held. Captured verbatim from windows-2025
+ * hosted runners, once in each sibling CI lane, mid-suite with ordinary boots on both
+ * sides of the failure:
+ *
+ * ```
+ * error: runtime error: microsandbox install operation in progress until
+ * 2026-07-31 20:55:04.779845600; retry after it completes
+ * ```
+ *
+ * The deadline in the message reads ~30 minutes out, but both occurrences cleared within
+ * the same run — boots seconds later succeeded — so the boot path polls briefly (see
+ * `spawnAndAwaitRunning`) instead of failing on the first refusal or trusting the
+ * deadline. Matches on the stable phrase only; the timestamp varies per occurrence.
+ */
+internal fun isMsbInstallLockActive(output: String): Boolean =
+    "install operation in progress" in output
+
+/** Boot-path classified failure for [isMsbInstallLockActive] — internal to the boot path,
+ * like its two siblings above; `spawnAndAwaitRunning` owns the retry policy. */
+internal class MsbInstallLockException(val output: String) :
+    RuntimeException("msb install lock active:\n$output")
 
 /**
  * True if [output] (an early-exited `msb run` child's combined stdout/stderr) names a
@@ -797,7 +893,7 @@ internal fun isAgentEndpointNotReady(stderr: String): Boolean =
 /**
  * True if [stderr] (from `msb snapshot inspect <ref>`) names msb's own "no such snapshot"
  * miss, as opposed to some other inspect failure. Observed verbatim against the real msb
- * 0.6.6 binary:
+ * 0.6.8 binary:
  *
  * ```
  * error: snapshot not found: rz-ckpt-0123456789ab at /path/to/.microsandbox/snapshots/rz-ckpt-0123456789ab
@@ -813,8 +909,62 @@ internal fun isAgentEndpointNotReady(stderr: String): Boolean =
 internal fun isCheckpointMiss(stderr: String): Boolean = "error: snapshot not found:" in stderr
 
 /**
- * True if [stderr] (from `msb snapshot import`) names msb's own "already exists" outcome, as
- * opposed to some other import failure. Observed verbatim against the real msb 0.6.6 binary:
+ * True if [stderr] (from `msb snapshot save`) carries Windows' access-denied errno — which on
+ * msb 0.6.7/0.6.8 means the archive was written in full and then failed the fsync that follows
+ * it. Captured verbatim from a windows-2025 hosted runner:
+ *
+ * ```
+ * error: io error: Access is denied. (os error 5)
+ * ```
+ *
+ * msb's `save_snapshot` writes the archive to a staging file beside the destination, reopens
+ * that file READ-ONLY, calls `sync_all` on the handle, and only then renames it onto the
+ * destination. On Windows `sync_all` is `FlushFileBuffers`, which requires write access on the
+ * handle, so it returns error 5 on every single save and the rename is never reached; on Unix
+ * fsync of a read-only descriptor is legal, so only Windows sees it. msb 0.6.6 wrote straight to
+ * the destination with no fsync step at all, which is why this appeared with 0.6.7.
+ *
+ * Matches the `(os error 5)` suffix rather than the message text: the text is Windows' own,
+ * rendered through FormatMessage and therefore localized ("Access is denied." only on an English
+ * host), while the suffix is appended by Rust itself and reads identically in every locale.
+ * Deliberately narrow in the other direction too — see [salvageStagedArchive], which additionally
+ * requires an unambiguous staging file before this classification is acted on at all.
+ */
+internal fun isSnapshotSaveAccessDenied(stderr: String): Boolean = "(os error 5)" in stderr
+
+/**
+ * Finishes the rename a fsync-failed `msb snapshot save` never got to: moves the one staging
+ * file sitting beside [dest] onto [dest], returning true if it did.
+ *
+ * msb names that file `.<destination file name>.tmp.<msb's pid>.<unix nanos>` in the
+ * destination's own directory, and removes it only when WRITING the archive fails — a write that
+ * succeeded and then failed its fsync leaves the complete, valid archive behind under that name,
+ * which is what makes salvaging it correct rather than a guess. The move performed here is the
+ * same one msb's own `replace_archive` would have performed on the next line.
+ *
+ * Exactly one candidate is required. Checkpoint archives are always exported into a fresh,
+ * uniquely named staging directory this library creates and owns for that one artifact, so a
+ * single candidate is the normal case; none means the failure was not the one being worked
+ * around, and several mean the directory is not what this assumes, where choosing between them
+ * would be a guess. Both of those leave every file exactly where it is and report false, so the
+ * caller surfaces msb's original error. A failure to list the directory or to perform the move
+ * is reported the same way, for the same reason.
+ */
+internal fun salvageStagedArchive(dest: Path): Boolean {
+    val parent = dest.toAbsolutePath().parent ?: return false
+    val prefix = ".${dest.fileName ?: return false}.tmp."
+    val staged = runCatching {
+        Files.list(parent).use { entries ->
+            entries.filter { it.fileName.toString().startsWith(prefix) && Files.isRegularFile(it) }
+                .toList()
+        }
+    }.getOrElse { return false }.singleOrNull() ?: return false
+    return runCatching { Files.move(staged, dest, StandardCopyOption.REPLACE_EXISTING) }.isSuccess
+}
+
+/**
+ * True if [stderr] (from `msb snapshot load`) names msb's own "already exists" outcome, as
+ * opposed to some other import failure. Observed verbatim against the real msb 0.6.8 binary:
  *
  * ```
  * error: snapshot already exists: /path/to/.microsandbox/snapshots/sha256-b9c0448ee9d54e33
@@ -828,8 +978,8 @@ internal fun isCheckpointMiss(stderr: String): Boolean = "error: snapshot not fo
 internal fun isSnapshotAlreadyExists(stderr: String): Boolean = "snapshot already exists:" in stderr
 
 /**
- * Parses the digest-dir basename (e.g. `sha256-b9c0448ee9d54e33`) from `msb snapshot import`'s
- * own output. Verified against msb 0.6.6: on both an ordinary success and the
+ * Parses the digest-dir basename (e.g. `sha256-b9c0448ee9d54e33`) from `msb snapshot load`'s
+ * own output. Verified against msb 0.6.8: on both an ordinary success and the
  * already-exists-as-success outcome ([isSnapshotAlreadyExists]), the last non-blank line ends
  * with the artifact's full path under `~/.microsandbox/snapshots/<digest-dir>` — this takes that
  * line's final whitespace-separated token as the path and returns its filename. `null` if

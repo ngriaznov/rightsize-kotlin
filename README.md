@@ -51,7 +51,7 @@ than Docker, image pulls and container-to-container tests faster.
 
 ```kotlin
 // build.gradle.kts
-testImplementation(platform("dev.rightsize:bom:0.6.0"))
+testImplementation(platform("dev.rightsize:bom:0.6.1"))
 testImplementation("dev.rightsize:core")
 testImplementation("dev.rightsize:modules")
 testRuntimeOnly("dev.rightsize:backend-microsandbox")
@@ -145,7 +145,7 @@ rightsize picks a backend automatically; override with
 | Windows without WHP | Docker (auto-fallback)ᵇ |
 | Linux without KVM | Docker (auto-fallback) |
 
-ᵃ Windows msb support is upstream beta (microsandbox 0.6.6). rightsize detects a Windows
+ᵃ Windows msb support is upstream beta (microsandbox 0.6.8). rightsize detects a Windows
 build is available and attempts it; if WHP turns out not to be usable, msb's own `msb doctor`
 names the exact precondition (see ᵇ) instead of a generic failure.
 ᵇ Force with `RIGHTSIZE_BACKEND=docker`, or enable WHP: run `msb doctor --fix` in an
@@ -160,10 +160,6 @@ backend-specific rather than behavioral divergences:
 
 - **Network-alias tunnels on microsandbox have real limits** versus Docker's native
   bridge networking - see [Networking](#networking).
-- **Read-only file mounts aren't enforced in-guest on microsandbox 0.6.2.**
-  `FileMount.readOnly` is honored by Docker; on microsandbox the guest currently gets a
-  writable mount regardless. Don't rely on guest-side write protection under
-  `RIGHTSIZE_BACKEND=microsandbox`.
 - **`followOutput` delivers the same ordered, no-duplicate log stream on both backends**,
   but on microsandbox the final tail can arrive shortly after the sandbox reports stopped,
   rather than exactly at stream EOF (`msb logs -f` doesn't close on sandbox stop in 0.6.2,

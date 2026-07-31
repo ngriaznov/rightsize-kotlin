@@ -69,7 +69,7 @@ class CassandraContainerTest {
 
 **`GPG_KEYS` must be overridden to a tab-free value — this is the difference
 between the module booting and aborting.** `cassandra:5.0.8`'s baked env includes a
-`GPG_KEYS` value that contains a literal TAB character. Under msb 0.6.6, booting any
+`GPG_KEYS` value that contains a literal TAB character. Under msb 0.6.6 and still under 0.6.8, booting any
 image whose baked env contains a TAB aborts before the guest is even reachable:
 
 ```

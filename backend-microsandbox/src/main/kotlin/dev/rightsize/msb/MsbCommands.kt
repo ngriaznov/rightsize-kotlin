@@ -16,14 +16,32 @@ object MsbCommands {
         spec.memoryLimitMb?.let { add("-m"); add("${it}M") }   // `msb run --help`: -m/--memory <MEMORY>, e.g. 512M/1G
         spec.ports.forEach { add("-p"); add("${it.hostPort}:${it.guestPort}") }
         spec.env.forEach { (k, v) -> add("-e"); add("$k=$v") }
-        spec.mounts.forEach { add("--mount-file"); add("${it.hostPath}:${it.guestPath}") }
-        // --snapshot is mutually exclusive with the image arg (msb run --help): a checkpointRef
+        // The option block is always spelled out, never left to msb's defaults, for two
+        // reasons on top of each other. The access token (`ro`/`rw`) carries
+        // FileMount.readOnly, which msb enforces as a genuine guest-side write block — and it
+        // keeps OUR spec parseable on Windows: msb stages each mount into a temp directory and
+        // canonicalizes it, which there yields the extended-length `\\?\C:\...` form, and its
+        // splitter skips a drive prefix only for a bare drive letter, so a spec with no option
+        // block splits at the drive's colon and rejects the path tail as options. `nodev`
+        // exists because msb then rebuilds an INTERNAL `tag:staged_path[:opts]` spec for the
+        // same mount, carrying over only NON-DEFAULT option tokens — `rw` is its default and
+        // is dropped, which on Windows strips the internal spec's option block and re-creates
+        // the same misparse one layer down (captured: `--mount "fm_…:\\?\C:\…": expected flag
+        // or key=value option`). `nodev` always survives the carry-over, and for a single-file
+        // mount it is meaningless (no device nodes to block): verified against a real msb
+        // 0.6.8 — `rw,nodev` mounts `rw,nodev` and accepts an in-guest write, `ro,nodev`
+        // rejects one with `Read-only file system`.
+        spec.mounts.forEach {
+            add("--mount-file")
+            add("${it.hostPath}:${it.guestPath}:${if (it.readOnly) "ro" else "rw"},nodev")
+        }
+        // --from-snapshot is mutually exclusive with the image arg (msb run --help): a checkpointRef
         // boots from a disk snapshot instead of the ordinary image (see docs/checkpoints.md).
         // Still no -d, same as every other boot this backend does — detached mode never starts
         // the image's own ENTRYPOINT/CMD (see this file's header comment), and that's just as
         // true of a snapshot-booted sandbox as an ordinary one.
         val checkpointRef = spec.checkpointRef
-        if (checkpointRef != null) { add("--snapshot"); add(checkpointRef) } else add(spec.image)
+        if (checkpointRef != null) { add("--from-snapshot"); add(checkpointRef) } else add(spec.image)
         spec.command?.let { add("--"); addAll(it) }   // null => image default ENTRYPOINT/CMD runs
     }
 
@@ -43,22 +61,22 @@ object MsbCommands {
     fun snapshotInspect(name: String) = listOf("snapshot", "inspect", name)
 
     /**
-     * `msb snapshot export <ref> <dest>` — writes a `.tar.zst` artifact archive for [ref] to
+     * `msb snapshot save <ref> <dest>` — writes a `.tar.zst` artifact archive for [ref] to
      * [dest]; the artifact half of a portable checkpoint archive (see
      * [MsbCliBackend.exportCheckpoint], docs/checkpoints.md's "Moving checkpoints between
      * machines" section). Deliberately never `--with-image`: its import fails an integrity check
      * ("raw manifest digest mismatch") on msb 0.6.6, so the destination machine pulls the OCI
      * image on the restored container's first boot instead.
      */
-    fun snapshotExport(ref: String, dest: Path) = listOf("snapshot", "export", ref, dest.toString())
+    fun snapshotExport(ref: String, dest: Path) = listOf("snapshot", "save", ref, dest.toString())
 
-    /** `msb snapshot import <archive>` — unpacks [archive] into a digest-derived directory under
+    /** `msb snapshot load <archive>` — unpacks [archive] into a digest-derived directory under
      * `~/.microsandbox/snapshots/`, discarding the original snapshot name entirely (see
      * [MsbCliBackend.importCheckpoint]). */
-    fun snapshotImport(archive: Path) = listOf("snapshot", "import", archive.toString())
+    fun snapshotImport(archive: Path) = listOf("snapshot", "load", archive.toString())
 
     /** `msb snapshot list --format json` — the only way to confirm the digest-dir basename
-     * `snapshot import` itself prints is genuinely registered (see
+     * `snapshot load` itself prints is genuinely registered (see
      * [MsbCliBackend.importCheckpoint] and [MsbSnapshotListJson]). */
     fun snapshotList() = listOf("snapshot", "list", "--format", "json")
 
@@ -121,8 +139,8 @@ internal object MsbLsJson {
 /** One entry of `msb snapshot list --format json`'s output — only the fields
  * [MsbSnapshotListJson.contains] reads; `created_at`/`digest` (and anything a future msb version
  * adds) are ignored by the `ignoreUnknownKeys` [Json] instance. `artifact_path` names the on-disk
- * snapshot directory (whose basename is the digest-dir name `msb snapshot import` itself
- * prints); `name` was confirmed to carry that same digest-dir value against msb 0.6.6 for an
+ * snapshot directory (whose basename is the digest-dir name `msb snapshot load` itself
+ * prints); `name` was confirmed to carry that same digest-dir value against msb 0.6.8 for an
  * imported snapshot — matching on both `name` and `artifact_path`'s basename covers whichever
  * one a future msb version favors.
  */
@@ -138,7 +156,7 @@ private data class SnapshotEntry(
  * [MsbCliBackend.importCheckpoint]). The FULL `sha256:<64hex>` `digest` field is deliberately
  * never surfaced here: msb does not resolve it as a snapshot ref (`msb snapshot inspect
  * sha256:<full>` fails "snapshot not found", treating it as a literal path) — only the
- * digest-dir name (`sha256-<16hex>`) does, for `inspect`, `rm`, and `run --snapshot` alike.
+ * digest-dir name (`sha256-<16hex>`) does, for `inspect`, `rm`, and `run --from-snapshot` alike.
  *
  * PIN: keep this in sync with `msb snapshot list --format json`'s actual shape if msb changes it
  * — the msb `sandbox-it` lane is the only guard on that short of a live-CLI shape drift, same as

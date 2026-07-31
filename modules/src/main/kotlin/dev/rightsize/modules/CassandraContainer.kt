@@ -22,7 +22,8 @@ import java.time.Duration
  * ### `GPG_KEYS` must be overridden to a tab-free value — the difference between booting and aborting
  *
  * `cassandra:5.0.8`'s baked env includes a `GPG_KEYS` value that contains a literal TAB
- * character. Under msb 0.6.6, booting any image whose baked env contains a TAB aborts before the
+ * character. Under msb 0.6.6, and still under the pinned 0.6.8, booting any image whose baked env
+ * contains a TAB aborts before the
  * guest is even reachable:
  *
  * ```
@@ -68,7 +69,7 @@ class CassandraContainer(image: DockerImageName) : GenericContainer<CassandraCon
     init {
         image.assertCompatibleWith(EXPECTED_REPOSITORY)
         withExposedPorts(CQL_PORT)
-        // Baked GPG_KEYS contains a TAB; msb 0.6.6 SIGABRTs on any TAB in an image's baked env
+        // Baked GPG_KEYS contains a TAB; msb SIGABRTs on any TAB in an image's baked env (0.6.6 and 0.6.8 both)
         // before the guest is reachable. See the class doc for the exact panic signature.
         withEnv("GPG_KEYS", "")
         withEnv("MAX_HEAP_SIZE", "512M")

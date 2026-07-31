@@ -86,7 +86,7 @@ class MsbCheckpointIT {
     }
 
     /**
-     * `exportTo`/`importFrom` round trip against a real `.tar.zst` `msb snapshot export`/`import`
+     * `exportTo`/`importFrom` round trip against a real `.tar.zst` `msb snapshot save`/`import`
      * cycle (see docs/checkpoints.md's "Moving checkpoints between machines" section): checkpoint
      * a nonce-named sandbox with a `/srv` marker, export it, remove the ORIGINAL checkpoint
      * (artifact and registry entry both — proving the archive alone, not the original artifact,
@@ -125,7 +125,13 @@ class MsbCheckpointIT {
             val imported = Checkpoint.importFrom(archive)
             importedRef = imported.ref
             assertNotEquals(originalCp.ref, imported.ref,
-                "msb's snapshot import never preserves the original name-derived ref — the effective ref must be a digest")
+                "msb's snapshot load never preserves the original name-derived ref — the effective ref must be a digest")
+            // Digest-shaped, not merely different: msb has published both `sha256-<16hex>`
+            // (0.6.6) and a bare 64-hex digest (0.6.8) for a loaded snapshot, so the prefix is
+            // optional — what must hold is that the ref is a content digest. Asserting only
+            // "differs from the original" would accept any renaming msb ever adopts.
+            assertTrue(imported.ref.matches(Regex("^(sha256-)?[0-9a-f]{16,64}$")),
+                "expected msb's digest-shaped effective ref, got '${imported.ref}'")
             assertEquals("microsandbox", imported.backend)
 
             val found = Checkpoint.find(name)

@@ -45,7 +45,7 @@ is the whole story that matters from the outside.
 ### Provisioning
 
 On first use, if no runtime is already cached (or `MSB_PATH` isn't set), rightsize
-downloads a pinned `msb` release (currently `0.6.6`) plus its `libkrunfw` companion
+downloads a pinned `msb` release (currently `0.6.8`) plus its `libkrunfw` companion
 library from GitHub releases, matched to your OS/architecture
 (`msb-darwin-aarch64`, `msb-linux-x86_64`, `msb-linux-aarch64`,
 `msb-windows-x86_64.exe`, `msb-windows-aarch64.exe`, and the corresponding
@@ -128,12 +128,6 @@ The two backends are contract-equivalent — the same shared test suite passes a
 both — but a handful of edges are genuinely backend-specific rather than incidental
 timing quirks. Know these before you hit them:
 
-- **Read-only mounts aren't enforced in-guest on microsandbox 0.6.2.**
-  `FileMount.readOnly` (under `withCopyFileToContainer`) is honored by the Docker
-  backend — the bind mount is genuinely read-only inside the container. On
-  microsandbox, the guest currently gets a writable mount regardless of the flag.
-  Don't rely on guest-side write protection under `RIGHTSIZE_BACKEND=microsandbox`.
-  See [Files & Memory](concepts/files-and-memory.md#read-only-mounts-a-real-backend-difference).
 - **`followOutput`'s tail-flush on microsandbox is a watchdog, not a stream close.**
   `msb logs -f` doesn't exit when its sandbox stops (a documented gap in msb 0.6.2), so
   the microsandbox backend polls in the background and replays only the
@@ -162,7 +156,7 @@ timing quirks. Know these before you hit them:
   image; microsandbox stops the sandbox, snapshots its disk, and reboots it, which restarts the
   workload (`capabilities.checkpointRestartsWorkload`). See [Checkpoint /
   Restore](checkpoints.md#mechanism-per-backend) for the full comparison.
-- **Native Windows msb support is upstream beta (microsandbox 0.6.6).** The guest is
+- **Native Windows msb support is upstream beta (microsandbox 0.6.8).** The guest is
   Linux on every host, so guest-side behavior (entrypoints, `/etc/hosts` aliasing, the
   exec-stream tunnels) is unaffected by running on Windows — the Windows-specific
   surface is entirely host-side (downloading a `.exe`/`.dll` pair, the cache root,

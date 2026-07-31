@@ -20,9 +20,22 @@ class MsbCommandsTest {
         val cmd = MsbCommands.run(spec)
         assertEquals(listOf("run", "--name", "rz-abc-1",
             "-p", "12345:6379", "-e", "A=1",
-            "--mount-file", "/tmp/f.conf:/etc/f.conf",
+            "--mount-file", "/tmp/f.conf:/etc/f.conf:rw,nodev",
             "redis:8.6-alpine", "--", "redis-server", "--port", "6379"), cmd)
         assertFalse(cmd.contains("-d"))
+    }
+
+    // Both spellings matter. `ro` is what makes FileMount.readOnly mean anything on this
+    // backend, and an always-present token is what keeps the spec parseable on Windows,
+    // where a bare `host:guest` splits at the drive letter's colon.
+    @Test fun `mount-file always carries an explicit access token`() {
+        val cmd = MsbCommands.run(spec.copy(mounts = listOf(
+            FileMount(Path.of("/tmp/rw.conf"), "/etc/rw.conf"),
+            FileMount(Path.of("/tmp/ro.conf"), "/etc/ro.conf", readOnly = true),
+        )))
+        assertTrue(cmd.contains("/tmp/rw.conf:/etc/rw.conf:rw,nodev"), "argv was $cmd")
+        assertTrue(cmd.contains("/tmp/ro.conf:/etc/ro.conf:ro,nodev"), "argv was $cmd")
+        assertFalse(cmd.contains("/tmp/rw.conf:/etc/rw.conf"), "a two-segment spec must never be emitted: $cmd")
     }
 
     @Test fun `image default entrypoint runs when command is null`() {
@@ -30,15 +43,15 @@ class MsbCommandsTest {
         assertEquals("redis:8.6-alpine", cmd.last())   // no trailing `--`: attached mode runs the image default
     }
 
-    // --snapshot replaces the image arg entirely when checkpointRef is set (mutually exclusive
+    // --from-snapshot replaces the image arg entirely when checkpointRef is set (mutually exclusive
     // per `msb run --help`) — still no -d, same as every other boot this backend does.
-    @Test fun `run command uses --snapshot instead of the image arg when checkpointRef is set`() {
+    @Test fun `run command uses --from-snapshot instead of the image arg when checkpointRef is set`() {
         val cmd = MsbCommands.run(spec.copy(checkpointRef = "rz-ckpt-0123456789ab"))
         assertEquals(listOf("run", "--name", "rz-abc-1",
             "-p", "12345:6379", "-e", "A=1",
-            "--mount-file", "/tmp/f.conf:/etc/f.conf",
-            "--snapshot", "rz-ckpt-0123456789ab", "--", "redis-server", "--port", "6379"), cmd)
-        assertFalse(cmd.contains("redis:8.6-alpine"), "the ordinary image arg must not appear alongside --snapshot")
+            "--mount-file", "/tmp/f.conf:/etc/f.conf:rw,nodev",
+            "--from-snapshot", "rz-ckpt-0123456789ab", "--", "redis-server", "--port", "6379"), cmd)
+        assertFalse(cmd.contains("redis:8.6-alpine"), "the ordinary image arg must not appear alongside --from-snapshot")
         assertFalse(cmd.contains("-d"))
     }
 

@@ -7,7 +7,7 @@ from `withCopyFileToContainer`'s start-time mount.
 ## Runtime copy vs. start-time mount
 
 `withCopyFileToContainer(file, guestPath)` is configured before `start()` and takes effect at
-boot: a read-only-by-default host mount, present from the moment the container comes up. See
+boot: a host mount, read-write by default, present from the moment the container comes up. See
 [Files & Memory](concepts/files-and-memory.md).
 
 The three methods on this page are different: they act on a container that is already running,

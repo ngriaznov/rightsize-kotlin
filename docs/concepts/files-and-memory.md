@@ -25,18 +25,18 @@ container.withCopyFileToContainer(fromClasspath, "/docker-entrypoint-initdb.d/se
   designed for — if your process is long-running and calls this repeatedly, be aware
   the temp files accumulate until the JVM actually exits.
 
-### Read-only mounts: a real backend difference
+### Read-only mounts
 
-`FileMount.readOnly` (the flag underneath `withCopyFileToContainer`) is honored
-faithfully by the **Docker backend** — the bind mount is genuinely read-only inside
-the container. On the **microsandbox backend**, this is not currently enforced
-in-guest (a known gap in msb 0.6.2): the guest gets a writable mount regardless of the
-flag.
+`FileMount.readOnly` (the flag underneath `withCopyFileToContainer`) defaults to
+`false`: the mount is read-write, and it is a view of the host file rather than a copy
+of it — the Docker backend binds the host path directly, the microsandbox backend
+hard-links it into its staging directory — so a guest write reaches the host file
+itself.
 
-Practically: don't write a test that depends on a write to a "read-only" mount failing
-when it's exercised under `RIGHTSIZE_BACKEND=microsandbox`. If your test's correctness
-depends on genuine write protection, verify it against the Docker backend, or add an
-explicit in-test assertion that doesn't rely on the guest OS enforcing it.
+A mount constructed with `readOnly = true` is enforced on both backends as a
+guest-side write block: an in-guest write fails with `Read-only file system`. Use it
+whenever the host copy must not be modified — in particular when the container runs
+code you don't trust (see [Isolation](../isolation.md#untrusted-code-guidance)).
 
 ## `withMemoryLimit(megabytes)`
 

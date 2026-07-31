@@ -63,5 +63,8 @@ setup around code you don't trust:
   picks microsandbox when available but silently falls back to Docker when it isn't (no KVM/WHP,
   unsupported host) — exactly the situation `withRequireIsolation()` is for: fail the start
   instead of running untrusted code under the weaker guarantee without anyone noticing.
-- **Keep mounts read-only** (the default for `withCopyFileToContainer`) unless the untrusted
-  code genuinely needs to write back to the host filesystem.
+- **Mount files read-only.** `withCopyFileToContainer` mounts are read-write by default, and
+  the mount is a view of the host file, not a copy — a guest write reaches the host file
+  itself. Unless the untrusted code genuinely needs to write back to the host filesystem,
+  construct the mount with `readOnly = true`, which both backends enforce as a guest-side
+  write block.

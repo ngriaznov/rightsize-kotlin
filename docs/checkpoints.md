@@ -41,7 +41,7 @@ Both backends support checkpoint/restore today, via different mechanisms:
 
 microsandbox's `msb snapshot create` requires the sandbox stopped, so `checkpoint()` there runs
 `msb stop` → `msb snapshot create --from <sandbox> <ref>` → `msb rm <sandbox>` → a fresh attached
-`msb run --snapshot <ref>` under the same name, ports, env, and memory limit — the sandbox ends up
+`msb run --from-snapshot <ref>` under the same name, ports, env, and memory limit — the sandbox ends up
 running again under the same name, but its workload command re-ran from scratch to get there.
 Because of that, `checkpoint()` re-applies the container's own wait strategy before returning
 whenever the active backend's `capabilities.checkpointRestartsWorkload` is `true` — a bare return
@@ -320,13 +320,13 @@ is already zstd-compressed; a docker `save` tar compresses poorly enough not to 
 - `checkpoint.json` — the same pinned shape as a [named checkpoint's registry entry](#the-registry),
   plus a format version and a nullable `name` (an exported UNNAMED checkpoint carries `name: null`).
 - `artifact` — the backend's own payload file, byte-for-byte what the backend CLI produced: an
-  msb `snapshot export` `.tar.zst`, or a docker `save` tar.
+  msb `snapshot save` `.tar.zst`, or a docker `save` tar.
 
 ### Not bundled: the OCI image
 
 `exportTo` never bundles the container image itself, on either backend — a docker archive is the
 committed layer(s) on top of the base image, not the base image; an msb archive is the disk
-snapshot artifact alone (`msb snapshot export` deliberately never runs with `--with-image`, whose
+snapshot artifact alone (`msb snapshot save` deliberately never runs with `--with-image`, whose
 import fails an integrity check on msb 0.6.6). The destination machine pulls the image normally on
 the restored container's first boot, exactly as it would for any other container using that image
 — make sure it's reachable there (a private registry needs the same credentials it would for a
@@ -356,7 +356,7 @@ The ref a checkpoint restores by is not always the archived one:
 
 | | docker | microsandbox |
 |---|---|---|
-| Import mechanism | `docker load -i <archive>` | `msb snapshot import <archive>` |
+| Import mechanism | `docker load -i <archive>` | `msb snapshot load <archive>` |
 | Effective ref after import | The original tag, unchanged (`Loaded image: <tag>`) | A fresh DIGEST — the original snapshot name is never preserved |
 
 An imported msb checkpoint therefore shows up in `Checkpoint.find`/`list` with a digest-shaped

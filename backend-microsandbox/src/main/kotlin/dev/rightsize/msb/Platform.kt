@@ -18,8 +18,8 @@ import java.nio.file.Path
  */
 enum class Platform(val msbAsset: String, val krunAsset: String, val krunInstallName: String) {
     DARWIN_ARM64("msb-darwin-aarch64", "libkrunfw-darwin-aarch64.dylib", "libkrunfw.5.dylib"),
-    LINUX_X64("msb-linux-x86_64", "libkrunfw-linux-x86_64.so", "libkrunfw.so.5.5.0"),
-    LINUX_ARM64("msb-linux-aarch64", "libkrunfw-linux-aarch64.so", "libkrunfw.so.5.5.0"),
+    LINUX_X64("msb-linux-x86_64", "libkrunfw-linux-x86_64.so", "libkrunfw.so.5.6.1"),
+    LINUX_ARM64("msb-linux-aarch64", "libkrunfw-linux-aarch64.so", "libkrunfw.so.5.6.1"),
     WINDOWS_X64("msb-windows-x86_64.exe", "libkrunfw-windows-x86_64.dll", "libkrunfw.dll"),
     WINDOWS_ARM64("msb-windows-aarch64.exe", "libkrunfw-windows-aarch64.dll", "libkrunfw.dll");
 

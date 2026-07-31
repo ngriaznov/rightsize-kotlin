@@ -8,8 +8,15 @@ import java.nio.file.Path
 /** A host↔guest port map entry: the runtime binds [hostPort] on loopback, forwards to [guestPort]. */
 data class PortBinding(val hostPort: Int, val guestPort: Int)
 
-/** A host file exposed read-only (by default) inside the guest at [guestPath]. */
-data class FileMount(val hostPath: Path, val guestPath: String, val readOnly: Boolean = true)
+/**
+ * A host file exposed inside the guest at [guestPath].
+ *
+ * [readOnly] defaults to `false`: the mount is a view of the host file rather than a copy of
+ * it — the Docker backend binds the host path directly, the microsandbox backend hard-links it
+ * into its staging directory — so a guest write reaches the host file itself. Pass `true` when
+ * the host copy must not be modified.
+ */
+data class FileMount(val hostPath: Path, val guestPath: String, val readOnly: Boolean = false)
 
 data class ExecResult(val exitCode: Int, val stdout: String, val stderr: String)
 
@@ -35,7 +42,7 @@ data class ContainerSpec(
     /**
      * Set by `GenericContainer.fromCheckpoint` to the source [Checkpoint.ref] — docker ignores
      * it (the ref already IS `image`, so the normal create path just works); msb boots via
-     * `msb run --snapshot <checkpointRef>` instead of its normal image boot when this is set,
+     * `msb run --from-snapshot <checkpointRef>` instead of its normal image boot when this is set,
      * keeping every other flag (name, ports, env, memory) identical. Never part of reuse
      * identity (see `dev.rightsize.core.reuse.ReuseFromCheckpointConflictException`) — reuse and
      * `fromCheckpoint` are not a supported combination.
@@ -132,7 +139,7 @@ data class Checkpoint(val ref: String, val backend: String, val spec: Checkpoint
     /**
      * Writes this checkpoint out as a portable archive at [path] — a plain tar containing
      * `checkpoint.json` (this checkpoint's metadata, plus a format version) and `artifact` (the
-     * backend's own payload: a docker `save` tar or an msb `snapshot export` `.tar.zst`) — see
+     * backend's own payload: a docker `save` tar or an msb `snapshot save` `.tar.zst`) — see
      * docs/checkpoints.md's "Moving checkpoints between machines" section. Requires the ACTIVE
      * backend (`Backends.active()`) to equal [backend], or this throws
      * [CheckpointBackendMismatchException] before any backend or filesystem work; requires the

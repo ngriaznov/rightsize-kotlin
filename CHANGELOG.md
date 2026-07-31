@@ -9,6 +9,63 @@ reaches its first tagged release.
 
 Nothing yet.
 
+## [0.6.1] - 2026-08-01
+
+### Changed
+
+- **The pinned microsandbox release is now 0.6.8** (was 0.6.6). The provisioner
+  downloads and checksum-verifies it automatically, so no action is needed for the
+  usual setup.
+
+  **If you point `MSB_PATH` at your own msb binary, it must be 0.6.8 or newer.**
+  0.6.8 renamed three CLI surfaces this library drives, and the calls it now emits do
+  not exist in 0.6.6:
+
+  | 0.6.6 | 0.6.8 |
+  |---|---|
+  | `run --snapshot <ref>` | `run --from-snapshot <PATH_OR_NAME>` |
+  | `snapshot export <ref> <dest>` | `snapshot save <SNAPSHOT> <OUT>` |
+  | `snapshot import <archive>` | `snapshot load <ARCHIVE> [DEST]` |
+
+  Checkpoint restore and checkpoint archives are the affected features; both fail
+  outright against an older binary rather than degrading quietly.
+
+- **A loaded snapshot's effective ref is now a bare 64-character digest**, where 0.6.6
+  produced a `sha256-<16hex>` directory name. Nothing in the public API changes — the
+  ref was always opaque and content-addressed — but code that pattern-matched the old
+  shape will need updating.
+
+- **`FileMount.readOnly` now defaults to `false`, and the flag is genuinely enforced on
+  the microsandbox backend.** It previously never reached msb, so every mount there was
+  writable regardless of the flag; the Docker backend enforced it all along. What a
+  caller observes: a default `withCopyFileToContainer` mount on the Docker backend was
+  read-only before and is writable now — pass `readOnly = true` to get the old Docker
+  behavior, which both backends now honor as a guest-side write block. The mount is a
+  view of the host file, not a copy, so a guest write reaches the host file itself.
+
+### Fixed
+
+- **File mounts work on Windows.** msb 0.6.7 broke every start-time file mount there:
+  its mount-spec parsing splits a token-less spec at the drive letter's colon, both on
+  the CLI spec and again on an internally rebuilt one. Every mount spec this backend
+  emits now carries an explicit `ro`/`rw` access token plus `nodev`, which keeps both
+  layers parseable. `nodev` is meaningless for a single-file mount — there are no
+  device nodes to block.
+
+- **Checkpoint archives export on Windows again.** msb 0.6.7/0.6.8 fail every
+  `snapshot save` there with `Access is denied. (os error 5)`: the finished archive is
+  fsynced through a read-only handle one step before the final rename. When exactly
+  that failure occurs with exactly one finished staging file beside the destination,
+  the backend completes the rename itself. Transparent, Windows-only, and
+  self-disabling once msb fixes the fsync.
+
+- **Container boot rides out msb's transient `install operation in progress` refusal**
+  by polling for up to 30 seconds instead of failing on the first attempt.
+
+- The Cassandra module's `GPG_KEYS` override remains required: 0.6.8 still aborts
+  before the VM starts on any image whose baked environment contains a tab, verified
+  directly against this release.
+
 ## [0.6.0] - 2026-07-28
 
 ### Upgrading from 0.5.0
@@ -413,7 +470,9 @@ Initial public release.
   exactly once; any other failure, or a second failure after the heal,
   propagates unchanged.
 
-[Unreleased]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.6.0...v0.6.1
+[0.6.1]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.3.0...v0.4.0

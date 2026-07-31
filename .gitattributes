@@ -1,0 +1,12 @@
+# Force LF line endings for text sources and fixtures regardless of the
+# checking-out platform's core.autocrlf setting. Without this, a Windows
+# checkout (Git's default core.autocrlf=true there) converts LF to CRLF on
+# checkout for anything it detects as text — confirmed to break
+# core/src/testFixtures/resources/rightsize-fixture.txt's exact-content
+# round-trip assertion in the backend contract suite on the msb-windows CI
+# job (fixture read back as "...payload\r\n" instead of the committed
+# "...payload\n").
+* text=auto eol=lf
+
+# Windows batch scripts stay CRLF: cmd.exe mishandles LF-only label jumps.
+*.bat text eol=crlf

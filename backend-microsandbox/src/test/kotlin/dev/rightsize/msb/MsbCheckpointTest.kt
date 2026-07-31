@@ -19,11 +19,11 @@ import java.nio.file.Path
 class MsbCheckpointTest {
 
     /**
-     * Extends the lifecycle fake with `snapshot create`/`rm`/a `--snapshot`-flagged `run` (the
+     * Extends the lifecycle fake with `snapshot create`/`rm`/a `--from-snapshot`-flagged `run` (the
      * re-boot): `run`/`ls`/`stop` behave exactly as [MsbCliBackendTest]'s own fake; `rm` is
      * always a no-op success (its own failure is not one of [MsbCliBackend.createCheckpoint]'s
      * two typed-failure shapes); `snapshot create` exits non-zero when [snapshotFailFlag] exists;
-     * a `run` invocation carrying `--snapshot` (the re-boot, as opposed to the initial ordinary
+     * a `run` invocation carrying `--from-snapshot` (the re-boot, as opposed to the initial ordinary
      * boot) exits non-zero when [rebootFailFlag] exists, otherwise it recreates [marker] (so the
      * sandbox reports Running again) exactly like an ordinary boot. Every invocation's full argv
      * is appended to [callLog], one line per call, so the tests below can assert on the order and
@@ -50,7 +50,7 @@ class MsbCheckpointTest {
             |    while [ "${'$'}#" -gt 0 ]; do
             |      case "${'$'}1" in
             |        --name) name="${'$'}2"; shift 2 ;;
-            |        --snapshot) snapshot="${'$'}2"; shift 2 ;;
+            |        --from-snapshot) snapshot="${'$'}2"; shift 2 ;;
             |        *) shift ;;
             |      esac
             |    done
@@ -93,7 +93,7 @@ class MsbCheckpointTest {
     private fun nonPollingCalls(callLog: Path): List<String> =
         Files.readAllLines(callLog).filterNot { it == "ls --format json" }
 
-    @Test fun `createCheckpoint drives exactly stop, snapshot create, rm, then a --snapshot re-boot under the same name-ports-env`() {
+    @Test fun `createCheckpoint drives exactly stop, snapshot create, rm, then a --from-snapshot re-boot under the same name-ports-env`() {
         assumeFalse(Platform.current()?.isWindows == true, "POSIX-only fake binary; see doc comment")
         val marker = Files.createTempFile("rz-marker-", "").also { Files.deleteIfExists(it) }
         val callLog = Files.createTempFile("rz-calllog-", "")
@@ -125,10 +125,10 @@ class MsbCheckpointTest {
             assertEquals(4, calls.size, "no extra commands beyond stop/snapshot-create/rm/run: $calls")
             val reboot = calls[3]
             assertTrue(reboot.startsWith("run --name rz-ckpt-test"), "unexpected re-boot argv: $reboot")
-            assertTrue("--snapshot rz-ckpt-0123456789ab" in reboot, "re-boot must run from the new checkpoint: $reboot")
+            assertTrue("--from-snapshot rz-ckpt-0123456789ab" in reboot, "re-boot must run from the new checkpoint: $reboot")
             assertTrue("-p 23456:80" in reboot, "re-boot must keep the original port mapping: $reboot")
             assertTrue("-e FOO=bar" in reboot, "re-boot must keep the original env: $reboot")
-            assertFalse("irrelevant" in reboot, "the ordinary image arg must not appear alongside --snapshot: $reboot")
+            assertFalse("irrelevant" in reboot, "the ordinary image arg must not appear alongside --from-snapshot: $reboot")
         } finally {
             backend.stop(handle)
             backend.remove(handle)
@@ -174,7 +174,7 @@ class MsbCheckpointTest {
         val marker = Files.createTempFile("rz-marker-", "").also { Files.deleteIfExists(it) }
         val callLog = Files.createTempFile("rz-calllog-", "")
         val snapshotFailFlag = Files.createTempFile("rz-snapfail-", "").also { Files.deleteIfExists(it) }   // snapshot succeeds
-        val rebootFailFlag = Files.createTempFile("rz-rebootfail-", "")   // present => the --snapshot re-boot fails
+        val rebootFailFlag = Files.createTempFile("rz-rebootfail-", "")   // present => the --from-snapshot re-boot fails
         val backend = MsbCliBackend(fakeMsbCheckpointLifecycle(marker, callLog, snapshotFailFlag, rebootFailFlag))
         val spec = ContainerSpec(name = "rz-ckpt-reboot-fail-test", image = "irrelevant", runId = "run1")
         val handle = backend.create(spec)

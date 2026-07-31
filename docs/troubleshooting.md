@@ -49,19 +49,20 @@ no duplicates on either backend; this is a timing nuance in *when* the last line
 arrives relative to stop, not a correctness issue. See
 [Backends](backends.md#backend-differences) for the summary.
 
-## Guest-side write to a "read-only" mount succeeds when it shouldn't
+## Guest-side write to a mounted file fails with `Read-only file system`
 
-**Symptom:** A test asserts that a write to a file mounted with `readOnly = true`
-fails inside the container, and the assertion fails — the write went through.
+**Symptom:** The workload writing to a file mounted via `withCopyFileToContainer`
+fails with `Read-only file system`.
 
-**Cause:** `FileMount.readOnly` is not enforced in-guest on the microsandbox backend
-(msb 0.6.2). Docker enforces it correctly.
+**Cause:** The mount was created with `readOnly = true`, which both backends enforce
+as a guest-side write block. A default mount (`readOnly = false`) is writable — and
+it is a view of the host file, not a copy, so a guest write reaches the host file
+itself.
 
-**Fix:** Don't write a test that depends on guest-side write protection when running
-under `RIGHTSIZE_BACKEND=microsandbox`. If your test's correctness genuinely depends
-on this, either verify it only under `RIGHTSIZE_BACKEND=docker`, or add your own
-in-test guard that doesn't rely on the guest OS enforcing the flag. See
-[Files & Memory](concepts/files-and-memory.md#read-only-mounts-a-real-backend-difference).
+**Fix:** Working as designed. If the workload genuinely needs to write to the mounted
+path, leave `readOnly` at its default; if the host copy must not be modified, the
+write block is exactly what the flag is for. See
+[Files & Memory](concepts/files-and-memory.md#read-only-mounts).
 
 ## `msb ls` output looks different than you expected
 

@@ -6,7 +6,7 @@ import org.junit.jupiter.api.Assertions.*
 class RunRecordTest {
     @Test fun `round-trips through toJson and parse, msbPath present`() {
         val r = RunRecord(pid = 4242, startedIso = "2026-07-11T10:00:00Z", backend = "msb",
-            msbPath = "/home/me/.cache/rightsize/msb/0.6.6/bin/msb")
+            msbPath = "/home/me/.cache/rightsize/msb/0.6.8/bin/msb")
         val parsed = RunRecord.parse(r.toJson())
         assertEquals(r, parsed)
     }

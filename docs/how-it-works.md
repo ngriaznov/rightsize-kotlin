@@ -167,7 +167,7 @@ sprawling one, specifically so that the contract test suite can be the referee f
 both implementations. The Docker backend is simple almost by comparison — a
 straightforward adapter over `docker-java` — and that simplicity is what makes it
 trustworthy as the oracle the harder, more inventive microsandbox backend gets checked
-against. Where the two genuinely can't be made equivalent (single-connection tunnels,
-advisory read-only mounts), rightsize documents the gap explicitly rather than hiding
+against. Where the two genuinely can't be made equivalent (the single-connection
+tunnels), rightsize documents the gap explicitly rather than hiding
 it — see [Backends → Backend differences](backends.md#backend-differences) for the
 complete, current list.

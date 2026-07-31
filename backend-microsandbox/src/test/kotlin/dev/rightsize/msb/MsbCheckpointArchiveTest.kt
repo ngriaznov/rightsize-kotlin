@@ -72,9 +72,9 @@ class MsbCheckpointArchiveTest {
     // --- MsbCliBackend.importCheckpoint end-to-end, against a fake msb binary ---
 
     /**
-     * Fake `msb` covering `snapshot import`/`snapshot list --format json` only — every other
+     * Fake `msb` covering `snapshot load`/`snapshot list --format json` only — every other
      * subcommand is a no-op success, since [MsbCliBackend.importCheckpoint] never calls them.
-     * `snapshot import` exits non-zero with unrelated stderr when [importFailFlag] exists; exits
+     * `snapshot load` exits non-zero with unrelated stderr when [importFailFlag] exists; exits
      * non-zero with msb's own already-exists wording when [alreadyExistsFlag] exists (still
      * printing the artifact path, on stderr this time — matching msb's real already-exists
      * behavior per docs/checkpoints.md's verified contracts); otherwise exits 0 printing a
@@ -97,7 +97,7 @@ class MsbCheckpointArchiveTest {
             |if [ "${'$'}cmd" = "snapshot" ]; then
             |  sub="${'$'}1"; shift
             |  case "${'$'}sub" in
-            |    import)
+            |    load)
             |      if [ -f "$importFailFlag" ]; then
             |        echo "error: something else went wrong" 1>&2
             |        exit 1
