@@ -524,9 +524,19 @@ abstract class BackendContractTest {
                 assertEquals(0, write.exitCode, "writing the marker file failed: ${write.stderr}")
 
                 val cp = c.checkpoint()
-                val refPattern = if (backend.name.equals("microsandbox", ignoreCase = true))
-                    Regex("^rz-ckpt-[0-9a-f]{12}$") else Regex("^rightsize/checkpoint:[0-9a-f]{12}$")
-                assertTrue(refPattern.matches(cp.ref), "unexpected ref shape for '${backend.name}': '${cp.ref}'")
+                // microsandbox refs are absolute artifact paths under <cacheDir>/checkpoints
+                // (created there via --dest-dir, restored by path); docker refs stay image tags.
+                if (backend.name.equals("microsandbox", ignoreCase = true)) {
+                    val ref = java.nio.file.Paths.get(cp.ref)
+                    assertTrue(ref.isAbsolute, "expected an absolute path ref for '${backend.name}': '${cp.ref}'")
+                    assertEquals("checkpoints", ref.parent?.fileName?.toString(),
+                        "expected the ref to sit in a 'checkpoints' dir: '${cp.ref}'")
+                    assertTrue(Regex("^rz-ckpt-[0-9a-f]{12}$").matches(ref.fileName.toString()),
+                        "unexpected ref artifact name for '${backend.name}': '${cp.ref}'")
+                } else {
+                    assertTrue(Regex("^rightsize/checkpoint:[0-9a-f]{12}$").matches(cp.ref),
+                        "unexpected ref shape for '${backend.name}': '${cp.ref}'")
+                }
                 assertEquals(backend.name, cp.backend)
 
                 // checkpointRestartsWorkload backends (microsandbox) restart the workload as part
