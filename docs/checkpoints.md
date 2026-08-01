@@ -37,12 +37,27 @@ Both backends support checkpoint/restore today, via different mechanisms:
 | Source container afterward | Undisturbed — never stopped | Briefly stopped, then running again |
 | Workload | Never restarts | Restarts (the VM reboots) |
 | `capabilities.checkpointRestartsWorkload` | `false` | `true` |
-| `Checkpoint.ref` shape | `rightsize/checkpoint:<12-hex>` (an image tag) | `rz-ckpt-<12-hex>` (a snapshot name) |
+| `Checkpoint.ref` shape | `rightsize/checkpoint:<12-hex>` (an image tag) | an absolute path under `<cache-dir>/checkpoints/` |
 
 microsandbox's `msb snapshot create` requires the sandbox stopped, so `checkpoint()` there runs
-`msb stop` → `msb snapshot create --from <sandbox> <ref>` → `msb rm <sandbox>` → a fresh attached
-`msb run --from-snapshot <ref>` under the same name, ports, env, and memory limit — the sandbox ends up
-running again under the same name, but its workload command re-ran from scratch to get there.
+`msb stop` → `msb snapshot create --from <sandbox> <ref> --dest-dir <cache-dir>/checkpoints` →
+`msb rm <sandbox>` → a fresh attached `msb run --from-snapshot <ref>` under the same name, ports,
+env, and memory limit — the sandbox ends up running again under the same name, but its workload
+command re-ran from scratch to get there. The `--dest-dir` flag is what makes `ref` an absolute
+path: msb writes the snapshot artifact under the rightsize cache directory instead of its own
+default `~/.microsandbox/snapshots/`, and the artifact's parent directories are created up front.
+The snapshot still shows up in `msb snapshot list` — msb keeps a global index regardless of where
+the artifact physically lives — so `Checkpoint.remove` cleans both the index entry and the
+on-disk artifact, and a bare-name ref minted by an earlier rightsize release still restores (a
+non-path ref falls back to msb's own `--from-snapshot <name>` resolution unchanged).
+
+A checkpoint of a `withTmpfsRoot()` container is refused up front: `checkpoint()` throws
+`TmpfsRootCheckpointException` before `msb stop` even runs, since a tmpfs root lives in guest
+memory and there is nothing durable on disk to snapshot — this applies whether the call is an
+unnamed `checkpoint()` or a named `checkpoint("existing-name")`, so a refused named
+re-checkpoint leaves the existing checkpoint entirely untouched. Restoring the other direction has
+a matching msb-level constraint: msb rejects any root-disk setting (`withDiskLimit`/`withTmpfsRoot`)
+on a `fromCheckpoint` restore before boot, because the snapshot already pins the root disk.
 Because of that, `checkpoint()` re-applies the container's own wait strategy before returning
 whenever the active backend's `capabilities.checkpointRestartsWorkload` is `true` — a bare return
 would otherwise hand back a container that looks ready but whose workload hasn't actually come
@@ -84,7 +99,7 @@ val db = GenericContainer("postgres:16-alpine")
 db.start()
 db.execInContainer("psql", "-U", "postgres", "-f", "/schema.sql")   // migrate + seed
 
-val cp = db.checkpoint()   // { ref: "rightsize/checkpoint:<12 hex>" or "rz-ckpt-<12 hex>", backend, spec }
+val cp = db.checkpoint()   // { ref: "rightsize/checkpoint:<12 hex>" or "<cache-dir>/checkpoints/rz-ckpt-<12 hex>", backend, spec }
 db.stop()
 
 val restored = GenericContainer.fromCheckpoint(cp)
@@ -211,8 +226,10 @@ with a letter or digit, up to 41 characters. An invalid name throws `InvalidChec
 before any backend call, the same fail-fast placement every other checkpoint precondition uses.
 
 `checkpoint(name)`'s ref is derived from the name instead of being random: `rightsize/checkpoint:<name>`
-for docker, `rz-ckpt-<name>` for microsandbox — the same shapes an unnamed `checkpoint()` uses,
-just with the name in place of the random 12-hex suffix.
+for docker, `<cache-dir>/checkpoints/rz-ckpt-<name>` for microsandbox — the same shapes an unnamed
+`checkpoint()` uses, just with the name in place of the random 12-hex suffix. Either way, `ref`
+is an opaque string — nothing downstream parses it, only `fromCheckpoint`/`remove`/the manual CLI
+one-liners consume it, so treat the shape as informational rather than something to pattern-match.
 
 ### Replace semantics
 
@@ -285,9 +302,15 @@ rather not go through the API at all), just no longer the only way to clean one 
 # docker
 docker rmi rightsize/checkpoint:<12-hex-or-name>
 
-# microsandbox
+# microsandbox — the snapshot name, not the full ref path
 msb snapshot rm rz-ckpt-<12-hex-or-name>
 ```
+
+`msb snapshot rm` keys on the snapshot name (the ref's basename), not the full path — pass
+`rz-ckpt-<12-hex-or-name>` even though `Checkpoint.ref` itself is the absolute
+`<cache-dir>/checkpoints/rz-ckpt-<12-hex-or-name>` path. This is exactly what
+`Checkpoint.remove`/`removeCheckpoint` do internally, plus a best-effort delete of the artifact
+directory if msb's own removal doesn't already take it with it.
 
 ## Moving checkpoints between machines
 
@@ -360,8 +383,11 @@ The ref a checkpoint restores by is not always the archived one:
 | Effective ref after import | The original tag, unchanged (`Loaded image: <tag>`) | A fresh DIGEST — the original snapshot name is never preserved |
 
 An imported msb checkpoint therefore shows up in `Checkpoint.find`/`list` with a digest-shaped
-ref (e.g. `sha256-b9c0448ee9d54e33`) instead of the `rz-ckpt-<name-or-hex>` shape a locally created
-one has — harmless, since every backend operation that takes a checkpoint ref (`fromCheckpoint`,
+ref (e.g. `sha256-b9c0448ee9d54e33`) instead of the absolute `<cache-dir>/checkpoints/rz-ckpt-<name-or-hex>`
+path shape a locally created one has — `msb snapshot load` writes into msb's own default
+`~/.microsandbox/snapshots/` store, not the rightsize cache directory `--dest-dir` points
+`createCheckpoint` at, so an imported artifact and a locally created one live in different places
+on disk. Harmless either way, since every backend operation that takes a checkpoint ref (`fromCheckpoint`,
 `snapshot rm`, `snapshot inspect`) resolves "path, name, or digest" identically. Importing an
 archive whose content already exists on the destination (matched by digest) is itself a success,
 not an error — the artifact is already there.

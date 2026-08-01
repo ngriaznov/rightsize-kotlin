@@ -56,6 +56,8 @@ setup around code you don't trust:
 
 - **Cap memory.** `withMemoryLimit(megabytes)` bounds what the sandbox can consume — untrusted
   code shouldn't be able to exhaust host memory even inside a microVM.
+- **Block network egress.** `withNetworkDisabled()` (msb-only — see below) stops untrusted code
+  from reaching the public internet at all, on top of hardware isolation.
 - **No secrets in the environment.** `withEnv(...)` values are visible to whatever runs inside
   the container; never pass API keys, credentials, or other secrets into a container running
   untrusted code.
@@ -68,3 +70,27 @@ setup around code you don't trust:
   itself. Unless the untrusted code genuinely needs to write back to the host filesystem,
   construct the mount with `readOnly = true`, which both backends enforce as a guest-side
   write block.
+
+## Blocking network egress: `withNetworkDisabled()`
+
+```kotlin
+val untrusted = GenericContainer("some/untrusted-image:latest")
+    .withRequireIsolation()
+    .withNetworkDisabled()
+untrusted.start()
+```
+
+What this does and doesn't cover:
+
+- **msb-only.** On the microsandbox backend, `withNetworkDisabled()` emits `--net private`.
+  Published ports keep serving, and links to siblings on a private `Network` keep working —
+  only outbound connections to the public internet fail.
+- **Docker ignores it entirely.** `withNetworkDisabled()` on the Docker backend is a no-op: the
+  container runs with normal networking, egress and all. There's no portable way to block
+  egress on Docker while still keeping published ports reachable, so the flag is silently
+  dropped rather than faked with a partial approximation. If blocking egress matters as much as
+  isolation does, pair `withNetworkDisabled()` with `withRequireIsolation()` (as in the example
+  above) so the run fails outright on Docker instead of quietly running with open egress.
+- **Cannot be combined with `withNetwork()`.** A network-disabled container can't also join a
+  `Network` to reach siblings by alias — `start()` throws `NetworkDisabledConflictException`
+  before any backend call.

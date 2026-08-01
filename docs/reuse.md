@@ -33,13 +33,20 @@ reuse-relevant subset of their configuration:
 
 ```text
 {image, env (sorted by key), command, exposedPorts (sorted), memoryLimitMb,
- copies: [{guestPath, sha256(content)}] sorted by guestPath}
+ copies: [{guestPath, sha256(content)}] sorted by guestPath,
+ diskLimitMb, tmpfsRootMb, networkDisabled}
 ```
 
 - `env` and `copies` are order-independent (sorted before hashing); `command` is not — argv
   order is itself meaningful.
 - A mounted file's bytes are part of identity, not just its guest path — `withCopyFileToContainer`
   with different source content changes the hash even if `guestPath` doesn't.
+- `diskLimitMb`/`tmpfsRootMb`/`networkDisabled` (the `withDiskLimit`/`withTmpfsRoot`/
+  `withNetworkDisabled` builders) fold into identity exactly the way `memoryLimitMb` does — two
+  otherwise-identical containers with a different disk limit, or one with `withNetworkDisabled()`
+  and one without, are not interchangeable for reuse. Unlike `memoryLimitMb`, though, these three
+  are omitted entirely (not rendered as `null`/`false`) when left at their default, so a spec that
+  never touches them hashes identically to how it did before these fields existed.
 - Host ports, the container name, and the network are **not** part of identity — a reuse
   container's host ports are whatever the first boot allocated (or whatever adoption finds),
   not something a caller chooses.

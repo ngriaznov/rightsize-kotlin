@@ -151,6 +151,10 @@ timing quirks. Know these before you hit them:
   `Wait.forListeningPort()` can be satisfied before the in-guest process is actually
   ready on either backend, and when to prefer `Wait.forHttp`/`Wait.forLogMessage`
   instead.
+- **`withDiskLimit`/`withTmpfsRoot`/`withNetworkDisabled` are msb-only.** All three are silent
+  no-ops on the Docker backend. See [Files & Memory](concepts/files-and-memory.md#withdisklimitmegabytes-and-withtmpfsrootmegabytes)
+  for the root-disk knobs and [Isolation](isolation.md#blocking-network-egress-withnetworkdisabled)
+  for network egress blocking.
 - **Checkpoint/restore is supported on both backends, via different mechanisms.**
   `capabilities.checkpoint` is `true` on both — Docker commits the running container to a new
   image; microsandbox stops the sandbox, snapshots its disk, and reboots it, which restarts the

@@ -204,6 +204,12 @@ actionable error.
 - **Isolation requirement.** `withRequireIsolation()` fails `start()` immediately when the
   active backend isn't hardware-isolated, instead of silently running untrusted code under
   Docker's weaker guarantee.
+- **Root-disk and network controls (microsandbox only).** `withDiskLimit(mb)` caps the
+  writable root disk; `withTmpfsRoot(mb)` backs it with RAM instead for faster, residue-free
+  ephemeral containers; `withNetworkDisabled()` blocks public-internet egress while published
+  ports and private-range links keep working. Docker ignores all three. See
+  [Files & Memory](https://ngriaznov.github.io/rightsize-kotlin/concepts/files-and-memory/)
+  and [Isolation](https://ngriaznov.github.io/rightsize-kotlin/isolation/).
 - **Checkpoint / restore.** `checkpoint()` captures a running container's filesystem - a new
   image on Docker, a disk snapshot on microsandbox; `fromCheckpoint(cp)` boots an ordinary
   container from it - seed a fixture once per suite, restore it once per test instead of

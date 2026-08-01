@@ -97,3 +97,42 @@ process at all), and even MySQL/MariaDB's InnoDB default footprint all boot clea
 under the ~450 MB default with no adjustment. Only reach for `withMemoryLimit` when
 you actually observe a boot failure or OOM under the microsandbox backend — don't
 apply it prophylactically to every module.
+
+## `withDiskLimit(megabytes)` and `withTmpfsRoot(megabytes)`
+
+Two more msb-only knobs control the container's writable root disk. Both are ignored on the
+Docker backend — Docker runs without a root-disk ceiling and has no RAM-backed rootfs mode, so
+either builder is a silent no-op there.
+
+```kotlin
+GenericContainer("some-image:latest")
+    .withDiskLimit(2048)   // MB — caps the writable root disk
+```
+
+```kotlin
+GenericContainer("some-image:latest")
+    .withTmpfsRoot(512)    // MB — RAM-backed root disk instead of storage
+```
+
+**`withDiskLimit`** caps the writable root disk at the given size (msb's `--root-disk <mb>M`).
+On an msb reboot the cap can only grow, never shrink.
+
+**`withTmpfsRoot`** backs the root disk with RAM instead of disk storage (msb's
+`--root-disk tmpfs:<mb>M`) — faster ephemeral containers, and nothing written to the rootfs
+leaves a trace on the host disk afterward. It has to fit inside the guest's own memory: msb
+defaults the guest to 512M when `withMemoryLimit` is unset, and setting both with a tmpfs size
+larger than the memory limit throws `TmpfsRootExceedsMemoryException` at `start()`.
+
+Both are mutually exclusive with each other — the root disk is either size-capped or RAM-backed,
+never both — and combining them throws `RootDiskConflictException` at `start()`, before any
+backend call.
+
+### Constraints worth knowing before you reach for these
+
+- **A tmpfs root cannot be checkpointed.** `checkpoint()` on a `withTmpfsRoot()` container throws
+  `TmpfsRootCheckpointException` before touching anything — the root disk lives in guest memory,
+  so there's nothing durable to snapshot. A refused named re-checkpoint leaves the existing
+  checkpoint entirely intact. See [Checkpoint / Restore](../checkpoints.md).
+- **Neither survives a `fromCheckpoint` restore.** msb rejects any root-disk setting
+  (`withDiskLimit` or `withTmpfsRoot`) on a container restored via `fromCheckpoint` before boot —
+  the snapshot already pins the root disk from whatever it was when the checkpoint was taken.

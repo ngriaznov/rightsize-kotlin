@@ -7,7 +7,46 @@ reaches its first tagged release.
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- **`withDiskLimit(megabytes)`** caps a container's writable root disk — msb-only
+  (`--root-disk <mb>M`); Docker runs without a ceiling and ignores it. On an msb reboot
+  the cap can only grow, never shrink. Mutually exclusive with `withTmpfsRoot` — setting
+  both throws `RootDiskConflictException` at `start()`.
+- **`withTmpfsRoot(megabytes)`** backs the root disk with RAM instead of storage —
+  faster ephemeral containers, no disk residue — msb-only; Docker ignores it. Must fit
+  inside the guest's memory: msb defaults to 512M when `withMemoryLimit` is unset, and
+  setting both with a tmpfs size larger than the memory limit throws
+  `TmpfsRootExceedsMemoryException` at `start()`. A tmpfs root cannot be checkpointed —
+  `checkpoint()` throws `TmpfsRootCheckpointException` before touching anything, and a
+  refused named re-checkpoint leaves the existing checkpoint intact. msb also rejects
+  any root-disk setting on a `fromCheckpoint` restore before boot, since the snapshot
+  already pins the root disk.
+- **`withNetworkDisabled()`** blocks public-internet access — msb-only, emitted as
+  `--net private`: published ports keep serving and private-range network links keep
+  working, but outbound connections to the public internet fail. Docker ignores this
+  flag entirely — there's no portable way to block egress there while keeping published
+  ports. Cannot be combined with `withNetwork()` — throws `NetworkDisabledConflictException`
+  at `start()`.
+
+### Changed
+
+- **msb checkpoint artifacts now live under `<cache-dir>/checkpoints/`** (the same
+  rightsize cache directory the named-checkpoint registry already uses —
+  `~/.cache/rightsize` on macOS/Linux, `%LOCALAPPDATA%\rightsize` on Windows), written
+  via msb's own `--dest-dir` instead of its default `~/.microsandbox/snapshots/`
+  location. `Checkpoint.ref` for the microsandbox backend is now the absolute artifact
+  path — `ref` stays an opaque string in the public API, and a bare-name ref from an
+  earlier release still restores. The snapshot still shows up in `msb snapshot list`
+  (msb keeps its own global index); removing it through the library cleans both the
+  index entry and the artifact. `exportTo`/`importFrom` are unaffected.
+
+### Fixed
+
+- **The boot-retry classifier now also recognizes msb's second install-lock phrasing** —
+  `another microsandbox install operation is in progress until <timestamp>`, not just the
+  original `microsandbox install operation in progress until <timestamp>`. A boot that hit
+  the second wording used to fail outright instead of being retried like the first.
 
 ## [0.6.2] - 2026-08-01
 
