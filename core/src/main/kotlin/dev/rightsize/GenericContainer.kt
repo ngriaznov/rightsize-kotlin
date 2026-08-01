@@ -334,16 +334,23 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
 
     private fun checkpointCacheDir(): Path = checkpointCacheDirOverride ?: CacheDir.resolve()
 
-    /** `rightsize/checkpoint:<12-hex>` for a docker-shaped ref, `rz-ckpt-<12-hex>` for an
-     * msb-shaped one — [Checkpoint.ref]'s shape is decided by the ACTIVE backend at capture
-     * time, since a docker image tag and an msb snapshot name are meaningless to the other
-     * backend (see [CheckpointBackendMismatchException]). */
+    /** `rightsize/checkpoint:<12-hex>` for a docker-shaped ref, an absolute
+     * `<checkpoint cache dir>/checkpoints/rz-ckpt-<12-hex>` path for an msb-shaped one —
+     * [Checkpoint.ref]'s shape is decided by the ACTIVE backend at capture time, since a docker
+     * image tag and an msb snapshot artifact are meaningless to the other backend (see
+     * [CheckpointBackendMismatchException]). */
     private fun mintCheckpointRef(): String = mintCheckpointRef(randomCheckpointHex())
 
-    /** Named-checkpoint overload of [mintCheckpointRef]: same backend-shaped prefix, [suffix]
-     * (the checkpoint name) in place of the random hex a nameless call mints. */
+    /** Named-checkpoint overload of [mintCheckpointRef]: same backend-shaped form, [suffix]
+     * (the checkpoint name) in place of the random hex a nameless call mints. The msb path lives
+     * under [checkpointCacheDir] — the same dir the checkpoint registry itself uses, including
+     * the [withCheckpointCacheDir] test seam — so `msb snapshot create --dest-dir` and the
+     * registry always agree on where a run's checkpoint state lives. A ref is still an opaque
+     * string publicly; nothing outside the msb backend parses this shape. */
     private fun mintCheckpointRef(suffix: String): String =
-        if (canonicalBackendId(backend.name) == "msb") "rz-ckpt-$suffix" else "rightsize/checkpoint:$suffix"
+        if (canonicalBackendId(backend.name) == "msb")
+            checkpointCacheDir().resolve("checkpoints").resolve("rz-ckpt-$suffix").toString()
+        else "rightsize/checkpoint:$suffix"
 
     protected open fun customizeSpec(spec: ContainerSpec, mapped: (Int) -> Int): ContainerSpec = spec
     protected open fun containerIsStarted() {}

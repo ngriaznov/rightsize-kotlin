@@ -118,14 +118,19 @@ class GenericContainerCheckpointTest {
         } finally { c.stop() }
     }
 
-    @Test fun `checkpoint mints an msb-shaped snapshot ref when the active backend is named microsandbox`() {
+    @Test fun `checkpoint mints an absolute path under the checkpoint cache dir when the active backend is named microsandbox`(
+        @TempDir tmp: Path,
+    ) {
         val backend = object : CheckpointFakeBackend() { override val name = "microsandbox" }
         val c = GenericContainer("alpine:3.19").withBackend(backend).waitingFor(CheckpointReady)
+            .withCheckpointCacheDir(tmp)
         c.start()
         try {
             val cp = c.checkpoint()
-            assertTrue(Regex("^rz-ckpt-[0-9a-f]{12}$").matches(cp.ref),
-                "ref must be 'rz-ckpt-<12 hex>' for the microsandbox backend, got '${cp.ref}'")
+            assertTrue(Path.of(cp.ref).isAbsolute, "ref must be an absolute path for the microsandbox backend, got '${cp.ref}'")
+            assertEquals(tmp.resolve("checkpoints"), Path.of(cp.ref).parent)
+            assertTrue(Regex("^rz-ckpt-[0-9a-f]{12}$").matches(Path.of(cp.ref).fileName.toString()),
+                "ref's basename must be 'rz-ckpt-<12 hex>', got '${cp.ref}'")
             assertEquals("microsandbox", cp.backend)
         } finally { c.stop() }
     }

@@ -56,7 +56,9 @@ class MsbCheckpointIT {
             val beforeLedger = ledgerLines()
             val cp = original.checkpoint()
             snapshotRef = cp.ref
-            assertTrue(Regex("^rz-ckpt-[0-9a-f]{12}$").matches(cp.ref), "unexpected ref shape: '${cp.ref}'")
+            assertTrue(Path.of(cp.ref).isAbsolute, "unexpected ref shape: '${cp.ref}'")
+            assertTrue(Regex("^rz-ckpt-[0-9a-f]{12}$").matches(Path.of(cp.ref).fileName.toString()),
+                "unexpected ref basename: '${cp.ref}'")
             assertEquals("microsandbox", cp.backend)
             assertEquals(beforeLedger, ledgerLines(),
                 "the stop/snapshot/start cycle must not touch the reaper ledger — same sandbox, still this run's")

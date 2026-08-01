@@ -65,6 +65,44 @@ class MsbCommandsTest {
         assertFalse(withoutLimit.contains("-m"), "no -m flag when memoryLimitMb is null: $withoutLimit")
     }
 
+    @Test fun `run command emits --root-disk with a plain M suffix for diskLimitMb`() {
+        val cmd = MsbCommands.run(spec.copy(diskLimitMb = 2048))
+        val i = cmd.indexOf("--root-disk")
+        assertTrue(i >= 0, "expected --root-disk flag in $cmd")
+        assertEquals("2048M", cmd[i + 1])
+    }
+
+    @Test fun `run command emits --root-disk with a tmpfs prefix for tmpfsRootMb`() {
+        val cmd = MsbCommands.run(spec.copy(tmpfsRootMb = 512))
+        val i = cmd.indexOf("--root-disk")
+        assertTrue(i >= 0, "expected --root-disk flag in $cmd")
+        assertEquals("tmpfs:512M", cmd[i + 1])
+    }
+
+    @Test fun `run command omits --root-disk when neither diskLimitMb nor tmpfsRootMb is set`() {
+        assertFalse(MsbCommands.run(spec).contains("--root-disk"))
+    }
+
+    @Test fun `run command emits --net private when networkDisabled is true, absent when false`() {
+        val disabled = MsbCommands.run(spec.copy(networkDisabled = true))
+        val i = disabled.indexOf("--net")
+        assertTrue(i >= 0, "expected --net flag in $disabled")
+        assertEquals("private", disabled[i + 1])
+
+        assertFalse(MsbCommands.run(spec).contains("--net"), "no --net flag when networkDisabled is false")
+    }
+
+    // Pinned order: `run --name <n> [-m <mem>M] [--root-disk <SPEC>] [--net private] [-p h:g]...`
+    // — the new flags sit between memory and ports, root-disk before net.
+    @Test fun `run command orders -m, --root-disk, --net, then -p when all are set`() {
+        val cmd = MsbCommands.run(spec.copy(memoryLimitMb = 1024, diskLimitMb = 2048, networkDisabled = true))
+        assertEquals(listOf("run", "--name", "rz-abc-1",
+            "-m", "1024M", "--root-disk", "2048M", "--net", "private",
+            "-p", "12345:6379", "-e", "A=1",
+            "--mount-file", "/tmp/f.conf:/etc/f.conf:rw,nodev",
+            "redis:8.6-alpine", "--", "redis-server", "--port", "6379"), cmd)
+    }
+
     @Test fun `exec logs stop rm ls`() {
         assertEquals(listOf("exec", "rz-abc-1", "--", "redis-cli", "ping"),
             MsbCommands.exec("rz-abc-1", listOf("redis-cli", "ping")))
@@ -82,6 +120,19 @@ class MsbCommandsTest {
             MsbCommands.snapshotCreate("rz-abc-1", "rz-ckpt-0123456789ab"))
         assertEquals(listOf("snapshot", "rm", "rz-ckpt-0123456789ab"),
             MsbCommands.snapshotRemove("rz-ckpt-0123456789ab"))
+    }
+
+    @Test fun `snapshot create appends --dest-dir when a destination directory is given`() {
+        assertEquals(
+            listOf("snapshot", "create", "--from", "rz-abc-1", "rz-ckpt-0123456789ab",
+                "--dest-dir", "/home/u/.cache/rightsize/checkpoints"),
+            MsbCommands.snapshotCreate("rz-abc-1", "rz-ckpt-0123456789ab", Path.of("/home/u/.cache/rightsize/checkpoints")),
+        )
+    }
+
+    @Test fun `snapshot create without a destination directory is byte-identical to today`() {
+        assertEquals(listOf("snapshot", "create", "--from", "rz-abc-1", "rz-ckpt-0123456789ab"),
+            MsbCommands.snapshotCreate("rz-abc-1", "rz-ckpt-0123456789ab", null))
     }
 
     @Test fun `copyTo and copyFrom`() {

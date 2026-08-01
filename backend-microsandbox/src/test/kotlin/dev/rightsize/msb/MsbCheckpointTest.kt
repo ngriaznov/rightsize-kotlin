@@ -2,9 +2,11 @@ package dev.rightsize.msb
 
 import dev.rightsize.core.ContainerSpec
 import dev.rightsize.core.PortBinding
+import dev.rightsize.core.TmpfsRootCheckpointException
 import org.junit.jupiter.api.Assumptions.assumeFalse
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.Assertions.*
+import org.junit.jupiter.api.io.TempDir
 import java.nio.file.Files
 import java.nio.file.Path
 
@@ -211,6 +213,56 @@ class MsbCheckpointTest {
         assertDoesNotThrow { backend.removeCheckpoint("rz-ckpt-0123456789ab") }
     }
 
+    @Test fun `createCheckpoint throws TmpfsRootCheckpointException before touching msb when the spec uses a tmpfs root`() {
+        assumeFalse(Platform.current()?.isWindows == true, "POSIX-only fake binary; see doc comment")
+        val callLog = Files.createTempFile("rz-tmpfs-guard-calllog-", "")
+        val script = Files.createTempFile("rz-fake-msb-tmpfs-guard", "").also {
+            Files.writeString(it, "#!/bin/sh\necho \"${'$'}*\" >> \"$callLog\"\nexit 0\n")
+            it.toFile().setExecutable(true)
+        }
+        val backend = MsbCliBackend(script)
+        val spec = ContainerSpec(name = "rz-ckpt-tmpfs-test", image = "irrelevant", runId = "run1", tmpfsRootMb = 256)
+        val handle = backend.create(spec)
+
+        assertThrows(TmpfsRootCheckpointException::class.java) {
+            backend.createCheckpoint(handle, "rz-ckpt-0123456789ab")
+        }
+        assertEquals(emptyList<String>(), Files.readAllLines(callLog).filter { it.isNotBlank() },
+            "no msb command may run before the tmpfs-root guard fires, not even stop")
+    }
+
+    @Test fun `createCheckpoint against a path ref creates the parent dir and passes --dest-dir with the basename as the snapshot name`(
+        @TempDir tmp: Path,
+    ) {
+        assumeFalse(Platform.current()?.isWindows == true, "POSIX-only fake binary; see doc comment")
+        val marker = Files.createTempFile("rz-marker-", "").also { Files.deleteIfExists(it) }
+        val callLog = Files.createTempFile("rz-calllog-", "")
+        val snapshotFailFlag = Files.createTempFile("rz-snapfail-", "").also { Files.deleteIfExists(it) }
+        val rebootFailFlag = Files.createTempFile("rz-rebootfail-", "").also { Files.deleteIfExists(it) }
+        val backend = MsbCliBackend(fakeMsbCheckpointLifecycle(marker, callLog, snapshotFailFlag, rebootFailFlag))
+        val spec = ContainerSpec(name = "rz-ckpt-path-test", image = "irrelevant", runId = "run1")
+        val handle = backend.create(spec)
+        val destDir = tmp.resolve("checkpoints")
+        val ref = destDir.resolve("rz-ckpt-0123456789ab").toString()
+        try {
+            backend.start(handle)
+            Files.writeString(callLog, "")
+
+            backend.createCheckpoint(handle, ref)
+
+            assertTrue(Files.isDirectory(destDir), "createCheckpoint must create the ref's parent dir")
+            val calls = nonPollingCalls(callLog)
+            assertEquals(
+                "snapshot create --from rz-ckpt-path-test rz-ckpt-0123456789ab --dest-dir $destDir",
+                calls[1],
+            )
+            assertTrue("--from-snapshot $ref" in calls[3], "re-boot must use the full path ref verbatim: ${calls[3]}")
+        } finally {
+            backend.stop(handle)
+            backend.remove(handle)
+        }
+    }
+
     /**
      * Fake `msb snapshot inspect <ref>`: exits 0 for `rz-ckpt-exists`; exits 1 with msb's own
      * miss wording on stderr for `rz-ckpt-missing`; exits 1 with unrelated stderr (a stand-in
@@ -256,5 +308,55 @@ class MsbCheckpointTest {
         }
         assertTrue(e.message!!.contains("state database is corrupt"), "message must carry msb's stderr: ${e.message}")
         assertTrue(e.message!!.contains("rz-ckpt-other"), "message must name the ref: ${e.message}")
+    }
+
+    // A path ref never reaches the msb binary at all — /nonexistent/msb would throw the moment
+    // `invoke` tried to spawn it, so a clean boolean return here already proves no msb call ran.
+
+    @Test fun `hasCheckpoint for a path ref checks the artifact dir and snapshot json directly, no msb call`(
+        @TempDir tmp: Path,
+    ) {
+        val backend = MsbCliBackend(Path.of("/nonexistent/msb"))
+        val artifact = tmp.resolve("rz-ckpt-0123456789ab")
+        Files.createDirectories(artifact)
+        Files.writeString(artifact.resolve("snapshot.json"), "{}")
+        assertTrue(backend.hasCheckpoint(artifact.toString()))
+    }
+
+    @Test fun `hasCheckpoint for a path ref is false when the artifact dir has no snapshot json`(
+        @TempDir tmp: Path,
+    ) {
+        val backend = MsbCliBackend(Path.of("/nonexistent/msb"))
+        val artifact = tmp.resolve("rz-ckpt-missingjson")
+        Files.createDirectories(artifact)
+        assertFalse(backend.hasCheckpoint(artifact.toString()))
+    }
+
+    @Test fun `hasCheckpoint for a path ref is false when the artifact dir does not exist at all`(
+        @TempDir tmp: Path,
+    ) {
+        val backend = MsbCliBackend(Path.of("/nonexistent/msb"))
+        assertFalse(backend.hasCheckpoint(tmp.resolve("rz-ckpt-doesnotexist").toString()))
+    }
+
+    @Test fun `removeCheckpoint for a path ref runs snapshot rm with the basename and clears a leftover artifact dir`(
+        @TempDir tmp: Path,
+    ) {
+        assumeFalse(Platform.current()?.isWindows == true, "POSIX-only fake binary; see doc comment")
+        val callLog = Files.createTempFile("rz-rm-calllog-", "")
+        val script = Files.createTempFile("rz-fake-msb-rm", "").also {
+            Files.writeString(it, "#!/bin/sh\necho \"${'$'}*\" >> \"$callLog\"\nexit 0\n")
+            it.toFile().setExecutable(true)
+        }
+        val backend = MsbCliBackend(script)
+        val artifact = tmp.resolve("rz-ckpt-0123456789ab")
+        Files.createDirectories(artifact)
+        Files.writeString(artifact.resolve("snapshot.json"), "{}")
+
+        backend.removeCheckpoint(artifact.toString())
+
+        assertEquals(listOf("snapshot rm rz-ckpt-0123456789ab"), Files.readAllLines(callLog).filter { it.isNotBlank() },
+            "msb snapshot rm must be called with the ref's basename, not the full path")
+        assertFalse(Files.exists(artifact), "a leftover artifact dir (index lost it) must be best-effort deleted")
     }
 }

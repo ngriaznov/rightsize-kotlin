@@ -14,6 +14,13 @@ object MsbCommands {
     fun run(spec: ContainerSpec): List<String> = buildList {
         add("run"); add("--name"); add(spec.name)
         spec.memoryLimitMb?.let { add("-m"); add("${it}M") }   // `msb run --help`: -m/--memory <MEMORY>, e.g. 512M/1G
+        // `--root-disk` covers both a size cap and a tmpfs root (ContainerSpec's start()-time
+        // validation rejects both being set at once, so at most one of these fires).
+        spec.diskLimitMb?.let { add("--root-disk"); add("${it}M") }
+        spec.tmpfsRootMb?.let { add("--root-disk"); add("tmpfs:${it}M") }
+        // `--net private` keeps published ports and private-range network links working while
+        // blocking public-internet egress — `--net none` was tried and breaks port forwarding.
+        if (spec.networkDisabled) { add("--net"); add("private") }
         spec.ports.forEach { add("-p"); add("${it.hostPort}:${it.guestPort}") }
         spec.env.forEach { (k, v) -> add("-e"); add("$k=$v") }
         // The option block is always spelled out, never left to msb's defaults, for two
@@ -53,8 +60,11 @@ object MsbCommands {
     fun rm(name: String) = listOf("rm", name)
     fun ls() = listOf("ls", "--format", "json")
     /** `msb snapshot create --from <sandbox> <name>` requires [sandbox] STOPPED; writes a sparse
-     * disk snapshot artifact under `~/.microsandbox/snapshots/<name>`. */
-    fun snapshotCreate(sandbox: String, name: String) = listOf("snapshot", "create", "--from", sandbox, name)
+     * disk snapshot artifact under `~/.microsandbox/snapshots/<name>`, or under [destDir] when
+     * given (a path-ref checkpoint — see [MsbCliBackend.createCheckpoint]). */
+    fun snapshotCreate(sandbox: String, name: String, destDir: Path? = null) =
+        listOf("snapshot", "create", "--from", sandbox, name) +
+            (destDir?.let { listOf("--dest-dir", it.toString()) } ?: emptyList())
     fun snapshotRemove(name: String) = listOf("snapshot", "rm", name)
     /** `msb snapshot inspect <name>` — its exit code alone is [MsbCliBackend.hasCheckpoint]'s
      * signal (0 = exists, non-zero = doesn't); see docs/checkpoints.md. */

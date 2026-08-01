@@ -324,11 +324,26 @@ class MsbCliBackend private constructor(
      *   already been removed: this throws naming the ref and that its state is still recoverable
      *   via `GenericContainer.fromCheckpoint`, since the original sandbox is gone but the
      *   snapshot survives it.
+     *
+     * [ref] may be a bare snapshot name or an absolute path (see `GenericContainer.mintCheckpointRef`
+     * — the msb backend now mints paths under the checkpoint cache dir). A path ref's parent
+     * directory is created up front and passed to `snapshot create` as `--dest-dir`, with the
+     * path's basename as the snapshot name; msb writes the artifact there instead of its own
+     * default `~/.microsandbox/snapshots/` location. Either shape reboots identically: [ref]
+     * itself flows straight into `--from-snapshot`.
+     *
+     * A [ContainerSpec.tmpfsRootMb] container is refused before [stop] even runs — its root disk
+     * lives in guest memory and there is nothing durable to snapshot.
      */
     override fun createCheckpoint(handle: SandboxHandle, ref: String) {
         handle as Handle
+        if (handle.spec.tmpfsRootMb != null) throw TmpfsRootCheckpointException()
         stop(handle)
-        val snap = invoke(MsbCommands.snapshotCreate(handle.id, ref), SNAPSHOT_TIMEOUT_SEC)
+        val refPath = Path.of(ref)
+        val destDir = if (refPath.isAbsolute) refPath.parent else null
+        val snapshotName = if (refPath.isAbsolute) refPath.fileName.toString() else ref
+        destDir?.let { Files.createDirectories(it) }
+        val snap = invoke(MsbCommands.snapshotCreate(handle.id, snapshotName, destDir), SNAPSHOT_TIMEOUT_SEC)
         if (snap.exitCode != 0) {
             error("msb snapshot create --from ${handle.id} $ref failed (exit ${snap.exitCode}): " +
                 "${snap.stderr.trim().ifEmpty { snap.stdout.trim() }} — sandbox ${handle.id} is left " +
@@ -344,27 +359,46 @@ class MsbCliBackend private constructor(
         }
     }
 
-    /** Best-effort `msb snapshot rm` — "not found" is success, same contract as [removeByName].
-     * Snapshot artifacts are never auto-pruned (see docs/checkpoints.md); this exists so tests
-     * can keep shared CI state clean. */
+    /**
+     * Best-effort `msb snapshot rm <basename>` — "not found" is success, same contract as
+     * [removeByName]. Snapshot artifacts are never auto-pruned (see docs/checkpoints.md); this
+     * exists so tests can keep shared CI state clean.
+     *
+     * Always the basename: for a bare [ref] that's [ref] itself, unchanged from before; for a
+     * path ref it's the snapshot name `snapshot rm` actually keys on, spike-verified to delete
+     * both the index entry and the dest-dir artifact. If a path ref's artifact directory is
+     * still there afterward (the index lost track of it independently), it's removed by hand,
+     * best-effort — same as the rm call itself.
+     */
     override fun removeCheckpoint(ref: String) {
-        runCatching { invoke(MsbCommands.snapshotRemove(ref), STOP_TIMEOUT_SEC) }
+        val refPath = Path.of(ref)
+        val basename = refPath.fileName?.toString() ?: ref
+        runCatching { invoke(MsbCommands.snapshotRemove(basename), STOP_TIMEOUT_SEC) }
+        if (refPath.isAbsolute && Files.exists(refPath)) {
+            runCatching { refPath.toFile().deleteRecursively() }
+        }
     }
 
     /**
-     * `msb snapshot inspect <ref>` exits 0 when the snapshot exists. A non-zero exit is only
-     * "genuinely gone" — and thus only resolves to `false` — when stderr carries msb's own
-     * miss framing (see [isCheckpointMiss]); msb has no separate structured error to
-     * distinguish that from any other inspect failure (a corrupted state database, a
-     * permission failure, a transient hiccup), so per the SPI contract those must never fold
-     * into `false` — they throw instead, carrying stderr (falling back to stdout when empty),
-     * the same substring-classifier discipline [isImageCacheCorruption]/[isMsbStateDbError]
+     * A path ref never reaches msb at all: existence is a plain filesystem check — the artifact
+     * directory exists and holds a `snapshot.json` — since the artifact lives wherever
+     * `createCheckpoint`'s `--dest-dir` put it, not in msb's own snapshot store.
+     *
+     * A bare ref goes through `msb snapshot inspect <ref>`, which exits 0 when the snapshot
+     * exists. A non-zero exit is only "genuinely gone" — and thus only resolves to `false` —
+     * when stderr carries msb's own miss framing (see [isCheckpointMiss]); msb has no separate
+     * structured error to distinguish that from any other inspect failure (a corrupted state
+     * database, a permission failure, a transient hiccup), so per the SPI contract those must
+     * never fold into `false` — they throw instead, carrying stderr (falling back to stdout when
+     * empty), the same substring-classifier discipline [isImageCacheCorruption]/[isMsbStateDbError]
      * already use. Unlike [removeCheckpoint]'s best-effort `runCatching`, a probe failure here
      * is never swallowed: [Checkpoint.find]'s stale-entry cleanup calls this to decide whether
      * to delete a registry entry, and folding a probe failure into `false` would let it
      * permanently orphan a live checkpoint.
      */
     override fun hasCheckpoint(ref: String): Boolean {
+        val refPath = Path.of(ref)
+        if (refPath.isAbsolute) return Files.isDirectory(refPath) && Files.exists(refPath.resolve("snapshot.json"))
         val r = invoke(MsbCommands.snapshotInspect(ref), STOP_TIMEOUT_SEC)
         if (r.exitCode == 0) return true
         if (isCheckpointMiss(r.stderr)) return false
