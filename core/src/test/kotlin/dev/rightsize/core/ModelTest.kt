@@ -20,6 +20,38 @@ class ModelTest {
             e.message)
     }
 
+    @Test fun `RootDiskConflictException carries the fixed conflict message`() {
+        val e = RootDiskConflictException()
+        assertEquals(
+            "withDiskLimit() cannot be combined with withTmpfsRoot() — the root disk is either " +
+                "size-capped or RAM-backed, not both. Drop one.",
+            e.message)
+    }
+
+    @Test fun `TmpfsRootExceedsMemoryException reports both values`() {
+        val e = TmpfsRootExceedsMemoryException(1024, 512)
+        assertEquals(
+            "withTmpfsRoot(1024) exceeds withMemoryLimit(512) — a tmpfs root lives in guest " +
+                "memory and must fit inside it.",
+            e.message)
+    }
+
+    @Test fun `NetworkDisabledConflictException carries the fixed conflict message`() {
+        val e = NetworkDisabledConflictException()
+        assertEquals(
+            "withNetworkDisabled() cannot be combined with withNetwork() — a network-disabled " +
+                "container cannot join a network. Drop one.",
+            e.message)
+    }
+
+    @Test fun `TmpfsRootCheckpointException carries the fixed refusal message`() {
+        val e = TmpfsRootCheckpointException()
+        assertEquals(
+            "this container uses a tmpfs root (withTmpfsRoot), which is ephemeral and cannot be " +
+                "checkpointed — use withDiskLimit or the default root disk for checkpointable containers.",
+            e.message)
+    }
+
     // --- Checkpoint.find/remove must validate name before turning it into a registry file path
     // (C2) — before either Backends.active() or CacheDir.resolve() runs, so an invalid name never
     // resolves an active backend or touches any file. core's test classpath has no BackendProvider

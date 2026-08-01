@@ -72,6 +72,34 @@ class ReuseIdentityTest {
         assertTrue(ReuseIdentity.canonicalJson(withLimit).contains("\"memoryLimitMb\":512"))
     }
 
+    // diskLimitMb/tmpfsRootMb/networkDisabled at their defaults must leave the pinned spec's
+    // rendering (and hash) untouched — the whole point of omitting them rather than rendering
+    // null/false is that a spec from before these fields existed keeps hashing identically.
+    @Test fun `diskLimitMb, tmpfsRootMb, and networkDisabled at their defaults do not affect the hash`() {
+        assertEquals(pinnedHash, ReuseIdentity.hash(pinnedSpec))
+        assertFalse(ReuseIdentity.canonicalJson(pinnedSpec).contains("diskLimitMb"))
+        assertFalse(ReuseIdentity.canonicalJson(pinnedSpec).contains("tmpfsRootMb"))
+        assertFalse(ReuseIdentity.canonicalJson(pinnedSpec).contains("networkDisabled"))
+    }
+
+    @Test fun `a non-null diskLimitMb is part of the hash`() {
+        val withDisk = pinnedSpec.copy(diskLimitMb = 2048)
+        assertNotEquals(ReuseIdentity.hash(pinnedSpec), ReuseIdentity.hash(withDisk))
+        assertTrue(ReuseIdentity.canonicalJson(withDisk).contains("\"diskLimitMb\":2048"))
+    }
+
+    @Test fun `a non-null tmpfsRootMb is part of the hash`() {
+        val withTmpfs = pinnedSpec.copy(tmpfsRootMb = 512)
+        assertNotEquals(ReuseIdentity.hash(pinnedSpec), ReuseIdentity.hash(withTmpfs))
+        assertTrue(ReuseIdentity.canonicalJson(withTmpfs).contains("\"tmpfsRootMb\":512"))
+    }
+
+    @Test fun `networkDisabled true is part of the hash`() {
+        val disabled = pinnedSpec.copy(networkDisabled = true)
+        assertNotEquals(ReuseIdentity.hash(pinnedSpec), ReuseIdentity.hash(disabled))
+        assertTrue(ReuseIdentity.canonicalJson(disabled).contains("\"networkDisabled\":true"))
+    }
+
     @Test fun `canonical JSON escapes quotes, backslashes, whitespace controls, and raw control bytes`() {
         val spec = pinnedSpec.copy(env = mapOf("MSG" to "line1\nline2\ttab\"quote\\back\rcr"))
         val json = ReuseIdentity.canonicalJson(spec)

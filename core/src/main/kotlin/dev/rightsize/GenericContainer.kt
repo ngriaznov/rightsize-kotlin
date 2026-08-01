@@ -47,6 +47,9 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
     private var waitStrategy: WaitStrategy = Wait.forListeningPort()
     private var backendOverride: SandboxBackend? = null
     private var memoryLimitMb: Long? = null
+    private var diskLimitMb: Long? = null
+    private var tmpfsRootMb: Long? = null
+    private var networkDisabled = false
     private var reuseRequested = false
     private var reuseEnvOverride: Map<String, String>? = null
     private var reuseCacheDirOverride: Path? = null
@@ -101,6 +104,27 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
      * default) lets each runtime apply its own default instead of a fixed value here.
      */
     fun withMemoryLimit(megabytes: Long): SELF { memoryLimitMb = megabytes; return this as SELF }
+    /**
+     * Caps the writable root disk at [megabytes] — msb-only (`--root-disk`), grow-only across an
+     * msb reboot; docker runs without a ceiling. Cannot be combined with [withTmpfsRoot] (see
+     * [RootDiskConflictException], checked at [start]).
+     */
+    fun withDiskLimit(megabytes: Long): SELF { diskLimitMb = megabytes; return this as SELF }
+    /**
+     * Backs the root disk with RAM instead of storage, [megabytes] in size — msb-only; docker
+     * runs with its normal disk-backed rootfs. Must fit inside the guest's memory (msb defaults
+     * to 512M when [withMemoryLimit] is unset — see [TmpfsRootExceedsMemoryException], checked at
+     * [start]), and a tmpfs root cannot be checkpointed (see [TmpfsRootCheckpointException]).
+     * Cannot be combined with [withDiskLimit] (see [RootDiskConflictException]).
+     */
+    fun withTmpfsRoot(megabytes: Long): SELF { tmpfsRootMb = megabytes; return this as SELF }
+    /**
+     * Blocks public-internet access — msb-only, emitted as `--net private` (published ports and
+     * private-range network links still work); docker ignores it and runs with normal networking.
+     * Cannot be combined with [withNetwork] (see [NetworkDisabledConflictException], checked at
+     * [start]).
+     */
+    fun withNetworkDisabled(): SELF { networkDisabled = true; return this as SELF }
     /**
      * Marks this container for reuse: survive `stop()`/process exit and be adopted — not
      * re-created — by the next equivalent container, in this process or a later one. Only takes
@@ -349,6 +373,13 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
                 throw CheckpointBackendMismatchException(creator, backend.name)
             }
         }
+        // Same placement again: pure spec conflicts, none of them need a backend to detect, so
+        // none of them should wait for one.
+        if (diskLimitMb != null && tmpfsRootMb != null) throw RootDiskConflictException()
+        val tmpfs = tmpfsRootMb
+        val mem = memoryLimitMb
+        if (tmpfs != null && mem != null && tmpfs > mem) throw TmpfsRootExceedsMemoryException(tmpfs, mem)
+        if (networkDisabled && network != null) throw NetworkDisabledConflictException()
         if (reuseRequested) {
             if (reuseEnvEnabled()) { startReuse(); return }
             System.err.println(
@@ -420,6 +451,9 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
                 runId = RunId.value,
                 memoryLimitMb = memoryLimitMb,
                 checkpointRef = checkpointRef,
+                diskLimitMb = diskLimitMb,
+                tmpfsRootMb = tmpfsRootMb,
+                networkDisabled = networkDisabled,
             )
             spec = customizeSpec(spec) { guest -> mappedPorts.getValue(guest) }
             Reaper.beforeCreate(backend, spec)
@@ -551,6 +585,9 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
         exposedPorts = exposedPorts.toList(),
         memoryLimitMb = memoryLimitMb,
         copies = mounts.map { ReuseIdentitySpec.CopyEntry(it.guestPath, ReuseIdentity.sha256OfFile(it.hostPath)) },
+        diskLimitMb = diskLimitMb,
+        tmpfsRootMb = tmpfsRootMb,
+        networkDisabled = networkDisabled,
     )
 
     /**
@@ -605,6 +642,9 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
                 runId = RunId.value,
                 memoryLimitMb = memoryLimitMb,
                 keepAlive = true,
+                diskLimitMb = diskLimitMb,
+                tmpfsRootMb = tmpfsRootMb,
+                networkDisabled = networkDisabled,
             )
             spec = customizeSpec(spec) { guest -> mappedPorts.getValue(guest) }
             val h = try {

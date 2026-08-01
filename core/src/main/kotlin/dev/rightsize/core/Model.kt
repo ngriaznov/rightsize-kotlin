@@ -48,6 +48,28 @@ data class ContainerSpec(
      * `fromCheckpoint` are not a supported combination.
      */
     val checkpointRef: String? = null,
+    /**
+     * Caps the writable root disk at [diskLimitMb] megabytes — msb-only (`--root-disk`); docker
+     * runs without a ceiling and ignores this field. On an msb reboot the cap can only grow, never
+     * shrink. Part of reuse identity, same as [memoryLimitMb]: two otherwise-identical containers
+     * with a different [diskLimitMb] are not interchangeable for reuse.
+     */
+    val diskLimitMb: Long? = null,
+    /**
+     * Backs the root disk with RAM instead of storage — msb-only; docker runs with its normal
+     * disk-backed rootfs and ignores this field. Must fit inside the guest's memory (see
+     * [memoryLimitMb]; msb defaults to 512M when that's unset), and a tmpfs root cannot be
+     * checkpointed. Mutually exclusive with [diskLimitMb] — the root disk is either size-capped
+     * or RAM-backed, not both. Part of reuse identity, same as [memoryLimitMb].
+     */
+    val tmpfsRootMb: Long? = null,
+    /**
+     * Blocks public-internet access — msb-only, emitted as `--net private` (published ports and
+     * private-range network links still work); docker ignores this field and runs with normal
+     * networking. Mutually exclusive with [networkId] — a network-disabled container cannot join
+     * a network. Part of reuse identity, same as [memoryLimitMb].
+     */
+    val networkDisabled: Boolean = false,
 )
 
 /** Opaque per-backend container reference; [id] is backend-native, [spec] is what created it. */
@@ -62,6 +84,42 @@ interface SandboxHandle { val id: String; val spec: ContainerSpec }
 class UnsupportedByBackendException(feature: String, backend: String, remedy: String? = null) :
     RuntimeException(
         "Feature '$feature' is not supported by the '$backend' backend" + (remedy?.let { " — $it" } ?: ""))
+
+/**
+ * Thrown by `GenericContainer.start()` when both `withDiskLimit()` and `withTmpfsRoot()` were
+ * called — the root disk is either size-capped or RAM-backed, never both. Raised before any
+ * backend call, same as [IsolationRequiredException].
+ */
+class RootDiskConflictException : RuntimeException(
+    "withDiskLimit() cannot be combined with withTmpfsRoot() — the root disk is either " +
+        "size-capped or RAM-backed, not both. Drop one.")
+
+/**
+ * Thrown by `GenericContainer.start()` when `withTmpfsRoot(tmpfsMb)` exceeds an explicitly set
+ * `withMemoryLimit(memoryMb)` — a tmpfs root lives in guest memory and must fit inside it. Not
+ * raised when no memory limit was set (msb's own error is precise enough there). Raised before
+ * any backend call, same as [IsolationRequiredException].
+ */
+class TmpfsRootExceedsMemoryException(tmpfsMb: Long, memoryMb: Long) : RuntimeException(
+    "withTmpfsRoot($tmpfsMb) exceeds withMemoryLimit($memoryMb) — a tmpfs root lives in guest " +
+        "memory and must fit inside it.")
+
+/**
+ * Thrown by `GenericContainer.start()` when `withNetworkDisabled()` and `withNetwork()` were both
+ * called — a network-disabled container cannot join a network. Raised before any backend call,
+ * same as [IsolationRequiredException].
+ */
+class NetworkDisabledConflictException : RuntimeException(
+    "withNetworkDisabled() cannot be combined with withNetwork() — a network-disabled container " +
+        "cannot join a network. Drop one.")
+
+/**
+ * Thrown by the msb backend's `createCheckpoint`, before the stop, when the container uses
+ * `withTmpfsRoot()` — a tmpfs root is ephemeral and there is nothing durable on disk to snapshot.
+ */
+class TmpfsRootCheckpointException : RuntimeException(
+    "this container uses a tmpfs root (withTmpfsRoot), which is ephemeral and cannot be " +
+        "checkpointed — use withDiskLimit or the default root disk for checkpointable containers.")
 
 /**
  * Thrown by `GenericContainer.start()` when `withRequireIsolation()` was called but the active

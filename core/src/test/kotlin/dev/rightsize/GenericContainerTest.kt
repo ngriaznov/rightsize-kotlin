@@ -57,6 +57,11 @@ class GenericContainerTest {
         assertEquals(6379, spec.ports.single().guestPort)
         assertTrue(spec.ports.single().hostPort > 0)
         assertEquals(spec.ports.single().hostPort, c.getMappedPort(6379))
+        // Untouched by any of the withDiskLimit/withTmpfsRoot/withNetworkDisabled builders: the
+        // spec a plain container builds must be field-for-field the same as before those existed.
+        assertNull(spec.diskLimitMb)
+        assertNull(spec.tmpfsRootMb)
+        assertFalse(spec.networkDisabled)
         assertTrue(c.isRunning)
         c.stop(); assertFalse(c.isRunning)
     }
@@ -344,6 +349,90 @@ class GenericContainerTest {
         unset.start()
         assertNull(backend.created.last().memoryLimitMb)
         unset.stop()
+    }
+
+    // Disk-limit/tmpfs-root/network-disabled knobs: same "carries through, null/false when unset"
+    // shape as withMemoryLimit above.
+    @Test fun `withDiskLimit carries through to the ContainerSpec, null when unset`() {
+        val backend = FakeBackend()
+        val limited = container(backend).withExposedPorts(6379).withDiskLimit(2048)
+        limited.start()
+        assertEquals(2048L, backend.created.single().diskLimitMb)
+        limited.stop()
+
+        val unset = container(backend).withExposedPorts(6379)
+        unset.start()
+        assertNull(backend.created.last().diskLimitMb)
+        unset.stop()
+    }
+
+    @Test fun `withTmpfsRoot carries through to the ContainerSpec, null when unset`() {
+        val backend = FakeBackend()
+        val withTmpfs = container(backend).withExposedPorts(6379).withTmpfsRoot(256)
+        withTmpfs.start()
+        assertEquals(256L, backend.created.single().tmpfsRootMb)
+        withTmpfs.stop()
+
+        val unset = container(backend).withExposedPorts(6379)
+        unset.start()
+        assertNull(backend.created.last().tmpfsRootMb)
+        unset.stop()
+    }
+
+    @Test fun `withNetworkDisabled carries through to the ContainerSpec, false when unset`() {
+        val backend = FakeBackend()
+        val disabled = container(backend).withExposedPorts(6379).withNetworkDisabled()
+        disabled.start()
+        assertTrue(backend.created.single().networkDisabled)
+        disabled.stop()
+
+        val unset = container(backend).withExposedPorts(6379)
+        unset.start()
+        assertFalse(backend.created.last().networkDisabled)
+        unset.stop()
+    }
+
+    // --- Disk-limit/tmpfs-root/network-disabled start()-time validation — none of these need a
+    // backend to detect, so none of them should reach one; backend.created must stay empty. ---
+
+    @Test fun `withDiskLimit plus withTmpfsRoot is a typed error before any backend call`() {
+        val backend = FakeBackend()
+        val c = container(backend).withExposedPorts(6379).withDiskLimit(2048).withTmpfsRoot(512)
+        assertThrows(RootDiskConflictException::class.java) { c.start() }
+        assertTrue(backend.created.isEmpty())
+    }
+
+    @Test fun `withTmpfsRoot exceeding withMemoryLimit is a typed error`() {
+        val backend = FakeBackend()
+        val c = container(backend).withExposedPorts(6379).withTmpfsRoot(1024).withMemoryLimit(512)
+        val e = assertThrows(TmpfsRootExceedsMemoryException::class.java) { c.start() }
+        assertTrue(e.message!!.contains("1024"))
+        assertTrue(e.message!!.contains("512"))
+        assertTrue(backend.created.isEmpty())
+    }
+
+    @Test fun `withTmpfsRoot with no withMemoryLimit never validates, however large`() {
+        val backend = FakeBackend()
+        val c = container(backend).withExposedPorts(6379).withTmpfsRoot(1_000_000)
+        c.start()
+        assertEquals(1_000_000L, backend.created.single().tmpfsRootMb)
+        c.stop()
+    }
+
+    @Test fun `withTmpfsRoot at or under withMemoryLimit does not validate`() {
+        val backend = FakeBackend()
+        val c = container(backend).withExposedPorts(6379).withTmpfsRoot(512).withMemoryLimit(512)
+        c.start()
+        assertEquals(512L, backend.created.single().tmpfsRootMb)
+        c.stop()
+    }
+
+    @Test fun `withNetworkDisabled plus withNetwork is a typed error before any backend call`() {
+        val backend = FakeBackend()
+        val net = Network.newNetwork()
+        val c = container(backend).withExposedPorts(6379).withNetworkDisabled().withNetwork(net)
+        assertThrows(NetworkDisabledConflictException::class.java) { c.start() }
+        assertTrue(backend.created.isEmpty())
     }
 
     @Test fun `execInContainer requires running container`() {

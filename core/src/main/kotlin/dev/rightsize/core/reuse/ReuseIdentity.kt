@@ -7,9 +7,11 @@ import java.security.MessageDigest
 /**
  * The reuse-relevant subset of a container's configuration — deliberately narrower than
  * [dev.rightsize.core.ContainerSpec]: reuse identity is about what a container fundamentally
- * *is* (image, env, command, exposed ports, memory limit, mounted file content), never how this
- * one `start()` happened to invoke it (no name, no host ports, no `runId`, no `networkId`). Two
- * containers with an equal [ReuseIdentitySpec] are, by definition, interchangeable for reuse.
+ * *is* (image, env, command, exposed ports, memory limit, mounted file content, and any of the
+ * msb-only root-disk/network knobs that were actually set), never how this one `start()` happened
+ * to invoke it (no name, no host ports, no `runId`, no `networkId`). Two containers with an equal
+ * [ReuseIdentitySpec] are, by definition, interchangeable for reuse. [diskLimitMb]/[tmpfsRootMb]/
+ * [networkDisabled] are folded in exactly the way [memoryLimitMb] is — see [canonicalJson].
  */
 data class ReuseIdentitySpec(
     val image: String,
@@ -18,6 +20,9 @@ data class ReuseIdentitySpec(
     val exposedPorts: List<Int>,
     val memoryLimitMb: Long?,
     val copies: List<CopyEntry>,
+    val diskLimitMb: Long? = null,
+    val tmpfsRootMb: Long? = null,
+    val networkDisabled: Boolean = false,
 ) {
     /** A mounted file's guest destination plus a content hash — so identity busts when the
      * bytes a mount would copy in change, even if [guestPath] and every other field don't. */
@@ -65,8 +70,13 @@ object ReuseIdentity {
     /** Stable key order per field: `image`, `env` (keys sorted), `command` (declaration order —
      * unlike `env`/`exposedPorts`/`copies`, argv order is itself meaningful), `exposedPorts`
      * (sorted ascending), `memoryLimitMb` (`null` or a bare integer), `copies` (sorted by
-     * `guestPath`). No whitespace anywhere — a single byte of formatting drift would change the
-     * hash for an otherwise-identical spec. */
+     * `guestPath`), then `diskLimitMb`/`tmpfsRootMb`/`networkDisabled` — unlike `memoryLimitMb`,
+     * these three are OMITTED entirely rather than rendered as `null`/`false` when left at their
+     * default, so a spec that never touches them renders (and hashes) byte-for-byte the same as
+     * it did before these fields existed — the pinned vector below stays pinned. Setting any of
+     * them still changes the hash, the same as a non-null `memoryLimitMb` does. No whitespace
+     * anywhere — a single byte of formatting drift would change the hash for an otherwise-identical
+     * spec. */
     internal fun canonicalJson(spec: ReuseIdentitySpec): String = buildString {
         append("{\"image\":").append(jsonString(spec.image))
         append(",\"env\":{")
@@ -85,7 +95,11 @@ object ReuseIdentity {
             append("{\"guestPath\":").append(jsonString(c.guestPath))
                 .append(",\"sha256\":").append(jsonString(c.sha256)).append('}')
         }
-        append("]}")
+        append(']')
+        spec.diskLimitMb?.let { append(",\"diskLimitMb\":").append(it) }
+        spec.tmpfsRootMb?.let { append(",\"tmpfsRootMb\":").append(it) }
+        if (spec.networkDisabled) append(",\"networkDisabled\":true")
+        append('}')
     }
 
     private fun jsonString(s: String): String = buildString {
