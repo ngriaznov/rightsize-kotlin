@@ -51,7 +51,7 @@ than Docker, image pulls and container-to-container tests faster.
 
 ```kotlin
 // build.gradle.kts
-testImplementation(platform("dev.rightsize:bom:0.6.1"))
+testImplementation(platform("dev.rightsize:bom:0.6.2"))
 testImplementation("dev.rightsize:core")
 testImplementation("dev.rightsize:modules")
 testRuntimeOnly("dev.rightsize:backend-microsandbox")
