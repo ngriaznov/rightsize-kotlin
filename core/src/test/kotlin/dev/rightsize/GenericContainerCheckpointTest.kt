@@ -135,6 +135,27 @@ class GenericContainerCheckpointTest {
         } finally { c.stop() }
     }
 
+    @Test fun `checkpoint mints an absolute ref even when the checkpoint cache dir override is relative`() {
+        // A relative RIGHTSIZE_CACHE_DIR (or a relative dir handed to the withCheckpointCacheDir
+        // test seam) must still mint an absolute ref — otherwise every isAbsolute-gated
+        // path-vs-bare-name branch on the msb backend misclassifies it as a bare snapshot name.
+        val relativeDir = Path.of("rz-relative-checkpoint-cache-dir-test")
+        val backend = object : CheckpointFakeBackend() { override val name = "microsandbox" }
+        val c = GenericContainer("alpine:3.19").withBackend(backend).waitingFor(CheckpointReady)
+            .withCheckpointCacheDir(relativeDir)
+        assertFalse(relativeDir.isAbsolute, "the override itself must actually be relative for this test to mean anything")
+        c.start()
+        try {
+            val cp = c.checkpoint()
+            val refPath = Path.of(cp.ref)
+            assertTrue(refPath.isAbsolute, "ref must be absolute even with a relative cache-dir override, got '${cp.ref}'")
+            assertEquals(
+                relativeDir.toAbsolutePath().normalize().resolve("checkpoints"), refPath.parent,
+                "ref must still resolve under the (now-absolute) cache dir's checkpoints subdir",
+            )
+        } finally { c.stop() }
+    }
+
     @Test fun `two checkpoints of the same container mint two different random refs`() {
         val backend = CheckpointFakeBackend()
         val c = GenericContainer("alpine:3.19").withBackend(backend).waitingFor(CheckpointReady)

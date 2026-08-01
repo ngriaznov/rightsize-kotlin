@@ -359,4 +359,34 @@ class MsbCheckpointTest {
             "msb snapshot rm must be called with the ref's basename, not the full path")
         assertFalse(Files.exists(artifact), "a leftover artifact dir (index lost it) must be best-effort deleted")
     }
+
+    @Test fun `removeCheckpoint never recursively deletes a path ref that is not a checkpoint artifact dir`(
+        @TempDir tmp: Path,
+    ) {
+        assumeFalse(Platform.current()?.isWindows == true, "POSIX-only fake binary; see doc comment")
+        val callLog = Files.createTempFile("rz-rm-guard-calllog-", "")
+        val script = Files.createTempFile("rz-fake-msb-rm-guard", "").also {
+            Files.writeString(it, "#!/bin/sh\necho \"${'$'}*\" >> \"$callLog\"\nexit 0\n")
+            it.toFile().setExecutable(true)
+        }
+        val backend = MsbCliBackend(script)
+
+        // No snapshot.json at all: not a checkpoint artifact dir, whatever its basename.
+        val noSnapshotJson = tmp.resolve("rz-ckpt-arbitrary")
+        Files.createDirectories(noSnapshotJson)
+        Files.writeString(noSnapshotJson.resolve("some-other-file"), "not a checkpoint")
+        backend.removeCheckpoint(noSnapshotJson.toString())
+        assertTrue(Files.exists(noSnapshotJson), "a dir without snapshot.json must never be deleted")
+        assertTrue(Files.exists(noSnapshotJson.resolve("some-other-file")), "its contents must be untouched")
+
+        // snapshot.json present but the basename doesn't carry the rz-ckpt- prefix: still not
+        // this backend's artifact shape.
+        val wrongBasename = tmp.resolve("not-a-checkpoint-dir")
+        Files.createDirectories(wrongBasename)
+        Files.writeString(wrongBasename.resolve("snapshot.json"), "{}")
+        Files.writeString(wrongBasename.resolve("payload"), "arbitrary populated directory")
+        backend.removeCheckpoint(wrongBasename.toString())
+        assertTrue(Files.exists(wrongBasename), "a dir with the wrong basename shape must never be deleted")
+        assertTrue(Files.exists(wrongBasename.resolve("payload")), "its contents must be untouched")
+    }
 }

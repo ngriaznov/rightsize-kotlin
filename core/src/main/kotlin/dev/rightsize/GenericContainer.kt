@@ -255,14 +255,16 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
      * backend's `createCheckpoint` — a filesystem snapshot, not a memory snapshot: [fromCheckpoint]
      * boots a fresh container whose filesystem starts where this one left off, but its processes
      * restart from scratch (see docs/checkpoints.md). [Checkpoint.ref] is backend-shaped (a
-     * docker image tag or an msb snapshot name); with [name] omitted (the default) it's random
-     * per call and purely in-process — nothing is written anywhere, exactly today's behavior.
+     * docker image tag or an ABSOLUTE msb snapshot artifact path, under [mintCheckpointRef]'s own
+     * checkpoint cache dir — restored via `--from-snapshot <path>`, removed via `msb snapshot rm
+     * <basename>`); with [name] omitted (the default) it's random per call and purely in-process
+     * — nothing is written anywhere, exactly today's behavior.
      *
      * Passing [name] instead makes the checkpoint DURABLE and rediscoverable in any later
      * process, without ever holding onto the returned [Checkpoint] — see docs/checkpoints.md's
      * "Reusing checkpoints across runs" section. The ref is derived from [name]
-     * (`rightsize/checkpoint:<name>` / `rz-ckpt-<name>`, replacing the random hex a nameless call
-     * would use), and a registry entry ([dev.rightsize.core.checkpoint.CheckpointRegistry],
+     * (`rightsize/checkpoint:<name>` / `<...>/checkpoints/rz-ckpt-<name>`, replacing the random
+     * hex a nameless call would use), and a registry entry ([dev.rightsize.core.checkpoint.CheckpointRegistry],
      * under the rightsize cache dir) is written ONLY after the backend checkpoint below has
      * already succeeded — a failed capture never leaves a stale entry behind. [name] must match
      * `^[a-z0-9][a-z0-9-]{0,40}$`, checked before any backend call (before even the capability
@@ -292,6 +294,14 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
         if (name != null) validateCheckpointName(name)
         if (!backend.capabilities.checkpoint) throw CheckpointUnsupportedException(backend.name)
         val h = requireHandle()
+        // Checked before any replace/remove/backend call — a guaranteed-to-fail checkpoint on a
+        // tmpfs-root container must never destroy an existing named checkpoint first. Same
+        // branching mintCheckpointRef uses, since a docker-shaped ref never hits this backend's
+        // tmpfs restriction at all. The msb backend's own createCheckpoint guard stays as
+        // defense in depth; this is the one that actually protects replaceExistingNamedCheckpoint.
+        if (h.spec.tmpfsRootMb != null && canonicalBackendId(backend.name) == "msb") {
+            throw TmpfsRootCheckpointException()
+        }
         if (name != null) replaceExistingNamedCheckpoint(name)
         val ref = if (name != null) mintCheckpointRef(name) else mintCheckpointRef()
         backend.createCheckpoint(h, ref)
@@ -345,11 +355,18 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
      * (the checkpoint name) in place of the random hex a nameless call mints. The msb path lives
      * under [checkpointCacheDir] — the same dir the checkpoint registry itself uses, including
      * the [withCheckpointCacheDir] test seam — so `msb snapshot create --dest-dir` and the
-     * registry always agree on where a run's checkpoint state lives. A ref is still an opaque
-     * string publicly; nothing outside the msb backend parses this shape. */
+     * registry always agree on where a run's checkpoint state lives. Always minted absolute
+     * ([Path.toAbsolutePath] + [Path.normalize]): [checkpointCacheDir] can itself be relative (an
+     * explicit relative `RIGHTSIZE_CACHE_DIR`, or a relative dir handed to
+     * [withCheckpointCacheDir]), and every `isAbsolute`-gated path-vs-bare-name branch this ref
+     * later reaches (the msb backend's `hasCheckpoint`/`removeCheckpoint`/`createCheckpoint`)
+     * would otherwise misclassify a relative path ref as a bare snapshot name instead of a path
+     * ref. A ref is still an opaque string publicly; nothing outside the msb backend parses this
+     * shape. */
     private fun mintCheckpointRef(suffix: String): String =
         if (canonicalBackendId(backend.name) == "msb")
-            checkpointCacheDir().resolve("checkpoints").resolve("rz-ckpt-$suffix").toString()
+            checkpointCacheDir().resolve("checkpoints").resolve("rz-ckpt-$suffix")
+                .toAbsolutePath().normalize().toString()
         else "rightsize/checkpoint:$suffix"
 
     protected open fun customizeSpec(spec: ContainerSpec, mapped: (Int) -> Int): ContainerSpec = spec
@@ -381,12 +398,10 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
             }
         }
         // Same placement again: pure spec conflicts, none of them need a backend to detect, so
-        // none of them should wait for one.
-        if (diskLimitMb != null && tmpfsRootMb != null) throw RootDiskConflictException()
-        val tmpfs = tmpfsRootMb
-        val mem = memoryLimitMb
-        if (tmpfs != null && mem != null && tmpfs > mem) throw TmpfsRootExceedsMemoryException(tmpfs, mem)
-        if (networkDisabled && network != null) throw NetworkDisabledConflictException()
+        // none of them should wait for one. Re-checked against the FINAL spec (after
+        // customizeSpec) at each construction site below — see [validateSpecConflicts]'s doc for
+        // why a builder-time-only check here isn't enough.
+        validateSpecConflicts(diskLimitMb, tmpfsRootMb, memoryLimitMb, networkDisabled, network?.id)
         if (reuseRequested) {
             if (reuseEnvEnabled()) { startReuse(); return }
             System.err.println(
@@ -413,6 +428,30 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
         }
         containerIsStarted()                    // subclass hook: replica-set init, etc.
         LiveContainers.register(h, backend, host)
+    }
+
+    /**
+     * The pure spec-conflict checks [start] runs before touching a backend — shared between two
+     * call sites so they can never drift: once against this container's own builder-set fields,
+     * before [customizeSpec] runs at all (the ordinary case, and the only check ever reached for
+     * a container with no [customizeSpec] override), and again against the FINAL [ContainerSpec]
+     * — after [customizeSpec] — at each construction site ([createStartedContainer],
+     * [createReuseFresh]). The second check exists because [customizeSpec] is a subclass hook
+     * that runs strictly after the first one: a module overriding it can hand back a spec with
+     * both root-disk fields set, `networkDisabled` alongside a network, or a tmpfs root
+     * exceeding memory, and the pre-customize check above has no way to see that mutation. Without
+     * re-validating the spec [customizeSpec] actually produced, such a spec would reach
+     * `backend.create` unvalidated — exactly the emission [MsbCommands.run]'s own comment on
+     * `--root-disk` assumes can never happen.
+     */
+    private fun validateSpecConflicts(
+        diskLimitMb: Long?, tmpfsRootMb: Long?, memoryLimitMb: Long?, networkDisabled: Boolean, networkId: String?,
+    ) {
+        if (diskLimitMb != null && tmpfsRootMb != null) throw RootDiskConflictException()
+        if (tmpfsRootMb != null && memoryLimitMb != null && tmpfsRootMb > memoryLimitMb) {
+            throw TmpfsRootExceedsMemoryException(tmpfsRootMb, memoryLimitMb)
+        }
+        if (networkDisabled && networkId != null) throw NetworkDisabledConflictException()
     }
 
     /** Links to siblings already running when we start; a failure here still tears us down.
@@ -463,6 +502,7 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
                 networkDisabled = networkDisabled,
             )
             spec = customizeSpec(spec) { guest -> mappedPorts.getValue(guest) }
+            validateSpecConflicts(spec.diskLimitMb, spec.tmpfsRootMb, spec.memoryLimitMb, spec.networkDisabled, spec.networkId)
             Reaper.beforeCreate(backend, spec)
             val h = backend.create(spec)
             try {
@@ -654,6 +694,7 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
                 networkDisabled = networkDisabled,
             )
             spec = customizeSpec(spec) { guest -> mappedPorts.getValue(guest) }
+            validateSpecConflicts(spec.diskLimitMb, spec.tmpfsRootMb, spec.memoryLimitMb, spec.networkDisabled, spec.networkId)
             val h = try {
                 backend.create(spec)
             } catch (e: Exception) {

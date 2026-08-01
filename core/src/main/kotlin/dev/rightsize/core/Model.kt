@@ -179,10 +179,13 @@ data class CheckpointSpec(
  * captured via whichever backend was active ([backend], `"docker"`/`"microsandbox"` — matching
  * `RIGHTSIZE_BACKEND`) plus enough of the source container's configuration ([spec]) to boot an
  * equivalent one via `GenericContainer.fromCheckpoint`. [ref]'s shape is backend-specific: a
- * docker image tag (`rightsize/checkpoint:<12-hex>`) or an msb snapshot name
- * (`rz-ckpt-<12-hex>`) for an unnamed checkpoint (random per call), or the same shapes with a
- * caller-chosen name in place of the hex (`rightsize/checkpoint:<name>` / `rz-ckpt-<name>`) for
- * `GenericContainer.checkpoint(name)`. This is a filesystem capture, not a memory snapshot — a
+ * docker image tag (`rightsize/checkpoint:<12-hex>`) or an ABSOLUTE msb snapshot artifact path
+ * (`<rightsize cache dir>/checkpoints/rz-ckpt-<12-hex>`) for an unnamed checkpoint (random per
+ * call), or the same shapes with a caller-chosen name in place of the hex
+ * (`rightsize/checkpoint:<name>` / `<...>/checkpoints/rz-ckpt-<name>`) for
+ * `GenericContainer.checkpoint(name)`. The msb path is restored via `--from-snapshot <path>` and
+ * removed via `msb snapshot rm <basename>` — msb keys `snapshot rm`/`inspect` on the basename
+ * alone even for a path-ref artifact. This is a filesystem capture, not a memory snapshot — a
  * restored container's processes restart from scratch. Restoring under a different active
  * backend than the one that created it throws [CheckpointBackendMismatchException] before any
  * backend call. See docs/checkpoints.md.

@@ -368,16 +368,31 @@ class MsbCliBackend private constructor(
      * path ref it's the snapshot name `snapshot rm` actually keys on, spike-verified to delete
      * both the index entry and the dest-dir artifact. If a path ref's artifact directory is
      * still there afterward (the index lost track of it independently), it's removed by hand,
-     * best-effort — same as the rm call itself.
+     * best-effort — same as the rm call itself, but only after confirming [refPath] is actually
+     * a checkpoint artifact ([isCheckpointArtifactDir]'s shape) rather than an arbitrary
+     * directory some caller-controlled [ref] happens to point at — [ref] is never validated
+     * upstream of this method, and `deleteRecursively()` on an unchecked path is a data-loss trap.
      */
     override fun removeCheckpoint(ref: String) {
         val refPath = Path.of(ref)
         val basename = refPath.fileName?.toString() ?: ref
         runCatching { invoke(MsbCommands.snapshotRemove(basename), STOP_TIMEOUT_SEC) }
-        if (refPath.isAbsolute && Files.exists(refPath)) {
+        if (refPath.isAbsolute && isCheckpointArtifactDir(refPath)) {
             runCatching { refPath.toFile().deleteRecursively() }
         }
     }
+
+    /**
+     * True if [path] has the on-disk shape a path-ref checkpoint artifact directory
+     * [createCheckpoint] itself writes: a directory, containing `snapshot.json`, whose basename
+     * starts with `rz-ckpt-` — the same three-part shape [hasCheckpoint] already checks for a
+     * path ref. Guards [removeCheckpoint]'s `deleteRecursively()` against recursively wiping an
+     * arbitrary populated directory a caller-supplied [ref] happens to name.
+     */
+    private fun isCheckpointArtifactDir(path: Path): Boolean =
+        Files.isDirectory(path) &&
+            Files.exists(path.resolve("snapshot.json")) &&
+            (path.fileName?.toString()?.startsWith("rz-ckpt-") == true)
 
     /**
      * A path ref never reaches msb at all: existence is a plain filesystem check — the artifact

@@ -14,8 +14,11 @@ object MsbCommands {
     fun run(spec: ContainerSpec): List<String> = buildList {
         add("run"); add("--name"); add(spec.name)
         spec.memoryLimitMb?.let { add("-m"); add("${it}M") }   // `msb run --help`: -m/--memory <MEMORY>, e.g. 512M/1G
-        // `--root-disk` covers both a size cap and a tmpfs root (ContainerSpec's start()-time
-        // validation rejects both being set at once, so at most one of these fires).
+        // `--root-disk` covers both a size cap and a tmpfs root (GenericContainer.start()'s
+        // validation rejects both being set at once, so at most one of these fires — checked both
+        // against the builder-set fields before customizeSpec runs and again against the spec
+        // customizeSpec actually produces, so a subclass hook can't reach this emission with an
+        // unvalidated, conflicting spec either).
         spec.diskLimitMb?.let { add("--root-disk"); add("${it}M") }
         spec.tmpfsRootMb?.let { add("--root-disk"); add("tmpfs:${it}M") }
         // `--net private` keeps published ports and private-range network links working while
@@ -61,7 +64,11 @@ object MsbCommands {
     fun ls() = listOf("ls", "--format", "json")
     /** `msb snapshot create --from <sandbox> <name>` requires [sandbox] STOPPED; writes a sparse
      * disk snapshot artifact under `~/.microsandbox/snapshots/<name>`, or under [destDir] when
-     * given (a path-ref checkpoint — see [MsbCliBackend.createCheckpoint]). */
+     * given (a path-ref checkpoint — see [MsbCliBackend.createCheckpoint]). [JvmOverloads] keeps
+     * the original 2-arg `(sandbox, name)` JVM descriptor alongside the 3-arg one — [destDir]
+     * getting a default value would otherwise drop that descriptor from a published artifact and
+     * break any compiled-against-the-old-jar caller. */
+    @JvmOverloads
     fun snapshotCreate(sandbox: String, name: String, destDir: Path? = null) =
         listOf("snapshot", "create", "--from", sandbox, name) +
             (destDir?.let { listOf("--dest-dir", it.toString()) } ?: emptyList())

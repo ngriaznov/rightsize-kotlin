@@ -108,8 +108,9 @@ interface SandboxBackend : AutoCloseable {
      * [capabilities]`.checkpoint` is true: the generic layer gates on that flag BEFORE reaching
      * this method, so a backend that doesn't support it never needs a real implementation.
      * [ref]'s shape is backend-specific and already minted by the generic layer before this
-     * call — a docker image tag (`rightsize/checkpoint:<12-hex>`) or an msb snapshot name
-     * (`rz-ckpt-<12-hex>`); this method does only the capture. Docker commits the running
+     * call — a docker image tag (`rightsize/checkpoint:<12-hex>`) or an ABSOLUTE msb snapshot
+     * artifact path (`<rightsize cache dir>/checkpoints/rz-ckpt-<12-hex>`); this method does only
+     * the capture. Docker commits the running
      * container to an image, leaving it undisturbed ([capabilities]`.checkpointRestartsWorkload`
      * = `false`); microsandbox stops the sandbox, snapshots its disk, then resumes it
      * (`checkpointRestartsWorkload = true`, since the resumed workload restarts from scratch —

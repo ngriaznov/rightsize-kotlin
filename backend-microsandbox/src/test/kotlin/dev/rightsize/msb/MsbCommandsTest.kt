@@ -135,6 +135,19 @@ class MsbCommandsTest {
             MsbCommands.snapshotCreate("rz-abc-1", "rz-ckpt-0123456789ab", null))
     }
 
+    /** [MsbCommands.snapshotCreate] grew a defaulted [Path]? param; without `@JvmOverloads` that
+     * removes the original 2-arg `(String, String)` JVM descriptor from a published artifact,
+     * breaking any caller compiled against the old jar. Reflection is the only way to see the JVM
+     * descriptors Kotlin actually emits — a Kotlin-source call site always compiles against the
+     * new signature regardless of `@JvmOverloads`, so it can't catch a regression here. */
+    @Test fun `snapshotCreate keeps the original 2-arg JVM descriptor via @JvmOverloads`() {
+        val twoArg = MsbCommands::class.java.getMethod("snapshotCreate", String::class.java, String::class.java)
+        assertEquals(listOf("snapshot", "create", "--from", "rz-abc-1", "rz-ckpt-0123456789ab"),
+            twoArg.invoke(MsbCommands, "rz-abc-1", "rz-ckpt-0123456789ab"))
+        // The 3-arg descriptor must still exist too — this is an addition, not a replacement.
+        MsbCommands::class.java.getMethod("snapshotCreate", String::class.java, String::class.java, Path::class.java)
+    }
+
     @Test fun `copyTo and copyFrom`() {
         assertEquals(listOf("copy", "-q", "/host/src.txt", "rz-abc-1:/dst.txt"),
             MsbCommands.copyTo("rz-abc-1", Path.of("/host/src.txt"), "/dst.txt"))
