@@ -22,6 +22,14 @@ class MsbInstallLockTest {
                 "2027-01-01 00:00:00.000000000; retry after it completes"))
     }
 
+    @Test fun `matches the second phrasing - another operation is in progress`() {
+        // Also captured from a windows-2025 hosted runner: msb words the refusal with an
+        // "is" (and no retry hint) when the other side holds the lock.
+        assertTrue(isMsbInstallLockActive(
+            "error: runtime error: another microsandbox install operation is in progress " +
+                "until 2026-08-01 19:26:19.025098100"))
+    }
+
     @Test fun `ignores other msb runtime errors and a guest command's own failure`() {
         assertFalse(isMsbInstallLockActive("error: runtime error: something else entirely"))
         assertFalse(isMsbInstallLockActive("error: failed to start \"rz-abc-1\""))
