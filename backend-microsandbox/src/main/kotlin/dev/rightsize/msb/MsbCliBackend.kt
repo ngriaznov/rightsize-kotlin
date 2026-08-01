@@ -365,7 +365,7 @@ class MsbCliBackend private constructor(
      * exists so tests can keep shared CI state clean.
      *
      * Always the basename: for a bare [ref] that's [ref] itself, unchanged from before; for a
-     * path ref it's the snapshot name `snapshot rm` actually keys on, spike-verified to delete
+     * path ref it's the snapshot name `snapshot rm` actually keys on, verified live to delete
      * both the index entry and the dest-dir artifact. If a path ref's artifact directory is
      * still there afterward (the index lost track of it independently), it's removed by hand,
      * best-effort — same as the rm call itself, but only after confirming [refPath] is actually
