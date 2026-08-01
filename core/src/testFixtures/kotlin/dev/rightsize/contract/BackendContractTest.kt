@@ -13,6 +13,7 @@ import dev.rightsize.core.IsolationRequiredException
 import dev.rightsize.core.PortBinding
 import dev.rightsize.core.SandboxBackend
 import dev.rightsize.core.SandboxHandle
+import dev.rightsize.core.TmpfsRootCheckpointException
 import dev.rightsize.core.diagnostics.Diagnostics
 import dev.rightsize.core.diagnostics.LiveContainers
 import dev.rightsize.core.reaper.RunRecord
@@ -659,6 +660,103 @@ abstract class BackendContractTest {
             val hostDir = tmp.resolve("copy-out-dir")
             c.copyFileFromContainer("/copy-out-dir", hostDir)
             assertEquals("copy-out-dir-payload\n", Files.readString(hostDir.resolve("nested.txt")))
+        } finally { c.stop() }
+    }
+
+    // --- Root disk sizing, tmpfs root, and network isolation (msb-only; docker no-ops each one) ---
+
+    @Test fun `a network-disabled container serves its published port`() {
+        val backend = Backends.active()
+        val c = GenericContainer("python:3.12-alpine")
+            .withCommand("python", "-m", "http.server", "8000")
+            .withExposedPorts(8000)
+            .withNetworkDisabled()
+            .waitingFor(Wait.forHttp("/").forPort(8000)
+                .withStartupTimeout(Duration.ofSeconds(120)))
+        c.start()
+        try {
+            val conn = URI("http://127.0.0.1:${c.getMappedPort(8000)}/").toURL()
+                .openConnection() as HttpURLConnection
+            assertEquals(200, conn.responseCode, "the published port must still work with networking disabled")
+            if (backend.name.equals("microsandbox", ignoreCase = true)) {
+                val probe = c.execInContainer("python", "-c",
+                    "import urllib.request; urllib.request.urlopen('http://example.com', timeout=5)")
+                assertNotEquals(0, probe.exitCode,
+                    "public egress must be blocked by --net private: ${probe.stdout} ${probe.stderr}")
+            }
+        } finally { c.stop() }
+    }
+
+    @Test fun `a tmpfs-root container boots and accepts writes`() {
+        val c = GenericContainer("alpine:3.19")
+            .withTmpfsRoot(256)
+            .withCommand("sleep", "120")
+            .waitingFor(Wait.forLogMessage(".*", 0).withStartupTimeout(Duration.ofSeconds(30)))
+        c.start()
+        try {
+            val write = c.execInContainer("sh", "-c", "echo tmpfs-root-payload > /root/marker.txt && sync")
+            assertEquals(0, write.exitCode, "writing under a tmpfs root failed: ${write.stderr}")
+            val read = c.execInContainer("cat", "/root/marker.txt")
+            assertEquals(0, read.exitCode, "reading the file back failed: ${read.stderr}")
+            assertTrue(read.stdout.contains("tmpfs-root-payload"))
+        } finally { c.stop() }
+    }
+
+    @Test fun `a disk-limited container boots`() {
+        val c = GenericContainer("alpine:3.19")
+            .withDiskLimit(1024)
+            .withCommand("sleep", "120")
+            .waitingFor(Wait.forLogMessage(".*", 0).withStartupTimeout(Duration.ofSeconds(30)))
+        c.start()
+        try { assertTrue(c.isRunning) } finally { c.stop() }
+    }
+
+    @Test fun `checkpointing a tmpfs-root container is refused`() {
+        val backend = Backends.active()
+        Assumptions.assumeTrue(backend.name.equals("microsandbox", ignoreCase = true),
+            "tmpfs-root checkpoint refusal is microsandbox-specific")
+        val c = GenericContainer("alpine:3.19")
+            .withTmpfsRoot(256)
+            .withCommand("sleep", "120")
+            .waitingFor(Wait.forLogMessage(".*", 0).withStartupTimeout(Duration.ofSeconds(30)))
+        c.start()
+        try {
+            assertThrows(TmpfsRootCheckpointException::class.java) { c.checkpoint() }
+        } finally { c.stop() }
+    }
+
+    @Test fun `a checkpoint stores its artifact under the cache dir and restores from it`() {
+        val backend = Backends.active()
+        Assumptions.assumeTrue(backend.name.equals("microsandbox", ignoreCase = true),
+            "dest-dir checkpoint storage is microsandbox-specific")
+        val c = GenericContainer("alpine:3.19").withCommand("sh", "-c", "echo BOOT-MARKER; sleep 120")
+            .waitingFor(Wait.forLogMessage(".*BOOT-MARKER.*"))
+        c.start()
+        try {
+            val write = c.execInContainer("sh", "-c", // /srv, not /tmp: the microsandbox guest mounts /tmp as tmpfs, which a disk snapshot cannot capture.
+                "echo checkpoint-marker > /srv/marker.txt && sync")
+            assertEquals(0, write.exitCode, "writing the marker file failed: ${write.stderr}")
+
+            val cp = c.checkpoint()
+            val refPath = Path.of(cp.ref)
+            assertTrue(refPath.isAbsolute, "an msb checkpoint ref must be an absolute path: ${cp.ref}")
+            assertTrue(refPath.startsWith(CacheDir.resolve()), "the ref must live under the cache dir: ${cp.ref}")
+            assertTrue(Files.isDirectory(refPath), "the checkpoint artifact directory must exist: ${cp.ref}")
+            assertTrue(Files.exists(refPath.resolve("snapshot.json")),
+                "the checkpoint artifact must contain snapshot.json")
+
+            val restored = GenericContainer.fromCheckpoint(cp)
+                .waitingFor(Wait.forLogMessage(".*", 0).withStartupTimeout(Duration.ofSeconds(30)))
+            try {
+                restored.start()
+                val read = restored.execInContainer("cat", "/srv/marker.txt")
+                assertEquals(0, read.exitCode, "reading the marker file back failed: ${read.stderr}")
+                assertTrue(read.stdout.contains("checkpoint-marker"),
+                    "restored container is missing the checkpointed filesystem state: ${read.stdout}")
+            } finally { restored.stop() }
+
+            backend.removeCheckpoint(cp.ref)
+            assertFalse(Files.exists(refPath), "removeCheckpoint must clean up the artifact directory")
         } finally { c.stop() }
     }
 }

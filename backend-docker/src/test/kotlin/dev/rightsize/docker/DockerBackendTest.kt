@@ -3,8 +3,10 @@ package dev.rightsize.docker
 import com.github.dockerjava.api.exception.InternalServerErrorException
 import com.github.dockerjava.api.exception.NotFoundException
 import dev.rightsize.core.ContainerSpec
+import dev.rightsize.core.FileMount
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.Assertions.*
+import java.nio.file.Path
 
 /** Pure/no-daemon-required unit coverage — [DockerBackend]'s `client` is lazy, so a plain
  * `val` like `watchdogCommands` never touches it. Everything that needs a real daemon is
@@ -68,5 +70,25 @@ class DockerBackendTest {
             DockerBackend().probeExists { throw InternalServerErrorException("daemon unreachable") }
         }
         assertTrue(e.message!!.contains("daemon unreachable"), "message: ${e.message}")
+    }
+
+    // --- msb-only spec fields are a deliberate no-op here ---
+
+    // Compared via toString(), not equals(): docker-java's HostConfig wraps binds in Binds,
+    // which doesn't override equals(), so two independently-built HostConfigs would never
+    // compare equal by field regardless of this test's outcome. Ports are left out of [base]:
+    // its portBindings map holds a raw array per entry, and neither equals() nor Map's default
+    // toString() look past that array's identity, so a port would make this test fail no matter
+    // what create() actually does. Binds and memory already exercise the mounts/memoryLimitMb
+    // pass-through that's the point of this test.
+    @Test fun `hostConfigFor ignores diskLimitMb, tmpfsRootMb, and networkDisabled`() {
+        val base = ContainerSpec(
+            name = "rz-abcd1234-1", image = "alpine", runId = "abcd1234",
+            mounts = listOf(FileMount(hostPath = Path.of("/tmp/rightsize-x"), guestPath = "/x")),
+            memoryLimitMb = 256,
+        )
+        val withMsbOnlyFields = base.copy(diskLimitMb = 1024, tmpfsRootMb = 512, networkDisabled = true)
+        val backend = DockerBackend()
+        assertEquals(backend.hostConfigFor(base).toString(), backend.hostConfigFor(withMsbOnlyFields).toString())
     }
 }

@@ -98,8 +98,9 @@ class DockerBackend : SandboxBackend {
         return name.removePrefix(REUSE_NAME_PREFIX)
     }
 
-    override fun create(spec: ContainerSpec): SandboxHandle {
-        pullIfMissing(spec.image)
+    /** The [HostConfig] [create] hands to the daemon — pulled out, same as [labelsFor], so a
+     * unit test can pin it without a daemon. */
+    internal fun hostConfigFor(spec: ContainerSpec): HostConfig {
         val ports = spec.ports.map {
             PortBinding(
                 Ports.Binding.bindIpAndPort("127.0.0.1", it.hostPort),
@@ -112,6 +113,18 @@ class DockerBackend : SandboxBackend {
         val host = HostConfig.newHostConfig().withPortBindings(ports).withBinds(binds)
             .withExtraHosts("host.docker.internal:host-gateway")
         spec.memoryLimitMb?.let { host.withMemory(it * 1024 * 1024) }
+        return host
+    }
+
+    /**
+     * [ContainerSpec.diskLimitMb]/[ContainerSpec.tmpfsRootMb]/[ContainerSpec.networkDisabled] are
+     * msb-only (root disk sizing/backing and network isolation are microsandbox concepts); this
+     * backend deliberately never reads them and creates the container exactly as it would without
+     * them.
+     */
+    override fun create(spec: ContainerSpec): SandboxHandle {
+        pullIfMissing(spec.image)
+        val host = hostConfigFor(spec)
         val cmd = client.createContainerCmd(spec.image)
             .withName(spec.name)
             .withEnv(spec.env.map { (k, v) -> "$k=$v" })
