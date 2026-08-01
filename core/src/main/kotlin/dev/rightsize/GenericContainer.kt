@@ -423,7 +423,16 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
             )
             spec = customizeSpec(spec) { guest -> mappedPorts.getValue(guest) }
             Reaper.beforeCreate(backend, spec)
-            val h = backend.create(spec)
+            val h = try {
+                backend.create(spec)
+            } catch (e: Exception) {
+                // This attempt never produced a live sandbox: return its ports to the allocator
+                // and undo the ledger append above, so a discarded name doesn't sit in
+                // `.sandboxes` forever. (The reuse path's create branch already releases.)
+                releasePorts()
+                Reaper.afterRemove(spec)
+                throw e
+            }
             try {
                 backend.start(h)
                 return h

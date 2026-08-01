@@ -7,6 +7,7 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.Assertions.*
 import java.nio.file.Files
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 
 /** A wait strategy that is immediately ready — the fake backend runs nothing to connect to. */
 private object ReadyImmediately : WaitStrategy {
@@ -163,6 +164,30 @@ class GenericContainerTest {
         assertTrue(port > 0, "wait strategy must have observed a real mapped port")
         assertFalse(port in FreePorts.issuedView(),
             "port $port must be released by the wait-strategy-failure cleanup path")
+    }
+
+    @Test fun `a failed create releases its allocated host ports`() {
+        // The attempted spec carries the allocated host ports, so a failing create() can
+        // record them for the assertion below even though no handle ever exists.
+        val attempted = AtomicReference<ContainerSpec>()
+        val backend = object : FakeBackend() {
+            override fun create(spec: ContainerSpec): SandboxHandle {
+                attempted.set(spec)
+                throw IllegalStateException("injected create failure")
+            }
+        }
+        val c = GenericContainer("redis:8.6-alpine").withBackend(backend).withExposedPorts(6379, 6380)
+        val e = assertThrows(IllegalStateException::class.java) { c.start() }
+        assertTrue(e.message!!.contains("injected create failure"), e.message)
+        val ports = attempted.get()!!.ports
+        assertEquals(2, ports.size)
+        // Discriminating proof against FreePorts' own bookkeeping, same as the
+        // wait-strategy-failure test above: without the create-failure release, these
+        // ports stay issued for the life of the process.
+        for (binding in ports) {
+            assertFalse(binding.hostPort in FreePorts.issuedView(),
+                "host port ${binding.hostPort} must be released after the failed create")
+        }
     }
 
     @Test fun `stop is a no-op before start and idempotent when called twice`() {
