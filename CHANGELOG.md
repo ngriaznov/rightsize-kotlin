@@ -9,6 +9,16 @@ reaches its first tagged release.
 
 Nothing yet.
 
+## [0.6.2] - 2026-08-01
+
+### Fixed
+
+- A failed container create no longer leaks its pre-allocated host ports or its
+  reaper ledger entry: the create-error path now returns the ports to the
+  allocator and removes the just-appended ledger line, as the reuse path and the
+  start-error path already did. Without this, every failed create attempt
+  permanently retired its ports from the pool for the life of the process.
+
 ## [0.6.1] - 2026-08-01
 
 ### Changed
@@ -470,7 +480,8 @@ Initial public release.
   exactly once; any other failure, or a second failure after the heal,
   propagates unchanged.
 
-[Unreleased]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.6.2...HEAD
+[0.6.2]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.6.0...v0.6.1
 [0.6.1]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.5.0...v0.6.0
