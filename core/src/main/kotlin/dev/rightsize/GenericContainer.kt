@@ -107,7 +107,8 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
     /**
      * Caps the writable root disk at [megabytes] — msb-only (`--root-disk`), grow-only across an
      * msb reboot; docker runs without a ceiling. Cannot be combined with [withTmpfsRoot] (see
-     * [RootDiskConflictException], checked at [start]).
+     * [RootDiskConflictException], checked at [start]), and msb rejects a root-disk setting on a
+     * [fromCheckpoint] restore before boot — the snapshot pins the root disk.
      */
     fun withDiskLimit(megabytes: Long): SELF { diskLimitMb = megabytes; return this as SELF }
     /**
@@ -115,7 +116,9 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
      * runs with its normal disk-backed rootfs. Must fit inside the guest's memory (msb defaults
      * to 512M when [withMemoryLimit] is unset — see [TmpfsRootExceedsMemoryException], checked at
      * [start]), and a tmpfs root cannot be checkpointed (see [TmpfsRootCheckpointException]).
-     * Cannot be combined with [withDiskLimit] (see [RootDiskConflictException]).
+     * Cannot be combined with [withDiskLimit] (see [RootDiskConflictException]), and msb rejects
+     * a root-disk setting on a [fromCheckpoint] restore before boot — the snapshot pins the
+     * root disk.
      */
     fun withTmpfsRoot(megabytes: Long): SELF { tmpfsRootMb = megabytes; return this as SELF }
     /**
