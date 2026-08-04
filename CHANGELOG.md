@@ -7,6 +7,10 @@ reaches its first tagged release.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.7.0] - 2026-08-04
+
 ### Added
 
 - **`withDiskLimit(megabytes)`** caps a container's writable root disk — msb-only
@@ -519,7 +523,8 @@ Initial public release.
   exactly once; any other failure, or a second failure after the heal,
   propagates unchanged.
 
-[Unreleased]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.6.2...HEAD
+[Unreleased]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.6.2...v0.7.0
 [0.6.2]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.6.0...v0.6.1
 [0.6.1]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.6.0...v0.6.1
