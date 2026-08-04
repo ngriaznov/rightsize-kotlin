@@ -34,7 +34,11 @@ class PinotModuleIT {
         .build()
 
     @Test fun `controller schema round-trip and broker health`() {
-        val pinot = PinotContainer()
+        // Pinned, not the floating default: upstream's :latest currently publishes only a
+        // linux/arm64 manifest, which no amd64 lane can pull; 1.3.0 carries both
+        // architectures. The module default keeps floating per its own docs — this pin
+        // is the IT's determinism, not a product change.
+        val pinot = PinotContainer("apachepinot/pinot:1.3.0")
         pinot.start()
         try {
             val schemaJson = """
