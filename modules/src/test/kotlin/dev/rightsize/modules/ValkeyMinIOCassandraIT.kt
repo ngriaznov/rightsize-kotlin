@@ -71,7 +71,9 @@ class ValkeyMinIOCassandraIT {
                 INSERT INTO roundtrip.t (x) VALUES (1);
                 SELECT x FROM roundtrip.t;
             """.trimIndent().replace("\n", " ")
-            val result = cassandra.execInContainer("cqlsh", "-e", cql)
+            // --request-timeout=60: cqlsh's ~10s per-request default is too tight for the
+            // FIRST statement on a cold Cassandra JVM on a loaded CI runner.
+            val result = cassandra.execInContainer("cqlsh", "--request-timeout=60", "-e", cql)
             assertEquals(0, result.exitCode, "cqlsh round-trip failed: ${result.stderr}")
             assertTrue(result.stdout.contains("1"), "expected the inserted row back, got: ${result.stdout}")
         } finally { cassandra.stop() }
