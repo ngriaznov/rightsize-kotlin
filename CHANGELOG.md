@@ -9,6 +9,18 @@ reaches its first tagged release.
 
 Nothing yet.
 
+## [0.7.1] - 2026-08-16
+
+### Changed
+
+- **The pinned microsandbox release is now 0.6.9** (was 0.6.8). No CLI surface this
+  library drives changed, so no action is needed — the provisioner downloads and
+  checksum-verifies the new release automatically, and `MSB_PATH` setups validated
+  against 0.6.8 keep working. 0.6.9 also fixes two upstream issues this library
+  carried defenses for: the Windows snapshot-save flush failure (the salvage path
+  stays in place and now simply never fires) and the concurrent-pull image-cache
+  race (the heal path likewise remains as a safety net).
+
 ## [0.7.0] - 2026-08-04
 
 ### Added
@@ -523,7 +535,8 @@ Initial public release.
   exactly once; any other failure, or a second failure after the heal,
   propagates unchanged.
 
-[Unreleased]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.6.2...v0.7.0
 [0.6.2]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.6.0...v0.6.1
