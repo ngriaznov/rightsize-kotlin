@@ -8,7 +8,7 @@ import java.nio.file.*
 import java.security.MessageDigest
 
 object MsbProvisioner {
-    const val MSB_VERSION = "0.6.9"
+    const val MSB_VERSION = "0.6.10"
     private const val DEFAULT_BASE =
         "https://github.com/superradcompany/microsandbox/releases/download/v$MSB_VERSION"
     private const val CONNECT_TIMEOUT_MS = 10_000
