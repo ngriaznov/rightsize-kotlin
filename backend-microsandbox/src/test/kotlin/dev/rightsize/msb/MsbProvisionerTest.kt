@@ -63,7 +63,7 @@ class MsbProvisionerTest {
         val cache = Files.createTempDirectory("rz-prov-crash")
         // Simulate a crash after bin/msb was moved into place but before lib/<krunAsset>:
         // an executable msb exists, the krun asset does not.
-        val installDir = cache.resolve("msb").resolve(MsbProvisioner.MSB_VERSION)
+        val installDir = cache.resolve("msb").resolve(MsbProvisioner.versionFor(Platform.current()))
         val binDir = Files.createDirectories(installDir.resolve("bin"))
         val staleMsb = binDir.resolve("msb")
         Files.write(staleMsb, "#!/bin/sh\necho stale".toByteArray())
@@ -158,5 +158,36 @@ class MsbProvisionerTest {
         val dir = MsbProvisioner.defaultCacheDir(Platform.WINDOWS_X64,
             mapOf("RIGHTSIZE_CACHE_DIR" to "/custom/path", "LOCALAPPDATA" to "C:\\ignored"))
         assertEquals(java.nio.file.Path.of("/custom/path"), dir)
+    }
+
+    // --- Per-platform version pin: 0.6.10 on macOS/Linux, 0.6.9 on Windows (0.6.10's guest
+    // bootstrap frame never reaches agentd on Windows hosts).
+
+    @Test fun `windows pin differs from the unix pin`() {
+        val unixVersion = MsbProvisioner.versionFor(Platform.LINUX_X64)
+        val windowsVersion = MsbProvisioner.versionFor(Platform.WINDOWS_X64)
+        assertNotEquals(unixVersion, windowsVersion)
+        assertEquals(unixVersion, MsbProvisioner.versionFor(Platform.DARWIN_ARM64))
+        assertEquals(unixVersion, MsbProvisioner.versionFor(Platform.LINUX_ARM64))
+        assertEquals(windowsVersion, MsbProvisioner.versionFor(Platform.WINDOWS_ARM64))
+    }
+
+    @Test fun `each platform's pin feeds its own download URL`() {
+        val unixVersion = MsbProvisioner.versionFor(Platform.LINUX_X64)
+        val windowsVersion = MsbProvisioner.versionFor(Platform.WINDOWS_X64)
+        assertTrue(MsbProvisioner.baseUrlFor(Platform.LINUX_X64).endsWith("/v$unixVersion"))
+        assertTrue(MsbProvisioner.baseUrlFor(Platform.WINDOWS_X64).endsWith("/v$windowsVersion"))
+    }
+
+    @Test fun `each platform's pin feeds its own install dir`() {
+        val unixVersion = MsbProvisioner.versionFor(Platform.LINUX_X64)
+        val windowsVersion = MsbProvisioner.versionFor(Platform.WINDOWS_X64)
+        val cache = Files.createTempDirectory("rz-prov-verpin")
+
+        val msbWin = MsbProvisioner.ensureInstalled(baseUrl, cache, emptyMap(), Platform.WINDOWS_X64)
+        assertEquals(windowsVersion, msbWin.parent.parent.fileName.toString())
+
+        val msbUnix = MsbProvisioner.ensureInstalled(baseUrl, cache, emptyMap(), Platform.LINUX_X64)
+        assertEquals(unixVersion, msbUnix.parent.parent.fileName.toString())
     }
 }

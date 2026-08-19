@@ -8,14 +8,38 @@ import java.nio.file.*
 import java.security.MessageDigest
 
 object MsbProvisioner {
+    /** The pin used on macOS/Linux hosts. See [MSB_VERSION_WINDOWS] for why Windows differs. */
     const val MSB_VERSION = "0.6.10"
-    private const val DEFAULT_BASE =
-        "https://github.com/superradcompany/microsandbox/releases/download/v$MSB_VERSION"
+
+    /**
+     * Windows stays one release back at 0.6.9. 0.6.10's guest bootstrap frame never reaches
+     * agentd on Windows hosts, so every sandbox exits agentless about 70 seconds after spawn
+     * ("sandbox process exited (exit code: 0) before agent relay became available"). macOS and
+     * Linux are unaffected — the regression is in msb.exe itself, not the guest kernel DLL,
+     * which is byte-identical between 0.6.9 and 0.6.10. Windows keeps 0.6.9 until upstream
+     * fixes bootstrap delivery. The CLI surface this library drives is identical between the
+     * two releases (verified by a full command-tree diff), so pinning Windows one release back
+     * does not fork behavior between platforms.
+     */
+    private const val MSB_VERSION_WINDOWS = "0.6.9"
+
     private const val CONNECT_TIMEOUT_MS = 10_000
     private const val READ_TIMEOUT_MS = 300_000
 
-    fun ensureInstalled(): Path =
-        ensureInstalled(DEFAULT_BASE, defaultCacheDir(Platform.current(), System.getenv()), System.getenv())
+    /** The pinned version for [platform]: [MSB_VERSION] everywhere except Windows, which gets
+     * [MSB_VERSION_WINDOWS]. `null` (no known build for the host) also falls through to
+     * [MSB_VERSION] here — callers with a `null` platform already fail before this matters
+     * (see [ensureInstalled]'s `resolved` check). */
+    internal fun versionFor(platform: Platform?): String =
+        if (platform?.isWindows == true) MSB_VERSION_WINDOWS else MSB_VERSION
+
+    internal fun baseUrlFor(platform: Platform?): String =
+        "https://github.com/superradcompany/microsandbox/releases/download/v${versionFor(platform)}"
+
+    fun ensureInstalled(): Path {
+        val platform = Platform.current()
+        return ensureInstalled(baseUrlFor(platform), defaultCacheDir(platform, System.getenv()), System.getenv())
+    }
 
     /**
      * `~/.cache/rightsize` on macOS/Linux; `%LOCALAPPDATA%\rightsize` on Windows (falling
@@ -51,7 +75,8 @@ object MsbProvisioner {
         val resolved = platform
             ?: error("microsandbox has no build for ${System.getProperty("os.name")}/${System.getProperty("os.arch")} " +
                 "— use the docker backend (RIGHTSIZE_BACKEND=docker) or set MSB_PATH")
-        val installDir = cacheDir.resolve("msb").resolve(MSB_VERSION)
+        val version = versionFor(resolved)
+        val installDir = cacheDir.resolve("msb").resolve(version)
         val msb = installDir.resolve("bin").resolve(resolved.msbBinaryName)
         // Installed under the canonical name msb resolves (`../lib/` next to its binary),
         // not the release-asset name it is downloaded as — msb never probes the asset name.
@@ -60,7 +85,7 @@ object MsbProvisioner {
         // The msb binary is written last (see below), so its presence alone is not sufficient.
         if (isInstalled(msb, krun, resolved)) return msb
         check(env["RIGHTSIZE_MSB_SKIP_DOWNLOAD"] != "true") {
-            "msb $MSB_VERSION not found at $msb and RIGHTSIZE_MSB_SKIP_DOWNLOAD=true " +
+            "msb $version not found at $msb and RIGHTSIZE_MSB_SKIP_DOWNLOAD=true " +
                 "— pre-install it there or point MSB_PATH at an msb binary"
         }
         Files.createDirectories(installDir)
