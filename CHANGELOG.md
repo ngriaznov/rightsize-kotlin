@@ -9,6 +9,21 @@ reaches its first tagged release.
 
 Nothing yet.
 
+## [0.7.2] - 2026-08-19
+
+### Changed
+
+- **The pinned microsandbox release is now 0.6.10 on macOS and Linux; Windows stays
+  on 0.6.9.** msb 0.6.10 has a Windows-only regression: its pre-boot guest bootstrap
+  message never reaches the guest agent on Windows hosts, so every sandbox exits
+  about 70 seconds after spawn without the agent ever coming up. macOS and Linux are
+  unaffected. The two releases are identical across every CLI surface this library
+  drives, so the per-platform pin does not change behavior — the provisioner simply
+  routes Windows around the broken release until upstream fixes it.
+
+  **If you point `MSB_PATH` at your own msb binary on Windows, keep it at 0.6.9** —
+  a 0.6.10 binary there will hit the regression on every container start.
+
 ## [0.7.1] - 2026-08-16
 
 ### Changed
@@ -535,7 +550,8 @@ Initial public release.
   exactly once; any other failure, or a second failure after the heal,
   propagates unchanged.
 
-[Unreleased]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.2...HEAD
+[0.7.2]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.6.2...v0.7.0
 [0.6.2]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.6.1...v0.6.2
