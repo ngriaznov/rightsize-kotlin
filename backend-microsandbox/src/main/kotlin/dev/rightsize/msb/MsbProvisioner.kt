@@ -9,17 +9,22 @@ import java.security.MessageDigest
 
 object MsbProvisioner {
     /** The pin used on macOS/Linux hosts. See [MSB_VERSION_WINDOWS] for why Windows differs. */
-    const val MSB_VERSION = "0.6.10"
+    const val MSB_VERSION = "0.6.12"
 
     /**
-     * Windows stays one release back at 0.6.9. 0.6.10's guest bootstrap frame never reaches
-     * agentd on Windows hosts, so every sandbox exits agentless about 70 seconds after spawn
-     * ("sandbox process exited (exit code: 0) before agent relay became available"). macOS and
-     * Linux are unaffected — the regression is in msb.exe itself, not the guest kernel DLL,
-     * which is byte-identical between 0.6.9 and 0.6.10. Windows keeps 0.6.9 until upstream
-     * fixes bootstrap delivery. The CLI surface this library drives is identical between the
-     * two releases (verified by a full command-tree diff), so pinning Windows one release back
-     * does not fork behavior between platforms.
+     * Windows stays three releases back at 0.6.9. Since 0.6.10, guest bootstrap moved off the
+     * kernel command line onto a one-shot pre-boot console frame, and on Windows hosts that
+     * frame never reaches agentd (the guest's PID 1): agentd times out after 60 seconds and the
+     * guest dies. The sandbox can briefly report Running — the heartbeat is file-based — but the
+     * agent relay endpoint is never created, because the relay's accept loop is gated on the
+     * guest's core.ready, which never arrives, so exec/logs/ping can never connect. This holds
+     * for 0.6.10, 0.6.11, and 0.6.12 alike; there is no environment variable, CLI flag, or other
+     * client-side lever that works around it. macOS and Linux are unaffected. The CLI surface
+     * this library drives is identical from 0.6.9 through 0.6.12 (no core source changes landed
+     * in that span, release packaging only), so pinning Windows behind unix does not fork
+     * behavior between platforms. Windows keeps 0.6.9 — the newest release whose Windows build
+     * works — until upstream fixes bootstrap delivery; bump it back in step with [MSB_VERSION]
+     * once that lands.
      */
     private const val MSB_VERSION_WINDOWS = "0.6.9"
 

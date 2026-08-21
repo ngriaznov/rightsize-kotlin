@@ -7,7 +7,24 @@ reaches its first tagged release.
 
 ## [Unreleased]
 
-Nothing yet.
+### Changed
+
+- **The pinned microsandbox release is now 0.6.12 on macOS and Linux; Windows stays
+  on 0.6.9.** The Windows-only bootstrap regression introduced in 0.6.10 is still
+  present in 0.6.11 and 0.6.12: since 0.6.10, guest bootstrap moved off the kernel
+  command line onto a one-shot pre-boot console frame, and on Windows hosts that
+  frame never reaches agentd (the guest's PID 1), so agentd times out after 60
+  seconds and the guest dies. The sandbox can briefly report Running, but the agent
+  relay endpoint is never created, so exec/logs/ping can never connect. There is no
+  environment variable, CLI flag, or other client-side workaround. macOS and Linux
+  are unaffected. The CLI surface this library drives is identical from 0.6.9
+  through 0.6.12 (no core source changes landed in that span), so the per-platform
+  pin does not change behavior — the provisioner simply keeps routing Windows around
+  the broken releases until upstream fixes bootstrap delivery.
+
+  **If you point `MSB_PATH` at your own msb binary on Windows, keep it at 0.6.9** —
+  a 0.6.10, 0.6.11, or 0.6.12 binary there will hit the regression on every
+  container start.
 
 ## [0.7.2] - 2026-08-19
 

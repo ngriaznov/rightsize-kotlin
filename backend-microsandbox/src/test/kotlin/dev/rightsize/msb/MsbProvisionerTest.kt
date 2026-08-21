@@ -160,8 +160,8 @@ class MsbProvisionerTest {
         assertEquals(java.nio.file.Path.of("/custom/path"), dir)
     }
 
-    // --- Per-platform version pin: 0.6.10 on macOS/Linux, 0.6.9 on Windows (0.6.10's guest
-    // bootstrap frame never reaches agentd on Windows hosts).
+    // --- Per-platform version pin: 0.6.12 on macOS/Linux, 0.6.9 on Windows (0.6.10 through
+    // 0.6.12's guest bootstrap frame never reaches agentd on Windows hosts).
 
     @Test fun `windows pin differs from the unix pin`() {
         val unixVersion = MsbProvisioner.versionFor(Platform.LINUX_X64)
