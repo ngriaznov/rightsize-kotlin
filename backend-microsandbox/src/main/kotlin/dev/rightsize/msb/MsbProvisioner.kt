@@ -8,42 +8,22 @@ import java.nio.file.*
 import java.security.MessageDigest
 
 object MsbProvisioner {
-    /** The pin used on macOS/Linux hosts. See [MSB_VERSION_WINDOWS] for why Windows differs. */
-    const val MSB_VERSION = "0.6.12"
-
     /**
-     * Windows stays three releases back at 0.6.9. Since 0.6.10, guest bootstrap moved off the
-     * kernel command line onto a one-shot pre-boot console frame, and on Windows hosts that
-     * frame never reaches agentd (the guest's PID 1): agentd times out after 60 seconds and the
-     * guest dies. The sandbox can briefly report Running — the heartbeat is file-based — but the
-     * agent relay endpoint is never created, because the relay's accept loop is gated on the
-     * guest's core.ready, which never arrives, so exec/logs/ping can never connect. This holds
-     * for 0.6.10, 0.6.11, and 0.6.12 alike; there is no environment variable, CLI flag, or other
-     * client-side lever that works around it. macOS and Linux are unaffected. The CLI surface
-     * this library drives is identical from 0.6.9 through 0.6.12 (no core source changes landed
-     * in that span, release packaging only), so pinning Windows behind unix does not fork
-     * behavior between platforms. Windows keeps 0.6.9 — the newest release whose Windows build
-     * works — until upstream fixes bootstrap delivery; bump it back in step with [MSB_VERSION]
-     * once that lands.
+     * The microsandbox (msb) release this library downloads and pins to, on every platform.
+     *
+     * History: this pin was split per-platform for a while, because msb 0.6.10 through 0.6.13
+     * were broken on Windows (fixed upstream in 0.6.14). Anyone pointing MSB_PATH at their own
+     * binary on Windows must still avoid 0.6.10-0.6.13.
      */
-    private const val MSB_VERSION_WINDOWS = "0.6.9"
+    const val MSB_VERSION = "0.6.14"
 
     private const val CONNECT_TIMEOUT_MS = 10_000
     private const val READ_TIMEOUT_MS = 300_000
 
-    /** The pinned version for [platform]: [MSB_VERSION] everywhere except Windows, which gets
-     * [MSB_VERSION_WINDOWS]. `null` (no known build for the host) also falls through to
-     * [MSB_VERSION] here — callers with a `null` platform already fail before this matters
-     * (see [ensureInstalled]'s `resolved` check). */
-    internal fun versionFor(platform: Platform?): String =
-        if (platform?.isWindows == true) MSB_VERSION_WINDOWS else MSB_VERSION
-
-    internal fun baseUrlFor(platform: Platform?): String =
-        "https://github.com/superradcompany/microsandbox/releases/download/v${versionFor(platform)}"
-
     fun ensureInstalled(): Path {
         val platform = Platform.current()
-        return ensureInstalled(baseUrlFor(platform), defaultCacheDir(platform, System.getenv()), System.getenv())
+        val baseUrl = "https://github.com/superradcompany/microsandbox/releases/download/v$MSB_VERSION"
+        return ensureInstalled(baseUrl, defaultCacheDir(platform, System.getenv()), System.getenv())
     }
 
     /**
@@ -80,8 +60,7 @@ object MsbProvisioner {
         val resolved = platform
             ?: error("microsandbox has no build for ${System.getProperty("os.name")}/${System.getProperty("os.arch")} " +
                 "— use the docker backend (RIGHTSIZE_BACKEND=docker) or set MSB_PATH")
-        val version = versionFor(resolved)
-        val installDir = cacheDir.resolve("msb").resolve(version)
+        val installDir = cacheDir.resolve("msb").resolve(MSB_VERSION)
         val msb = installDir.resolve("bin").resolve(resolved.msbBinaryName)
         // Installed under the canonical name msb resolves (`../lib/` next to its binary),
         // not the release-asset name it is downloaded as — msb never probes the asset name.
@@ -90,7 +69,7 @@ object MsbProvisioner {
         // The msb binary is written last (see below), so its presence alone is not sufficient.
         if (isInstalled(msb, krun, resolved)) return msb
         check(env["RIGHTSIZE_MSB_SKIP_DOWNLOAD"] != "true") {
-            "msb $version not found at $msb and RIGHTSIZE_MSB_SKIP_DOWNLOAD=true " +
+            "msb $MSB_VERSION not found at $msb and RIGHTSIZE_MSB_SKIP_DOWNLOAD=true " +
                 "— pre-install it there or point MSB_PATH at an msb binary"
         }
         Files.createDirectories(installDir)

@@ -7,7 +7,24 @@ reaches its first tagged release.
 
 ## [Unreleased]
 
-Nothing yet.
+### Changed
+
+- **The pinned microsandbox release is unified back to a single version, 0.6.14, on
+  every platform.** The per-platform split introduced in 0.7.2 is retired: upstream's
+  msb_krun/msb_krun_devices 0.1.32 bump (microsandbox issue #1426) removes the
+  Windows-only code path that started console-port delivery at `PORT_READY` — kernel
+  probe time, before any guest process has the port open, so the guest driver
+  discarded the bootstrap frame — and ports now start delivery at `PORT_OPEN` instead,
+  matching unix. 0.6.14 was channel-verified on a windows-2025 GitHub runner with the
+  official binary: sandboxes boot, exec works through the agent relay, the sandbox
+  survives well past the old 60-second death window, and `msb logs` streams guest
+  output. 0.6.12 through 0.6.14 change nothing else of substance for the CLI surface
+  this library drives, so unifying both platforms on 0.6.14 does not change behavior
+  on macOS or Linux.
+
+  **If you point `MSB_PATH` at your own msb binary on Windows, avoid 0.6.10 through
+  0.6.13** — those releases still hit the bootstrap regression on every container
+  start. Use 0.6.9 or 0.6.14+.
 
 ## [0.7.3] - 2026-08-21
 
