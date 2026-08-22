@@ -7,6 +7,10 @@ reaches its first tagged release.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.7.4] - 2026-08-22
+
 ### Changed
 
 - **The pinned microsandbox release is unified back to a single version, 0.6.14, on
@@ -588,7 +592,8 @@ Initial public release.
   exactly once; any other failure, or a second failure after the heal,
   propagates unchanged.
 
-[Unreleased]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.3...HEAD
+[Unreleased]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.4...HEAD
+[0.7.4]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.3...v0.7.4
 [0.7.3]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.2...v0.7.3
 [0.7.2]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.0...v0.7.1
