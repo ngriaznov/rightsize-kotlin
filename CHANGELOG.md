@@ -7,12 +7,23 @@ reaches its first tagged release.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.7.5] - 2026-08-26
+
 ### Changed
 
 - **The pinned microsandbox release is now 0.6.15** (from 0.6.14). Upstream changes
   relevant here: host DNS on Windows now routes through the system resolver, file
   copies on NTFS only copy allocated ranges, and read-only mounts no longer get
   write-probed. No CLI surface this library drives changed.
+
+### Fixed
+
+- **Host ports that hit a bind conflict are no longer eligible for the immediate retry.**
+  The port-retry loop used to return a conflicted port to the allocator before the next
+  attempt, so the OS could hand the same proven-contended port straight back. Conflicted
+  ports now stay quarantined until the retry loop exits.
 
 ## [0.7.4] - 2026-08-22
 
@@ -597,7 +608,8 @@ Initial public release.
   exactly once; any other failure, or a second failure after the heal,
   propagates unchanged.
 
-[Unreleased]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.4...HEAD
+[Unreleased]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.5...HEAD
+[0.7.5]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.4...v0.7.5
 [0.7.4]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.3...v0.7.4
 [0.7.3]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.2...v0.7.3
 [0.7.2]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.1...v0.7.2
