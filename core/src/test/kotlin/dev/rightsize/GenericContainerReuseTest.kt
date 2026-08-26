@@ -393,7 +393,9 @@ class GenericContainerReuseTest {
         c.start()
         assertTrue(c.isRunning)
         assertEquals(3, backend.startAttemptedPorts.size, "start attempted three times before succeeding")
-        // Ports are reallocated per attempt, not reused after a conflict.
+        // Ports are reallocated per attempt and never repeat: conflicted ports stay quarantined
+        // in FreePorts until the retry loop exits, so this distinctness is guaranteed, not an
+        // accident of the OS's ephemeral-port choice.
         assertEquals(backend.startAttemptedPorts.size,
             backend.startAttemptedPorts.map { it.single() }.distinct().size)
         assertEquals(3, backend.created.size, "each attempt recreates the container, same as the ordinary path")

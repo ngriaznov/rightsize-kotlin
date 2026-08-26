@@ -486,6 +486,12 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
      */
     private fun createStartedContainer(net: Network?): SandboxHandle {
         var lastConflict: Exception? = null
+        // Ports that hit a bind conflict stay quarantined (held in FreePorts' issued set, not
+        // returned) until this retry loop exits: releasing them immediately would let the next
+        // attempt legally re-pick the very port that just conflicted, wasting an attempt on a
+        // proven-contended port.
+        val conflicted = mutableListOf<Int>()
+        try {
         repeat(PORT_BIND_ATTEMPTS) {
             allocatePorts()
             var spec = ContainerSpec(
@@ -526,8 +532,13 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
                 runCatching { backend.stop(h) }
                 val removed = runCatching { backend.remove(h) }.isSuccess
                 if (removed) Reaper.afterRemove(h.spec)
+                if (isPortBindConflict(e)) {
+                    conflicted += mappedPorts.values
+                    mappedPorts = emptyMap()
+                    lastConflict = e
+                    return@repeat
+                }
                 releasePorts()
-                if (isPortBindConflict(e)) { lastConflict = e; return@repeat }
                 throw e
             }
         }
@@ -535,6 +546,9 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
             "Could not bind free host ports for ${describe()} after $PORT_BIND_ATTEMPTS attempts " +
                 "— another process kept grabbing the allocated ports first; if this persists, check " +
                 "for a port scanner/leaked process racing the allocator on this host", lastConflict)
+        } finally {
+            conflicted.forEach { FreePorts.release(it) }
+        }
     }
 
     /**
@@ -689,6 +703,11 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
      */
     private fun createReuseFresh(name: String, hash: String, registry: ReuseRegistry) {
         var lastConflict: Exception? = null
+        // Same conflicted-port quarantine as createStartedContainer: a port that just failed to
+        // bind stays out of the allocator until this retry loop exits, so no later attempt can
+        // re-pick it.
+        val conflicted = mutableListOf<Int>()
+        try {
         repeat(PORT_BIND_ATTEMPTS) {
             allocatePorts()
             var spec = ContainerSpec(
@@ -720,8 +739,13 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
             } catch (e: Exception) {
                 runCatching { backend.stop(h) }
                 runCatching { backend.remove(h) }
+                if (isPortBindConflict(e)) {
+                    conflicted += mappedPorts.values
+                    mappedPorts = emptyMap()
+                    lastConflict = e
+                    return@repeat
+                }
                 releasePorts()
-                if (isPortBindConflict(e)) { lastConflict = e; return@repeat }
                 throw e
             }
             handle = h
@@ -746,6 +770,9 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
             "Could not bind free host ports for ${describe()} after $PORT_BIND_ATTEMPTS attempts " +
                 "— another process kept grabbing the allocated ports first; if this persists, check " +
                 "for a port scanner/leaked process racing the allocator on this host", lastConflict)
+        } finally {
+            conflicted.forEach { FreePorts.release(it) }
+        }
     }
 
     /**
