@@ -7,7 +7,12 @@ reaches its first tagged release.
 
 ## [Unreleased]
 
-Nothing yet.
+### Changed
+
+- **The pinned microsandbox release is now 0.6.15** (from 0.6.14). Upstream changes
+  relevant here: host DNS on Windows now routes through the system resolver, file
+  copies on NTFS only copy allocated ranges, and read-only mounts no longer get
+  write-probed. No CLI surface this library drives changed.
 
 ## [0.7.4] - 2026-08-22
 
