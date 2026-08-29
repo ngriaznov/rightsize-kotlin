@@ -75,6 +75,13 @@ class MsbCliBackend private constructor(
      * readiness = name Running in `msb ls --format json`. Workload logs come from `msb logs`,
      * not this process's stdout.
      *
+     * A workload that completes before this backend's poll ever samples Running (e.g. a short
+     * build or script — see [isCleanFastExit]) is not a failed boot: the child still exits 0,
+     * this backend just never observed the in-between Running state. That sandbox is started
+     * and already finished — [Handle.attached] is the child's already-exited [Process], and
+     * `stop`/state-reporting surfaces treat it as not running, same as any other Stopped
+     * sandbox, because it genuinely is one.
+     *
      * A first boot attempt that exits before Running with msb's image-cache-corruption
      * signature (see [isImageCacheCorruption]) is healed by removing the affected image's
      * cache entry and retried exactly once — see [spawnAndAwaitRunning]. The failed attempt
@@ -215,8 +222,9 @@ class MsbCliBackend private constructor(
     /** Polls until [handle] reaches Running, or fails fast if the `msb run` child exits first.
      * An early exit is classified from the child's combined output: the image-cache-corruption
      * signature throws [ImageCacheCorruptionException] (the one failure [spawnAndAwaitRunning]
-     * heals and retries), a host-port bind conflict throws [PortBindConflictException], and
-     * anything else surfaces the raw output. */
+     * heals and retries), a host-port bind conflict throws [PortBindConflictException], a clean
+     * exit 0 that passes [isCleanFastExit]'s post-mortem check returns normally (see that
+     * method's doc), and anything else surfaces the raw output. */
     private fun awaitRunning(handle: Handle, proc: Process, tail: ConcurrentLinkedDeque<String>, drainer: Thread) {
         val deadline = System.currentTimeMillis() + FIRST_RUN_PULL_TIMEOUT_MS
         while (System.currentTimeMillis() < deadline) {
@@ -237,6 +245,7 @@ class MsbCliBackend private constructor(
                     throw SandboxNameCollisionException(
                         "sandbox named ${handle.id} already exists: $output")
                 }
+                if (proc.exitValue() == 0 && isCleanFastExit(handle)) return
                 error("msb run for sandbox ${handle.id} exited (code ${proc.exitValue()}) before reaching " +
                     "Running — check the image entrypoint and `msb run` output below:\n$output")
             }
@@ -246,6 +255,31 @@ class MsbCliBackend private constructor(
         error("Sandbox ${handle.id} did not reach Running within ${FIRST_RUN_PULL_TIMEOUT_MS / 1000}s — this can " +
             "mean a slow image pull, a crash-looping entrypoint, or msb itself being unresponsive; last output:\n" +
             tail.joinToString("\n"))
+    }
+
+    /**
+     * Post-mortem classification for an attached `msb run` child that exited 0 before this
+     * backend's poll loop ever observed [handle] Running. msb 0.6.16 reworked the sandbox
+     * lifecycle so Running is no longer guaranteed to be observable for a workload that
+     * finishes quickly — the old surfacing was itself a race a fast host happened to win, and a
+     * container whose command completes fast (a short build or script) must not fail [start]
+     * just because this backend's poll lost that race.
+     *
+     * Distinguishes that from a genuinely dead boot — msb 0.6.10 through 0.6.13's Windows
+     * agentless-death failures also exited the attached child with code 0, but the guest agent
+     * never came up — by requiring BOTH signals a clean completion leaves behind: [handle]'s
+     * status is `Stopped` in `msb ls --format json`, AND the system log carries the
+     * boot-completion marker the guest agent writes only once it has actually come up (`msb
+     * logs <name> --source system`; see [hasSandboxStartedMarker]). Either signal missing — the
+     * state, most cheaply checked, is looked at first — leaves this a failure, unchanged from
+     * before this classification existed; this method only ever turns a failure into a success,
+     * never the reverse.
+     */
+    private fun isCleanFastExit(handle: Handle): Boolean {
+        val status = MsbLsJson.statusOf(invoke(MsbCommands.ls(), LOGS_TIMEOUT_SEC).stdout, handle.id)
+        if (status != "Stopped") return false
+        val systemLog = invoke(MsbCommands.logsSystem(handle.id), LOGS_TIMEOUT_SEC).stdout
+        return hasSandboxStartedMarker(systemLog)
     }
 
     override fun stop(handle: SandboxHandle) {
@@ -917,6 +951,18 @@ internal class MsbInstallLockException(val output: String) :
  * propagates the failure with both attempts' output.
  */
 internal fun isMsbStateDbError(output: String): Boolean = "error: database error:" in output
+
+/**
+ * True if [output] (`msb logs <name> --source system`'s stdout) carries the boot-completion
+ * marker line msb's guest agent writes only once it has actually come up. This is the second
+ * of the two signals [MsbCliBackend.isCleanFastExit]'s post-mortem classification requires —
+ * state `Stopped` is the first — to tell a workload that ran to completion apart from a
+ * genuinely dead boot: msb 0.6.10 through 0.6.13's Windows agentless-death failures also
+ * exited the attached `msb run` child with code 0, but the guest agent never came up in those,
+ * so this marker was never written. Requiring both signals is what keeps a genuinely dead boot
+ * from being misclassified as a clean fast exit.
+ */
+internal fun hasSandboxStartedMarker(output: String): Boolean = "--- sandbox started ---" in output
 
 /**
  * True if [stderr] (an `msb exec` invocation's stderr) says msb could not reach the guest

@@ -63,4 +63,18 @@ class MsbLsJsonTest {
         val json = """[{"name":"rz-nested","status":"Running","meta":{"nested":"{not a name}"}}]"""
         assertEquals(setOf("rz-nested"), MsbLsJson.runningNames(json))
     }
+
+    // statusOf backs MsbCliBackend's fast-exit post-mortem classification, which needs the
+    // verbatim status (Stopped in particular) rather than just a Running/not-Running bit.
+    @Test fun `statusOf returns the named entry's status verbatim`() {
+        val json = """[{"name":"rz-a","status":"Running"},{"name":"rz-b","status":"Stopped"}]"""
+        assertEquals("Stopped", MsbLsJson.statusOf(json, "rz-b"))
+        assertEquals("Running", MsbLsJson.statusOf(json, "rz-a"))
+    }
+
+    @Test fun `statusOf returns null when the name is absent, or the json is not the documented shape`() {
+        assertNull(MsbLsJson.statusOf("""[{"name":"rz-a","status":"Running"}]""", "rz-nobodyhome"))
+        assertNull(MsbLsJson.statusOf("[]", "rz-a"))
+        assertNull(MsbLsJson.statusOf("not json at all", "rz-a"))
+    }
 }

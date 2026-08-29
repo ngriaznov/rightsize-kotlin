@@ -108,6 +108,8 @@ class MsbCommandsTest {
             MsbCommands.exec("rz-abc-1", listOf("redis-cli", "ping")))
         assertEquals(listOf("logs", "rz-abc-1", "--tail", "1000"), MsbCommands.logs("rz-abc-1"))
         assertEquals(listOf("logs", "rz-abc-1", "-f"), MsbCommands.followLogs("rz-abc-1"))
+        assertEquals(listOf("logs", "rz-abc-1", "--source", "system", "--tail", "1000"),
+            MsbCommands.logsSystem("rz-abc-1"))
         assertEquals(listOf("stop", "rz-abc-1"), MsbCommands.stop("rz-abc-1"))
         assertEquals(listOf("rm", "rz-abc-1"), MsbCommands.rm("rz-abc-1"))
         assertEquals(listOf("ls", "--format", "json"), MsbCommands.ls())   // no `--json` flag on ls

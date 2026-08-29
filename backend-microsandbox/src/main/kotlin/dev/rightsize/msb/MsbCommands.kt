@@ -58,6 +58,12 @@ object MsbCommands {
     fun exec(name: String, cmd: List<String>) = listOf("exec", name, "--") + cmd
     fun execStream(name: String, cmd: List<String>) = listOf("exec", "--stream", name, "--") + cmd
     fun logs(name: String) = listOf("logs", name, "--tail", "1000")
+    /** `msb logs <name> --source system --tail 1000` — the system log, distinct from the
+     * workload's own output [logs] reads. [MsbCliBackend]'s fast-exit post-mortem
+     * classification reads this for the boot-completion marker line the guest agent writes
+     * only once it has actually come up (see [MsbCliBackend.isCleanFastExit]).
+     */
+    fun logsSystem(name: String) = listOf("logs", name, "--source", "system", "--tail", "1000")
     fun followLogs(name: String) = listOf("logs", name, "-f")
     fun stop(name: String) = listOf("stop", name)
     fun rm(name: String) = listOf("rm", name)
@@ -151,6 +157,16 @@ internal object MsbLsJson {
     }.getOrDefault(emptyList()).mapNotNull { entry ->
         entry.name?.takeIf { entry.status == "Running" }
     }.toSet()
+
+    /** The `status` field of the entry named [name], or `null` if no entry has that name
+     * (including when `json` isn't the documented array shape at all). Unlike [runningNames],
+     * which only ever answers "is this name currently Running", this reports the status
+     * verbatim — [MsbCliBackend]'s fast-exit post-mortem classification needs to tell `Stopped`
+     * apart from every other status a completed sandbox could be left in.
+     */
+    fun statusOf(json: String, name: String): String? = runCatching {
+        this.json.decodeFromString<List<LsEntry>>(json)
+    }.getOrDefault(emptyList()).firstOrNull { it.name == name }?.status
 }
 
 /** One entry of `msb snapshot list --format json`'s output — only the fields
