@@ -7,7 +7,13 @@ reaches its first tagged release.
 
 ## [Unreleased]
 
-Nothing yet.
+### Changed
+
+- **The pinned microsandbox release is now 0.6.16** (from 0.6.15). Upstream changes
+  relevant here: network address slots are recycled instead of exhausting after many
+  sandbox creations, single-file mounts are properly isolated, and a failed boot now
+  renders a structured boot error in `msb logs`. No CLI surface this library drives
+  changed.
 
 ## [0.7.5] - 2026-08-26
 

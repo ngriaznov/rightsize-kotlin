@@ -15,7 +15,7 @@ object MsbProvisioner {
      * were broken on Windows (fixed upstream in 0.6.14). Anyone pointing MSB_PATH at their own
      * binary on Windows must still avoid 0.6.10-0.6.13.
      */
-    const val MSB_VERSION = "0.6.15"
+    const val MSB_VERSION = "0.6.16"
 
     private const val CONNECT_TIMEOUT_MS = 10_000
     private const val READ_TIMEOUT_MS = 300_000
