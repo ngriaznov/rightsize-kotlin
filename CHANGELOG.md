@@ -7,7 +7,19 @@ reaches its first tagged release.
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- **The docker backend now resolves a per-OS default daemon endpoint**, not just the Unix
+  domain socket: Windows gets `npipe:////./pipe/docker_engine`, the named pipe Docker
+  Desktop's WSL2 backend serves its API over, while every other OS keeps today's
+  `unix:///var/run/docker.sock`. `DOCKER_HOST` still overrides either default when set. The
+  new `DockerHost.resolve()` seam (`backend-docker`) makes this OS/env-driven choice explicit
+  and unit-testable in this repo, rather than relying only on the identical logic already
+  built into docker-java's `DefaultDockerClientConfig`. The `docker-java-transport-zerodep`
+  transport this backend already depends on shades its own Apache HttpClient5 and already
+  special-cases the `npipe` scheme with a JNA-backed named-pipe socket (`NamedPipeSocket`),
+  and JNA is already pulled in transitively — so no new dependency was needed to light this
+  up on a Windows host running Docker Desktop.
 
 ## [0.7.6] - 2026-08-29
 

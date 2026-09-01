@@ -10,7 +10,9 @@ class DockerBackendProvider : BackendProvider {
     override val priority = 10
 
     override fun isSupported(): Boolean = runCatching {
-        val cfg = DefaultDockerClientConfig.createDefaultConfigBuilder().build()
+        val cfg = DefaultDockerClientConfig.createDefaultConfigBuilder()
+            .withDockerHost(DockerHost.resolve().toString())
+            .build()
         val http = ZerodepDockerHttpClient.Builder()
             .dockerHost(cfg.dockerHost).sslConfig(cfg.sslConfig).build()
         DockerClientImpl.getInstance(cfg, http).pingCmd().exec()

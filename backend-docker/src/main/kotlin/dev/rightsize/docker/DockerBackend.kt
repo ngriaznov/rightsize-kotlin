@@ -66,7 +66,9 @@ class DockerBackend : SandboxBackend {
     }
 
     private val client: DockerClient by lazy {
-        val cfg = DefaultDockerClientConfig.createDefaultConfigBuilder().build()
+        val cfg = DefaultDockerClientConfig.createDefaultConfigBuilder()
+            .withDockerHost(DockerHost.resolve().toString())
+            .build()
         DockerClientImpl.getInstance(
             cfg,
             ZerodepDockerHttpClient.Builder()
