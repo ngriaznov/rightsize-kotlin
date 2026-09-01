@@ -7,6 +7,10 @@ reaches its first tagged release.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.7.7] - 2026-09-01
+
 ### Added
 
 - **The docker backend's per-OS default daemon endpoint is now documented and unit-tested in
@@ -658,7 +662,8 @@ Initial public release.
   exactly once; any other failure, or a second failure after the heal,
   propagates unchanged.
 
-[Unreleased]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.6...HEAD
+[Unreleased]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.7...HEAD
+[0.7.7]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.6...v0.7.7
 [0.7.6]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.5...v0.7.6
 [0.7.5]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.4...v0.7.5
 [0.7.4]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.3...v0.7.4
