@@ -10,9 +10,10 @@ class DockerBackendProvider : BackendProvider {
     override val priority = 10
 
     override fun isSupported(): Boolean = runCatching {
-        val cfg = DefaultDockerClientConfig.createDefaultConfigBuilder()
-            .withDockerHost(DockerHost.resolve().toString())
-            .build()
+        // Deliberately plain: see DockerHost's doc comment and DockerContextResolutionTest for
+        // why forcing a host here (even just to restate the platform default) would silently
+        // defeat docker CLI context resolution and report a reachable daemon unsupported.
+        val cfg = DefaultDockerClientConfig.createDefaultConfigBuilder().build()
         val http = ZerodepDockerHttpClient.Builder()
             .dockerHost(cfg.dockerHost).sslConfig(cfg.sslConfig).build()
         DockerClientImpl.getInstance(cfg, http).pingCmd().exec()

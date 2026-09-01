@@ -66,9 +66,11 @@ class DockerBackend : SandboxBackend {
     }
 
     private val client: DockerClient by lazy {
-        val cfg = DefaultDockerClientConfig.createDefaultConfigBuilder()
-            .withDockerHost(DockerHost.resolve().toString())
-            .build()
+        // Deliberately plain: see DockerHost's doc comment for why forcing a host here (even
+        // just to restate the platform default) would silently defeat docker CLI context
+        // resolution. build() already applies DOCKER_HOST, then the active context, then the
+        // same per-OS default DockerHost documents, in that order, with no help needed here.
+        val cfg = DefaultDockerClientConfig.createDefaultConfigBuilder().build()
         DockerClientImpl.getInstance(
             cfg,
             ZerodepDockerHttpClient.Builder()

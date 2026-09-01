@@ -38,7 +38,7 @@ is the whole story that matters from the outside.
 | `RIGHTSIZE_MSB_SKIP_DOWNLOAD` | `true` = fail with guidance instead of downloading — for air-gapped CI; pair with `MSB_PATH` or a pre-seeded cache. |
 | `RIGHTSIZE_REAPER` | `on` (default) / `sweep` / `off` — controls orphan reaping (a crashed process's leftover sandboxes). See [Orphan Reaping](reaping.md). |
 | `RIGHTSIZE_REUSE` | Exact string `true` or `1` — the environment half of container reuse's double opt-in (a `withReuse()` container still needs this to actually reuse). See [Container Reuse](reuse.md). |
-| `DOCKER_HOST` | Standard docker-java variable. The Docker backend also honors the active docker CLI context (`~/.docker/config.json`) — set this if your daemon isn't at the default `/var/run/docker.sock` (Docker Desktop / Colima / OrbStack on a non-default socket, for instance). On Windows this is not optional: the Docker backend's `zerodep` transport speaks only unix sockets, so `RIGHTSIZE_BACKEND=docker` on native Windows needs a unix-socket-reachable daemon (e.g. the Docker Engine running inside WSL, with `DOCKER_HOST` pointed at its socket) — a Windows named pipe alone will not work. |
+| `DOCKER_HOST` | Standard docker-java variable. The Docker backend also honors the active docker CLI context (`~/.docker/config.json`) — set this if your daemon isn't at the default socket (Docker Desktop / Colima / OrbStack on a non-default socket, for instance). When neither is set, the default is the same one the docker CLI itself uses: `unix:///var/run/docker.sock` everywhere except Windows, and the named pipe `npipe:////./pipe/docker_engine` there — the pipe Docker Desktop's WSL2 backend serves its API over. |
 
 ## `backend-microsandbox` deep-dive
 
@@ -122,6 +122,13 @@ unreachable" error that seems to have started after a dependency bump, and you'r
 using rightsize's Docker backend, this class of bug is now categorically
 ruled out; look elsewhere.
 
+Zerodep isn't unix-only, either: the same transport registers a `npipe` scheme
+backed by a JNA-based named pipe client (`NamedPipeSocket`, using
+`AsynchronousFileChannel` plus a `Kernel32.WaitNamedPipe` retry loop), and JNA is
+already pulled in transitively — so `npipe:////./pipe/docker_engine` (Docker
+Desktop's WSL2 backend serves its API over this pipe) works out of the box on
+Windows, no extra dependency or configuration needed.
+
 ## Backend differences
 
 The two backends are contract-equivalent — the same shared test suite passes against
@@ -168,7 +175,10 @@ timing quirks. Know these before you hit them:
   usable Windows Hypervisor Platform fails immediately naming that precondition,
   exactly as it does today on an Intel Mac or a KVM-less Linux box, rather than
   silently falling back to Docker.
-- **The Docker backend on Windows needs a unix-socket-reachable daemon.** The
-  `zerodep` transport (see below) speaks unix sockets only, so a Docker daemon
-  reachable purely via a Windows named pipe won't work — point `DOCKER_HOST` at a
-  unix-socket endpoint (for example, the Docker Engine running inside WSL).
+- **The Docker backend on Windows defaults to Docker Desktop's named pipe.** With no
+  `DOCKER_HOST` and no active docker CLI context pointing elsewhere, the default is
+  `npipe:////./pipe/docker_engine` — the same pipe Docker Desktop's WSL2 backend
+  serves its API over — since the `zerodep` transport (see below) supports `npipe`
+  natively. A daemon reachable only via a unix socket (Docker Engine running
+  directly inside WSL, say, with no Docker Desktop in front of it) still needs
+  `DOCKER_HOST` pointed at that socket instead.

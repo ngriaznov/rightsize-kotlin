@@ -14,6 +14,17 @@ import java.net.URI
  * given, so [resolve] doesn't change what either platform connects to — it exists so that
  * choice is visible in this repo's own code and unit-testable via [env]/[osName] injection
  * (see [DockerHostTest]) rather than only provable on an actual Windows machine.
+ *
+ * Precisely because docker-java already gets this right on its own, [resolve]'s result must
+ * never be fed into `DefaultDockerClientConfig.Builder.withDockerHost(...)` ahead of `.build()`
+ * in [DockerBackend]/[DockerBackendProvider] — including just to restate this class's own
+ * plain per-OS default. `Builder.build()` only fills `dockerHost` from the active docker CLI
+ * context (`~/.docker/config.json` plus `~/.docker/contexts/meta/<hash>/meta.json` — see
+ * `docs/backends.md`'s `DOCKER_HOST` row) `if (this.dockerHost == null)`; pre-setting it to
+ * anything, even this class's own literal default, silently skips that resolution on every OS,
+ * breaking Colima/OrbStack/Podman/remote-context setups and any Docker Desktop install without
+ * the `/var/run/docker.sock` compatibility symlink. [DockerContextResolutionTest] reproduces
+ * this exact failure against a throwaway `~/.docker`-shaped fixture, with no daemon involved.
  */
 internal object DockerHost {
     const val UNIX_DEFAULT = "unix:///var/run/docker.sock"

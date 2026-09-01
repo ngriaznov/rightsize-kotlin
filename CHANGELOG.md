@@ -9,17 +9,22 @@ reaches its first tagged release.
 
 ### Added
 
-- **The docker backend now resolves a per-OS default daemon endpoint**, not just the Unix
-  domain socket: Windows gets `npipe:////./pipe/docker_engine`, the named pipe Docker
-  Desktop's WSL2 backend serves its API over, while every other OS keeps today's
-  `unix:///var/run/docker.sock`. `DOCKER_HOST` still overrides either default when set. The
-  new `DockerHost.resolve()` seam (`backend-docker`) makes this OS/env-driven choice explicit
-  and unit-testable in this repo, rather than relying only on the identical logic already
-  built into docker-java's `DefaultDockerClientConfig`. The `docker-java-transport-zerodep`
-  transport this backend already depends on shades its own Apache HttpClient5 and already
-  special-cases the `npipe` scheme with a JNA-backed named-pipe socket (`NamedPipeSocket`),
-  and JNA is already pulled in transitively — so no new dependency was needed to light this
-  up on a Windows host running Docker Desktop.
+- **The docker backend's per-OS default daemon endpoint is now documented and unit-tested in
+  this repo**, not just implicit in docker-java's own resolution: Windows gets
+  `npipe:////./pipe/docker_engine`, the named pipe Docker Desktop's WSL2 backend serves its API
+  over, while every other OS keeps `unix:///var/run/docker.sock`. `DOCKER_HOST` still overrides
+  either default when set, and the active docker CLI context (`~/.docker/config.json`) still
+  takes precedence over the plain default the same way it always has. The new
+  `DockerHost.resolve()` seam (`backend-docker`) makes this OS/env-driven choice
+  unit-testable — but is deliberately never fed back into `DefaultDockerClientConfig.Builder`
+  ahead of `build()`, since doing so (an earlier draft of this change did exactly that) silently
+  defeats context resolution on every OS, not just where `DOCKER_HOST` is set; see
+  `DockerContextResolutionTest` for the reproduction and `DockerHost`'s doc comment for why. The
+  `docker-java-transport-zerodep` transport this backend already depends on already special-cases
+  the `npipe` scheme with a JNA-backed named-pipe socket (`NamedPipeSocket`), and JNA is already
+  pulled in transitively — so no new dependency was needed, and no behavior actually changed on
+  either platform; `docs/backends.md` is corrected to match (it previously and incorrectly said
+  the zerodep transport speaks unix sockets only).
 
 ## [0.7.6] - 2026-08-29
 
