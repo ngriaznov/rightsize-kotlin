@@ -24,7 +24,13 @@ reaches its first tagged release.
   the `npipe` scheme with a JNA-backed named-pipe socket (`NamedPipeSocket`), and JNA is already
   pulled in transitively — so no new dependency was needed, and no behavior actually changed on
   either platform; `docs/backends.md` is corrected to match (it previously and incorrectly said
-  the zerodep transport speaks unix sockets only).
+  the zerodep transport speaks unix sockets only). `DockerBackendProvider.isSupported()` now
+  also requires the daemon's `GET /version` to report a Linux OS, not just that it's reachable,
+  so a Windows-containers dockerd (which answers a plain ping fine but can't run this backend's
+  Linux images) is correctly reported unsupported instead of picked and then failing at boot,
+  and that `GET /version` query itself now carries the same short, bounded timeout `DockerBackend`
+  already uses so a daemon that accepts a connection but stalls before answering can't hang
+  detection indefinitely.
 
 ## [0.7.6] - 2026-08-29
 
