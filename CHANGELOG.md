@@ -7,7 +7,13 @@ reaches its first tagged release.
 
 ## [Unreleased]
 
-Nothing yet.
+### Changed
+
+- **The pinned microsandbox release is now 0.6.17** (from 0.6.16). Upstream changes
+  relevant here: outbound SOCKS4/SOCKS5 proxy support (new, additive `--proxy` flags
+  this library does not yet drive), a fix preserving the released order of state-db
+  migrations across upgrades, and a centralization of sandbox CLI option parsing. No
+  CLI surface this library drives changed.
 
 ## [0.7.7] - 2026-09-01
 
