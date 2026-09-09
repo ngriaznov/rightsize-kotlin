@@ -7,7 +7,11 @@ reaches its first tagged release.
 
 ## [Unreleased]
 
-Nothing yet.
+### Changed
+
+- **The pinned microsandbox release is now 0.6.18** (from 0.6.17). Upstream changes
+  are release-pipeline fixes plus incremental network-stack work (policy, secrets,
+  proxy internals). No CLI surface this library drives changed.
 
 ## [0.7.8] - 2026-09-04
 
