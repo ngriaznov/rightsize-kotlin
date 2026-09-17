@@ -42,8 +42,10 @@ data class ContainerSpec(
     /**
      * Set by `GenericContainer.fromCheckpoint` to the source [Checkpoint.ref] — docker ignores
      * it (the ref already IS `image`, so the normal create path just works); msb boots via
-     * `msb run --from-snapshot <checkpointRef>` instead of its normal image boot when this is set,
-     * keeping every other flag (name, ports, env, memory) identical. Never part of reuse
+     * `msb restore <checkpointRef> --name <name> --disk-only` instead of its normal image boot
+     * when this is set, keeping name/ports/memory identical — but NOT env or command, which
+     * `msb restore` has no flag for at all (see `MsbCommands.restore`'s doc); the disk-only
+     * restore replays the snapshot's own captured configuration instead. Never part of reuse
      * identity (see `dev.rightsize.core.reuse.ReuseFromCheckpointConflictException`) — reuse and
      * `fromCheckpoint` are not a supported combination.
      */
@@ -183,8 +185,8 @@ data class CheckpointSpec(
  * (`<rightsize cache dir>/checkpoints/rz-ckpt-<12-hex>`) for an unnamed checkpoint (random per
  * call), or the same shapes with a caller-chosen name in place of the hex
  * (`rightsize/checkpoint:<name>` / `<...>/checkpoints/rz-ckpt-<name>`) for
- * `GenericContainer.checkpoint(name)`. The msb path is restored via `--from-snapshot <path>` and
- * removed via `msb snapshot rm <basename>` — msb keys `snapshot rm`/`inspect` on the basename
+ * `GenericContainer.checkpoint(name)`. The msb path is restored via `msb restore <path> --name
+ * <name> --disk-only` and removed via `msb snapshot rm <basename>` — msb keys `snapshot rm`/`inspect` on the basename
  * alone even for a path-ref artifact. This is a filesystem capture, not a memory snapshot — a
  * restored container's processes restart from scratch. Restoring under a different active
  * backend than the one that created it throws [CheckpointBackendMismatchException] before any
@@ -296,6 +298,22 @@ class CheckpointBackendMismatchException(creatorBackend: String, activeBackend: 
     "This checkpoint was created by the '$creatorBackend' backend, but the active backend is " +
         "'$activeBackend' — set RIGHTSIZE_BACKEND=$creatorBackend to restore it, or call " +
         "checkpoint() again under '$activeBackend' to create one it can restore")
+
+/**
+ * Thrown by `GenericContainer.fromCheckpoint(cp).start()` when `withEnv`/`withCommand`/
+ * `removeEnv` were used, after `fromCheckpoint`, to change env or command away from what
+ * [Checkpoint.spec] captured — and the active backend's
+ * [BackendCapabilities.checkpointRestoreOverridable] is `false`. Raised before any backend
+ * call, same as [CheckpointBackendMismatchException]; re-supplying the SAME env/command
+ * `fromCheckpoint` already pre-populated from [Checkpoint.spec] never throws this, whatever the
+ * backend — only a genuine divergence does. See [BackendCapabilities.checkpointRestoreOverridable]'s
+ * doc for why microsandbox's disk-only restore can't honor an override at all.
+ */
+class CheckpointRestoreOverrideUnsupportedException(backend: String) : RuntimeException(
+    "This checkpoint would restore under the '$backend' backend, which cannot override env or " +
+        "command on restore — its restore primitive always replays the snapshot's own captured " +
+        "configuration. Remove the withEnv()/withCommand()/removeEnv() calls made after " +
+        "fromCheckpoint(), or capture a new checkpoint with the env/command you want restored.")
 
 /**
  * Thrown by `GenericContainer.copyFileToContainer`/`copyContentToContainer`/

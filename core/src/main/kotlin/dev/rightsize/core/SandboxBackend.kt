@@ -47,6 +47,21 @@ data class BackendCapabilities(
      * to `false`, the safer assumption for a backend that hasn't declared it.
      */
     val checkpointRestartsWorkload: Boolean = false,
+    /**
+     * True when restoring a checkpoint can run with env/command DIFFERENT from what was
+     * captured — Docker: `true` (a restored container just re-runs the committed image, which
+     * takes `-e`/a command override same as any other `docker run`); microsandbox: `false`,
+     * since `msb restore`'s disk-only mode (this backend's only restore mode — see
+     * `MsbCommands.restore`'s doc) has no CLI flag for either: it always replays the snapshot's
+     * own captured configuration verbatim. `GenericContainer.fromCheckpoint(cp).start()` throws
+     * [dev.rightsize.core.CheckpointRestoreOverrideUnsupportedException] before any backend call
+     * when this is `false` and the caller's env/command genuinely diverges from
+     * [dev.rightsize.core.Checkpoint.spec]'s own (extra `withEnv`/`withCommand`/`removeEnv`
+     * calls after `fromCheckpoint`) — re-passing back the SAME captured values is always fine,
+     * restore-flag support or not. Defaults to `true`, the permissive assumption for a backend
+     * that hasn't declared it, matching every other [BackendCapabilities] default here.
+     */
+    val checkpointRestoreOverridable: Boolean = true,
 )
 
 /**

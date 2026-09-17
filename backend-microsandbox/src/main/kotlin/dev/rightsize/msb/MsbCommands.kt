@@ -45,14 +45,57 @@ object MsbCommands {
             add("--mount-file")
             add("${it.hostPath}:${it.guestPath}:${if (it.readOnly) "ro" else "rw"},nodev")
         }
-        // --from-snapshot is mutually exclusive with the image arg (msb run --help): a checkpointRef
-        // boots from a disk snapshot instead of the ordinary image (see docs/checkpoints.md).
-        // Still no -d, same as every other boot this backend does — detached mode never starts
-        // the image's own ENTRYPOINT/CMD (see this file's header comment), and that's just as
-        // true of a snapshot-booted sandbox as an ordinary one.
-        val checkpointRef = spec.checkpointRef
-        if (checkpointRef != null) { add("--from-snapshot"); add(checkpointRef) } else add(spec.image)
+        add(spec.image)
         spec.command?.let { add("--"); addAll(it) }   // null => image default ENTRYPOINT/CMD runs
+    }
+
+    /**
+     * `msb restore <ref> --name <name> --disk-only [-m <mem>M] [-p host:guest]...` — msb 0.7's
+     * dedicated restore command, the sole survivor of what `run --from-snapshot` used to do. msb
+     * 0.7 removed `--from-snapshot` from `run` outright: clap now rejects it as an unrecognized
+     * flag, and `msb run` itself bails "snapshot sources require `msb restore SNAPSHOT --name
+     * NAME`" for a snapshot-shaped source (confirmed against msb's own source at tag v0.7.1 —
+     * crates/cli/lib/commands/{run,restore}.rs). [MsbCliBackend] routes here instead of [run]
+     * whenever [spec]'s `checkpointRef` is set — both [MsbCliBackend.createCheckpoint]'s own
+     * re-boot and a `GenericContainer.fromCheckpoint(cp).start()` call reach this the same way.
+     *
+     * `--disk-only` cold-boots only the captured disk, without resuming captured RAM/processes —
+     * the ONE restore mode matching what this backend's checkpoint has always meant (a
+     * filesystem snapshot, not a memory snapshot — see docs/checkpoints.md): the default (no
+     * `--disk-only`) is instead a FULL restore that resumes captured RAM/processes and requires
+     * the captured cpu/memory geometry, which this backend never records. Never omitted.
+     *
+     * `restore` has no `-e`/`--env` flag AND no trailing command at all — unlike `RunArgs`,
+     * `RestoreArgs` (crates/cli/lib/commands/restore.rs) declares neither. A disk-only restore
+     * replays the sandbox's captured configuration (its own baked env and boot command) exactly
+     * as the snapshot recorded it, with no CLI override for either — so [spec.env]/[spec.command]
+     * are never emitted here. For [MsbCliBackend.createCheckpoint]'s own re-boot that
+     * configuration IS [spec]'s own (the container's unchanged env/command, captured into the
+     * snapshot moments earlier by the very same [spec]), so not re-passing it changes nothing
+     * observable. A caller reaching this with a GENUINELY different env/command (via
+     * `GenericContainer.fromCheckpoint(cp).withEnv(...)`/`withCommand(...)`) never gets here at
+     * all — that's rejected earlier, before any backend call, by
+     * [dev.rightsize.core.CheckpointRestoreOverrideUnsupportedException].
+     *
+     * [spec.mounts] and [spec.diskLimitMb]/[spec.tmpfsRootMb]/[spec.networkDisabled] are likewise
+     * never emitted: `restore`'s own resource/control flags (`--volume`, network-policy flags)
+     * don't line up with `run`'s (`--mount-file`, `--root-disk`, `--net private`), and neither
+     * this backend's tests nor `docs/checkpoints.md` promise either survives a restore today — a
+     * `tmpfsRootMb` container is refused before capture even happens (see
+     * [MsbCliBackend.createCheckpoint]'s `TmpfsRootCheckpointException` guard), and mounts are
+     * never part of `CheckpointSpec` in the first place (see its own doc comment: the checkpoint's
+     * filesystem already carries whatever a mount would have copied in). [spec.ports] and
+     * [spec.memoryLimitMb] DO carry over — `RestoreResourceArgs`/`RestoreControlArgs` both take
+     * `-p`/`-m` for exactly this, sizing the fresh destination sandbox rather than describing
+     * what was captured.
+     */
+    fun restore(spec: ContainerSpec): List<String> = buildList {
+        val ref = requireNotNull(spec.checkpointRef) { "MsbCommands.restore requires spec.checkpointRef to be set" }
+        add("restore"); add(ref)
+        add("--name"); add(spec.name)
+        add("--disk-only")
+        spec.memoryLimitMb?.let { add("-m"); add("${it}M") }
+        spec.ports.forEach { add("-p"); add("${it.hostPort}:${it.guestPort}") }
     }
 
     fun exec(name: String, cmd: List<String>) = listOf("exec", name, "--") + cmd
@@ -189,7 +232,7 @@ private data class SnapshotEntry(
  * [MsbCliBackend.importCheckpoint]). The FULL `sha256:<64hex>` `digest` field is deliberately
  * never surfaced here: msb does not resolve it as a snapshot ref (`msb snapshot inspect
  * sha256:<full>` fails "snapshot not found", treating it as a literal path) — only the
- * digest-dir name (`sha256-<16hex>`) does, for `inspect`, `rm`, and `run --from-snapshot` alike.
+ * digest-dir name (`sha256-<16hex>`) does, for `inspect`, `rm`, and `restore` alike.
  *
  * PIN: keep this in sync with `msb snapshot list --format json`'s actual shape if msb changes it
  * — the msb `sandbox-it` lane is the only guard on that short of a live-CLI shape drift, same as

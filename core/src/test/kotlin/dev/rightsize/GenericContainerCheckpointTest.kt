@@ -3,6 +3,7 @@ package dev.rightsize
 import dev.rightsize.core.BackendCapabilities
 import dev.rightsize.core.Checkpoint
 import dev.rightsize.core.CheckpointBackendMismatchException
+import dev.rightsize.core.CheckpointRestoreOverrideUnsupportedException
 import dev.rightsize.core.CheckpointSpec
 import dev.rightsize.core.CheckpointUnsupportedException
 import dev.rightsize.core.ContainerSpec
@@ -39,10 +40,12 @@ private class CountingWait : WaitStrategy {
 private open class CheckpointFakeBackend(
     checkpointSupported: Boolean = true,
     checkpointRestartsWorkload: Boolean = false,
+    checkpointRestoreOverridable: Boolean = true,
 ) : FakeBackend() {
     override val capabilities = BackendCapabilities(
         hardwareIsolated = false, checkpoint = checkpointSupported,
-        checkpointRestartsWorkload = checkpointRestartsWorkload)
+        checkpointRestartsWorkload = checkpointRestartsWorkload,
+        checkpointRestoreOverridable = checkpointRestoreOverridable)
     val committed = mutableListOf<Pair<String, String>>()
     val removedRefs = mutableListOf<String>()
     var failCreateCheckpoint = false
@@ -269,6 +272,71 @@ class GenericContainerCheckpointTest {
             assertEquals(mapOf("A" to "1", "B" to "2"), spec.env)
             assertEquals(1024L, spec.memoryLimitMb)
         } finally { restored.stop() }
+    }
+
+    // --- checkpointRestoreOverridable gates env/command override at restore (msb: false) ---
+
+    @Test fun `fromCheckpoint re-supplying the same captured env and command never throws, even when overrides are unsupported`() {
+        val backend = CheckpointFakeBackend(checkpointRestoreOverridable = false)
+        val cp = Checkpoint(
+            ref = "rz-ckpt-0123456789ab", backend = "fake",
+            spec = CheckpointSpec(env = mapOf("A" to "1"), command = listOf("sleep", "120"), exposedPorts = emptyList(), memoryLimitMb = null),
+        )
+        val restored = GenericContainer.fromCheckpoint(cp).withBackend(backend).waitingFor(CheckpointReady)
+        restored.start()
+        try {
+            val spec = backend.created.single()
+            assertEquals(mapOf("A" to "1"), spec.env)
+            assertEquals(listOf("sleep", "120"), spec.command)
+        } finally { restored.stop() }
+    }
+
+    @Test fun `fromCheckpoint with an extra withEnv throws before any backend call when the backend cannot honor a restore override`() {
+        val backend = CheckpointFakeBackend(checkpointRestoreOverridable = false)
+        val cp = Checkpoint(
+            ref = "rz-ckpt-0123456789ab", backend = "fake",
+            spec = CheckpointSpec(env = mapOf("A" to "1"), command = null, exposedPorts = emptyList(), memoryLimitMb = null),
+        )
+        val restored = GenericContainer.fromCheckpoint(cp).withBackend(backend).waitingFor(CheckpointReady)
+            .withEnv("B", "2")
+        val e = assertThrows(CheckpointRestoreOverrideUnsupportedException::class.java) { restored.start() }
+        assertTrue(backend.created.isEmpty(), "no create call when a restore-time env override is unsupported")
+        assertTrue(e.message!!.contains("fake"), "message should name the active backend: ${e.message}")
+    }
+
+    @Test fun `fromCheckpoint with a different withCommand throws before any backend call when the backend cannot honor a restore override`() {
+        val backend = CheckpointFakeBackend(checkpointRestoreOverridable = false)
+        val cp = Checkpoint(
+            ref = "rz-ckpt-0123456789ab", backend = "fake",
+            spec = CheckpointSpec(env = emptyMap(), command = listOf("sleep", "120"), exposedPorts = emptyList(), memoryLimitMb = null),
+        )
+        val restored = GenericContainer.fromCheckpoint(cp).withBackend(backend).waitingFor(CheckpointReady)
+            .withCommand("sleep", "999")
+        assertThrows(CheckpointRestoreOverrideUnsupportedException::class.java) { restored.start() }
+        assertTrue(backend.created.isEmpty())
+    }
+
+    @Test fun `fromCheckpoint env or command override is fine when the backend declares it overridable`() {
+        // checkpointRestoreOverridable defaults to true (Docker's shape) — same override as the
+        // unsupported-backend tests above must NOT throw here.
+        val backend = CheckpointFakeBackend(checkpointRestoreOverridable = true)
+        val cp = Checkpoint(
+            ref = "rightsize/checkpoint:0123456789ab", backend = "fake",
+            spec = CheckpointSpec(env = mapOf("A" to "1"), command = null, exposedPorts = emptyList(), memoryLimitMb = null),
+        )
+        val restored = GenericContainer.fromCheckpoint(cp).withBackend(backend).waitingFor(CheckpointReady)
+            .withEnv("B", "2")
+        restored.start()
+        try {
+            assertEquals(mapOf("A" to "1", "B" to "2"), backend.created.single().env)
+        } finally { restored.stop() }
+    }
+
+    @Test fun `a plain (non-checkpoint) container never trips the restore-override guard regardless of capability`() {
+        val backend = CheckpointFakeBackend(checkpointRestoreOverridable = false)
+        val c = GenericContainer("alpine:3.19").withBackend(backend).waitingFor(CheckpointReady).withEnv("X", "1")
+        c.start()
+        try { assertTrue(c.isRunning) } finally { c.stop() }
     }
 
     @Test fun `a restored container is ordinary - fresh name, normal reaping ledger entry, normal stop`() {

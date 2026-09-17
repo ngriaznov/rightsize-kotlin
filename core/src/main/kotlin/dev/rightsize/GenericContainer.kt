@@ -55,10 +55,16 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
     private var reuseCacheDirOverride: Path? = null
     private var checkpointCacheDirOverride: Path? = null
     private var requireIsolationRequested = false
-    // Both set together by fromCheckpoint; null on every ordinary container. See
+    // All four set together by fromCheckpoint; null/empty on every ordinary container. See
     // withCheckpointRef's doc for what each drives.
     private var checkpointRef: String? = null
     private var checkpointCreatorBackend: String? = null
+    // The checkpoint's OWN env/command, as fromCheckpoint pre-populated them — the baseline
+    // start() diffs the (possibly since-overridden) env/command against, to tell "the caller
+    // never touched these" from "the caller genuinely wants something different restored" (see
+    // CheckpointRestoreOverrideUnsupportedException's doc).
+    private var checkpointCapturedEnv: Map<String, String> = emptyMap()
+    private var checkpointCapturedCommand: List<String>? = null
     // The links installed by linkToRunningSiblings at start() — empty when this container never
     // joined a Network or joined one with no running siblings yet. checkpoint() replays these
     // after a workload-restarting backend's cycle, since the reboot tears the emulated tunnels
@@ -147,12 +153,20 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
     fun withRequireIsolation(): SELF { requireIsolationRequested = true; return this as SELF }
     internal fun withBackend(b: SandboxBackend): SELF { backendOverride = b; return this as SELF }
     /** Internal factory seam: `fromCheckpoint` sets [checkpointRef] (msb boots via
-     * `msb run --from-snapshot <ref>` instead of its normal image path — see `MsbCommands.run`) and
-     * [checkpointCreatorBackend] (checked at [start], before any backend call — see
-     * [CheckpointBackendMismatchException]). Not a public `withX` builder: restoring from a
-     * checkpoint is only ever reached through [fromCheckpoint] itself. */
-    internal fun withCheckpointRef(ref: String, creatorBackend: String): SELF {
-        checkpointRef = ref; checkpointCreatorBackend = creatorBackend; return this as SELF
+     * `msb restore <ref> --name <name> --disk-only` instead of its normal image path — see
+     * `MsbCommands.restore`) and [checkpointCreatorBackend] (checked at [start], before any
+     * backend call — see [CheckpointBackendMismatchException]). [capturedEnv]/[capturedCommand]
+     * are the checkpoint's own env/command, BEFORE `fromCheckpoint` pre-populates this
+     * container's `env`/`command` from them — [start]'s own override guard diffs against these
+     * (see [CheckpointRestoreOverrideUnsupportedException]). Not a public `withX` builder:
+     * restoring from a checkpoint is only ever reached through [fromCheckpoint] itself. */
+    internal fun withCheckpointRef(
+        ref: String, creatorBackend: String,
+        capturedEnv: Map<String, String> = emptyMap(), capturedCommand: List<String>? = null,
+    ): SELF {
+        checkpointRef = ref; checkpointCreatorBackend = creatorBackend
+        checkpointCapturedEnv = capturedEnv; checkpointCapturedCommand = capturedCommand
+        return this as SELF
     }
     /** Internal test seam: injects the environment [withReuse]'s env half is read from, instead
      * of the real `System.getenv()`. */
@@ -259,8 +273,9 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
      * boots a fresh container whose filesystem starts where this one left off, but its processes
      * restart from scratch (see docs/checkpoints.md). [Checkpoint.ref] is backend-shaped (a
      * docker image tag or an ABSOLUTE msb snapshot artifact path, under [mintCheckpointRef]'s own
-     * checkpoint cache dir — restored via `--from-snapshot <path>`, removed via `msb snapshot rm
-     * <basename>`); with [name] omitted (the default) it's random per call and purely in-process
+     * checkpoint cache dir — restored via `msb restore <path> --name <name> --disk-only`,
+     * removed via `msb snapshot rm <basename>`); with [name] omitted (the default) it's random
+     * per call and purely in-process
      * — nothing is written anywhere, exactly today's behavior.
      *
      * Passing [name] instead makes the checkpoint DURABLE and rediscoverable in any later
@@ -399,6 +414,16 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
             if (!backend.name.equals(creator, ignoreCase = true)) {
                 throw CheckpointBackendMismatchException(creator, backend.name)
             }
+        }
+        // Same placement again: a backend that can't honor a restore-time env/command override
+        // (capabilities.checkpointRestoreOverridable = false, e.g. msb — see
+        // CheckpointRestoreOverrideUnsupportedException's doc) must reject a GENUINE divergence
+        // from what fromCheckpoint captured before ever reaching that backend, not silently boot
+        // with the wrong env/command. Re-supplying the same values fromCheckpoint already seeded
+        // (the ordinary case — no extra withEnv/withCommand/removeEnv calls) never trips this.
+        if (checkpointRef != null && !backend.capabilities.checkpointRestoreOverridable &&
+            (env.toMap() != checkpointCapturedEnv || command != checkpointCapturedCommand)) {
+            throw CheckpointRestoreOverrideUnsupportedException(backend.name)
         }
         // Same placement again: pure spec conflicts, none of them need a backend to detect, so
         // none of them should wait for one. Re-checked against the FINAL spec (after
@@ -818,15 +843,21 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
         /**
          * Builds a normal container from [checkpoint]'s ref and the source container's spec
          * defaults (env, command, exposed ports, memory limit) — the usual `withX` builders
-         * still apply afterward, so a caller can override any of these (e.g. a different wait
-         * strategy) before calling `start()`. The result is an ordinary container in every
-         * respect: fresh host ports, normal reaping ledger entry, normal stop. Nothing about it
-         * is "special" once started, except that [dev.rightsize.core.SandboxBackend.name] must
-         * match [Checkpoint.backend] at `start()` (see [CheckpointBackendMismatchException]).
-         * See docs/checkpoints.md.
+         * still apply afterward, so a caller can override exposed ports, memory limit, or the
+         * wait strategy freely before calling `start()`. Overriding env or command (`withEnv`/
+         * `withCommand`/`removeEnv`) instead of just re-stating what [checkpoint] already
+         * captured works on a backend whose `capabilities.checkpointRestoreOverridable` is
+         * `true` (Docker) but throws [CheckpointRestoreOverrideUnsupportedException] at
+         * `start()` on one where it's `false` (microsandbox — its disk-only restore has no
+         * CLI-level way to honor an override at all, see `MsbCommands.restore`'s doc). The
+         * result is otherwise an ordinary container in every respect: fresh host ports, normal
+         * reaping ledger entry, normal stop. Nothing about it is "special" once started, except
+         * that [dev.rightsize.core.SandboxBackend.name] must match [Checkpoint.backend] at
+         * `start()` (see [CheckpointBackendMismatchException]). See docs/checkpoints.md.
          */
         fun fromCheckpoint(checkpoint: Checkpoint): GenericContainer<*> {
-            val c = invoke(checkpoint.ref).withCheckpointRef(checkpoint.ref, checkpoint.backend)
+            val c = invoke(checkpoint.ref).withCheckpointRef(
+                checkpoint.ref, checkpoint.backend, checkpoint.spec.env, checkpoint.spec.command)
             checkpoint.spec.env.forEach { (k, v) -> c.withEnv(k, v) }
             checkpoint.spec.command?.let { c.withCommand(*it.toTypedArray()) }
             if (checkpoint.spec.exposedPorts.isNotEmpty()) {

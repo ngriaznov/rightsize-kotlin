@@ -43,16 +43,53 @@ class MsbCommandsTest {
         assertEquals("redis:8.6-alpine", cmd.last())   // no trailing `--`: attached mode runs the image default
     }
 
-    // --from-snapshot replaces the image arg entirely when checkpointRef is set (mutually exclusive
-    // per `msb run --help`) — still no -d, same as every other boot this backend does.
-    @Test fun `run command uses --from-snapshot instead of the image arg when checkpointRef is set`() {
+    // A checkpointRef-carrying spec is never fed to `run` in practice — MsbCliBackend routes it
+    // to MsbCommands.restore instead (msb 0.7 removed `run --from-snapshot` outright) — but `run`
+    // itself stays pure and simply ignores checkpointRef, always emitting the ordinary image arg.
+    @Test fun `run command ignores checkpointRef and always emits the ordinary image arg`() {
         val cmd = MsbCommands.run(spec.copy(checkpointRef = "rz-ckpt-0123456789ab"))
         assertEquals(listOf("run", "--name", "rz-abc-1",
             "-p", "12345:6379", "-e", "A=1",
             "--mount-file", "/tmp/f.conf:/etc/f.conf:rw,nodev",
-            "--from-snapshot", "rz-ckpt-0123456789ab", "--", "redis-server", "--port", "6379"), cmd)
-        assertFalse(cmd.contains("redis:8.6-alpine"), "the ordinary image arg must not appear alongside --from-snapshot")
+            "redis:8.6-alpine", "--", "redis-server", "--port", "6379"), cmd)
+        assertFalse(cmd.contains("--from-snapshot"), "msb 0.7 rejects --from-snapshot outright — run must never emit it")
         assertFalse(cmd.contains("-d"))
+    }
+
+    // --- MsbCommands.restore: msb 0.7's dedicated restore command ---
+
+    @Test fun `restore command carries the ref, name, --disk-only, memory, and ports - never env, command, or mounts`() {
+        val cmd = MsbCommands.restore(spec.copy(
+            checkpointRef = "rz-ckpt-0123456789ab", memoryLimitMb = 1024))
+        assertEquals(listOf("restore", "rz-ckpt-0123456789ab", "--name", "rz-abc-1",
+            "--disk-only", "-m", "1024M", "-p", "12345:6379"), cmd)
+        assertFalse(cmd.contains("-e"), "restore has no -e/--env flag at all")
+        assertFalse(cmd.contains("A=1"))
+        assertFalse(cmd.contains("--"), "restore has no trailing-command flag at all")
+        assertFalse(cmd.contains("redis-server"))
+        assertFalse(cmd.contains("--mount-file"), "restore has no --mount-file equivalent")
+        assertFalse(cmd.contains("redis:8.6-alpine"), "the ordinary image arg must not appear on a restore")
+    }
+
+    @Test fun `restore command omits -m when memoryLimitMb is null`() {
+        val cmd = MsbCommands.restore(spec.copy(checkpointRef = "rz-ckpt-0123456789ab", memoryLimitMb = null))
+        assertEquals(listOf("restore", "rz-ckpt-0123456789ab", "--name", "rz-abc-1", "--disk-only",
+            "-p", "12345:6379"), cmd)
+    }
+
+    @Test fun `restore command omits -p when there are no ports`() {
+        val cmd = MsbCommands.restore(spec.copy(checkpointRef = "rz-ckpt-0123456789ab", ports = emptyList()))
+        assertEquals(listOf("restore", "rz-ckpt-0123456789ab", "--name", "rz-abc-1", "--disk-only"), cmd)
+    }
+
+    @Test fun `restore command always emits --disk-only`() {
+        assertTrue(MsbCommands.restore(spec.copy(checkpointRef = "rz-ckpt-0123456789ab")).contains("--disk-only"))
+    }
+
+    @Test fun `restore throws when checkpointRef is not set`() {
+        assertThrows(IllegalArgumentException::class.java) {
+            MsbCommands.restore(spec.copy(checkpointRef = null))
+        }
     }
 
     @Test fun `run command includes -m when memoryLimitMb is set, absent when null`() {

@@ -12,7 +12,7 @@ import java.nio.file.Path
 
 /**
  * Fake-`msb`-binary unit coverage for [MsbCliBackend.createCheckpoint] (see docs/checkpoints.md)
- * — the stop -> snapshot create -> rm -> re-boot-from-snapshot cycle, and its two typed-failure
+ * — the stop -> snapshot create -> rm -> msb-restore-from-snapshot cycle, and its two typed-failure
  * paths, driven entirely against a local stub script rather than a real msb binary or sandbox
  * (same pattern as [MsbCliBackendTest]'s `fakeMsbLifecycle`). POSIX-only; the msb-windows CI
  * lane's own `sandbox-it` integration test is what exercises this against the real binary on
@@ -21,14 +21,14 @@ import java.nio.file.Path
 class MsbCheckpointTest {
 
     /**
-     * Extends the lifecycle fake with `snapshot create`/`rm`/a `--from-snapshot`-flagged `run` (the
-     * re-boot): `run`/`ls`/`stop` behave exactly as [MsbCliBackendTest]'s own fake; `rm` is
-     * always a no-op success (its own failure is not one of [MsbCliBackend.createCheckpoint]'s
-     * two typed-failure shapes); `snapshot create` exits non-zero when [snapshotFailFlag] exists;
-     * a `run` invocation carrying `--from-snapshot` (the re-boot, as opposed to the initial ordinary
-     * boot) exits non-zero when [rebootFailFlag] exists, otherwise it recreates [marker] (so the
-     * sandbox reports Running again) exactly like an ordinary boot. Every invocation's full argv
-     * is appended to [callLog], one line per call, so the tests below can assert on the order and
+     * Extends the lifecycle fake with `snapshot create`/`rm`/a `restore --disk-only` re-boot:
+     * `run`/`ls`/`stop` behave exactly as [MsbCliBackendTest]'s own fake; `rm` is always a no-op
+     * success (its own failure is not one of [MsbCliBackend.createCheckpoint]'s two
+     * typed-failure shapes); `snapshot create` exits non-zero when [snapshotFailFlag] exists; a
+     * `restore` invocation (the re-boot, as opposed to the initial ordinary `run` boot) exits
+     * non-zero when [rebootFailFlag] exists, otherwise it recreates [marker] (so the sandbox
+     * reports Running again) exactly like an ordinary boot. Every invocation's full argv is
+     * appended to [callLog], one line per call, so the tests below can assert on the order and
      * shape of the commands [createCheckpoint] actually drives instead of re-implementing msb's
      * own CLI.
      */
@@ -48,11 +48,23 @@ class MsbCheckpointTest {
             |shift
             |case "${'$'}cmd" in
             |  run)
-            |    name=""; snapshot=""
+            |    name=""
             |    while [ "${'$'}#" -gt 0 ]; do
             |      case "${'$'}1" in
             |        --name) name="${'$'}2"; shift 2 ;;
-            |        --from-snapshot) snapshot="${'$'}2"; shift 2 ;;
+            |        *) shift ;;
+            |      esac
+            |    done
+            |    echo "${'$'}name" > "$marker"
+            |    while [ -f "$marker" ]; do sleep 0.05; done
+            |    exit 0
+            |    ;;
+            |  restore)
+            |    snapshot="${'$'}1"; shift
+            |    name=""
+            |    while [ "${'$'}#" -gt 0 ]; do
+            |      case "${'$'}1" in
+            |        --name) name="${'$'}2"; shift 2 ;;
             |        *) shift ;;
             |      esac
             |    done
@@ -95,7 +107,7 @@ class MsbCheckpointTest {
     private fun nonPollingCalls(callLog: Path): List<String> =
         Files.readAllLines(callLog).filterNot { it == "ls --format json" }
 
-    @Test fun `createCheckpoint drives exactly stop, snapshot create, rm, then a --from-snapshot re-boot under the same name-ports-env`() {
+    @Test fun `createCheckpoint drives exactly stop, snapshot create, rm, then an msb restore --disk-only re-boot keeping ports but dropping env`() {
         assumeFalse(Platform.current()?.isWindows == true, "POSIX-only fake binary; see doc comment")
         val marker = Files.createTempFile("rz-marker-", "").also { Files.deleteIfExists(it) }
         val callLog = Files.createTempFile("rz-calllog-", "")
@@ -126,11 +138,13 @@ class MsbCheckpointTest {
             ), calls.take(3))
             assertEquals(4, calls.size, "no extra commands beyond stop/snapshot-create/rm/run: $calls")
             val reboot = calls[3]
-            assertTrue(reboot.startsWith("run --name rz-ckpt-test"), "unexpected re-boot argv: $reboot")
-            assertTrue("--from-snapshot rz-ckpt-0123456789ab" in reboot, "re-boot must run from the new checkpoint: $reboot")
+            assertTrue(reboot.startsWith("restore rz-ckpt-0123456789ab --name rz-ckpt-test"),
+                "unexpected re-boot argv: $reboot")
+            assertTrue("--disk-only" in reboot, "re-boot must cold-boot the disk, not a full RAM/process resume: $reboot")
             assertTrue("-p 23456:80" in reboot, "re-boot must keep the original port mapping: $reboot")
-            assertTrue("-e FOO=bar" in reboot, "re-boot must keep the original env: $reboot")
-            assertFalse("irrelevant" in reboot, "the ordinary image arg must not appear alongside --from-snapshot: $reboot")
+            assertFalse("-e" in reboot.split(" "), "restore has no -e/--env flag — env must never be emitted: $reboot")
+            assertFalse("FOO=bar" in reboot, "restore has no -e/--env flag — env must never be emitted: $reboot")
+            assertFalse("irrelevant" in reboot, "the ordinary image arg must not appear on a restore: $reboot")
         } finally {
             backend.stop(handle)
             backend.remove(handle)
@@ -176,7 +190,7 @@ class MsbCheckpointTest {
         val marker = Files.createTempFile("rz-marker-", "").also { Files.deleteIfExists(it) }
         val callLog = Files.createTempFile("rz-calllog-", "")
         val snapshotFailFlag = Files.createTempFile("rz-snapfail-", "").also { Files.deleteIfExists(it) }   // snapshot succeeds
-        val rebootFailFlag = Files.createTempFile("rz-rebootfail-", "")   // present => the --from-snapshot re-boot fails
+        val rebootFailFlag = Files.createTempFile("rz-rebootfail-", "")   // present => the restore re-boot fails
         val backend = MsbCliBackend(fakeMsbCheckpointLifecycle(marker, callLog, snapshotFailFlag, rebootFailFlag))
         val spec = ContainerSpec(name = "rz-ckpt-reboot-fail-test", image = "irrelevant", runId = "run1")
         val handle = backend.create(spec)
@@ -200,7 +214,7 @@ class MsbCheckpointTest {
                 "snapshot create --from-sandbox rz-ckpt-reboot-fail-test rz-ckpt-0123456789ab",
                 "rm rz-ckpt-reboot-fail-test",
             ), calls.take(3), "the re-boot attempt must follow a successful snapshot and rm: $calls")
-            assertTrue(calls[3].startsWith("run --name rz-ckpt-reboot-fail-test"),
+            assertTrue(calls[3].startsWith("restore rz-ckpt-0123456789ab --name rz-ckpt-reboot-fail-test"),
                 "unexpected re-boot argv: ${calls[3]}")
         } finally {
             backend.stop(handle)
@@ -256,7 +270,8 @@ class MsbCheckpointTest {
                 "snapshot create --from-sandbox rz-ckpt-path-test rz-ckpt-0123456789ab --dest-dir $destDir",
                 calls[1],
             )
-            assertTrue("--from-snapshot $ref" in calls[3], "re-boot must use the full path ref verbatim: ${calls[3]}")
+            assertTrue(calls[3].startsWith("restore $ref --name rz-ckpt-path-test"),
+                "re-boot must use the full path ref verbatim as restore's positional: ${calls[3]}")
         } finally {
             backend.stop(handle)
             backend.remove(handle)

@@ -40,24 +40,31 @@ Both backends support checkpoint/restore today, via different mechanisms:
 | `Checkpoint.ref` shape | `rightsize/checkpoint:<12-hex>` (an image tag) | an absolute path under `<cache-dir>/checkpoints/` |
 
 microsandbox's `msb snapshot create` requires the sandbox stopped, so `checkpoint()` there runs
-`msb stop` → `msb snapshot create --from <sandbox> <ref> --dest-dir <cache-dir>/checkpoints` →
-`msb rm <sandbox>` → a fresh attached `msb run --from-snapshot <ref>` under the same name, ports,
-env, and memory limit — the sandbox ends up running again under the same name, but its workload
-command re-ran from scratch to get there. The `--dest-dir` flag is what makes `ref` an absolute
-path: msb writes the snapshot artifact under the rightsize cache directory instead of its own
-default `~/.microsandbox/snapshots/`, and the artifact's parent directories are created up front.
-The snapshot still shows up in `msb snapshot list` — msb keeps a global index regardless of where
-the artifact physically lives — so `Checkpoint.remove` cleans both the index entry and the
-on-disk artifact, and a bare-name ref minted by an earlier rightsize release still restores (a
-non-path ref falls back to msb's own `--from-snapshot <name>` resolution unchanged).
+`msb stop` → `msb snapshot create --from-sandbox <sandbox> <ref> --dest-dir <cache-dir>/checkpoints`
+→ `msb rm <sandbox>` → a fresh attached `msb restore <ref> --name <sandbox> --disk-only` under
+the same name and ports — the sandbox ends up running again under the same name, but its workload
+command re-ran from scratch to get there. `--disk-only` cold-boots the captured disk without
+resuming captured RAM/processes, matching this library's filesystem-only checkpoint semantics;
+env and the boot command are never re-passed (`msb restore` has no `-e`/`--env` flag and no
+trailing-command flag at all, unlike `msb run`) — a disk-only restore replays the sandbox's own
+captured configuration instead, which for this same-container reboot is exactly what was already
+running a moment earlier. The `--dest-dir` flag is what makes `ref` an absolute path: msb writes
+the snapshot artifact under the rightsize cache directory instead of its own default
+`~/.microsandbox/snapshots/`, and the artifact's parent directories are created up front. The
+snapshot still shows up in `msb snapshot list` — msb keeps a global index regardless of where the
+artifact physically lives — so `Checkpoint.remove` cleans both the index entry and the on-disk
+artifact, and a bare-name ref minted by an earlier rightsize release still restores (a non-path
+ref falls back to msb's own `restore <name>` resolution unchanged).
 
 A checkpoint of a `withTmpfsRoot()` container is refused up front: `checkpoint()` throws
 `TmpfsRootCheckpointException` before `msb stop` even runs, since a tmpfs root lives in guest
 memory and there is nothing durable on disk to snapshot — this applies whether the call is an
 unnamed `checkpoint()` or a named `checkpoint("existing-name")`, so a refused named
 re-checkpoint leaves the existing checkpoint entirely untouched. Restoring the other direction has
-a matching msb-level constraint: msb rejects any root-disk setting (`withDiskLimit`/`withTmpfsRoot`)
-on a `fromCheckpoint` restore before boot, because the snapshot already pins the root disk.
+a matching constraint: `msb restore` has no root-disk flag at all (`withDiskLimit`/`withTmpfsRoot`
+on a `fromCheckpoint` restore go unhonored rather than erroring), because the snapshot already
+pins the root disk — the same reasoning that keeps this restore command from taking an env or
+command override either (see the "API" section below).
 Because of that, `checkpoint()` re-applies the container's own wait strategy before returning
 whenever the active backend's `capabilities.checkpointRestartsWorkload` is `true` — a bare return
 would otherwise hand back a container that looks ready but whose workload hasn't actually come
@@ -124,8 +131,16 @@ restored.start()   // fresh container, migrated schema and seed rows already on 
 `GenericContainer.fromCheckpoint(cp)`:
 
 - builds a normal container whose env/command/exposed ports/memory limit default to `cp.spec` —
-  apply the usual `withX` builders afterward to override any of them (a different wait strategy,
-  extra env, more exposed ports) before calling `start()`;
+  apply the usual `withX` builders afterward (a different wait strategy, more exposed ports, a
+  higher memory limit) before calling `start()`;
+- overriding env or command specifically (`withEnv`/`withCommand`/`removeEnv`, to something other
+  than what `cp.spec` already carries) works on a backend whose
+  `capabilities.checkpointRestoreOverridable` is `true` (Docker: restoring just re-runs the
+  committed image with the new env/command, same as any other `docker run`) but throws
+  `CheckpointRestoreOverrideUnsupportedException` before any backend call on one where it's
+  `false` (microsandbox: `msb restore`'s disk-only mode has no `-e`/`--env` flag and no
+  command-override flag at all — it always replays the snapshot's own captured configuration, so
+  a caller's override would otherwise be silently dropped rather than genuinely applied);
 - requires the active backend at `start()` time to match `cp.backend` — restoring an msb
   snapshot under the docker backend (or vice versa) throws `CheckpointBackendMismatchException`
   before any backend call, naming both backends and the `RIGHTSIZE_BACKEND=<creator>` remedy;

@@ -16,6 +16,22 @@ reaches its first tagged release.
   keep their existing default). One driven CLI flag was renamed upstream —
   `msb snapshot create --from` became `--from-sandbox` — and this library's
   checkpoint machinery now emits the new spelling; nothing changes for callers.
+- **Checkpoint restore on the microsandbox backend now goes through `msb restore
+  --disk-only`, not `msb run --from-snapshot`.** Upstream 0.7 removed `--from-snapshot`
+  from `run` entirely (clap rejects it outright; `msb run` itself now bails toward `msb
+  restore` for a snapshot-shaped source) and moved restoring into a dedicated `msb
+  restore <ref> --name <name> --disk-only` command. `--disk-only` cold-boots the
+  captured disk without resuming captured RAM/processes — the same filesystem-only
+  semantics this library's checkpoints have always had. `restore` carries no `-e`/
+  `--env` flag and no command override at all, unlike `run`: a disk-only restore
+  replays the sandbox's own captured configuration instead, so this library no longer
+  re-passes env/command on a restore boot. `GenericContainer.fromCheckpoint(cp)` still
+  lets a caller override env/command with `withEnv`/`withCommand` afterward — genuinely
+  changing either now throws the new typed `CheckpointRestoreOverrideUnsupportedException`
+  before any backend call on microsandbox (new `BackendCapabilities.checkpointRestoreOverridable`,
+  `false` there, `true` on Docker, which has no such restriction); re-supplying exactly
+  what the checkpoint already captured never throws. No other checkpoint/restore public
+  API changed.
 
 ## [0.7.9] - 2026-09-10
 

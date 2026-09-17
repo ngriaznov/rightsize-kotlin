@@ -34,11 +34,13 @@ class MsbCliBackend private constructor(
     override val name = "microsandbox"
     override val supportsNativeNetworks = false   // networks emulated via exec-tunnels
     // Each sandbox is its own microVM (hardware-isolated); checkpoint is backed by msb's disk
-    // snapshot primitives (stop -> snapshot create -> rm -> run --from-snapshot), which restarts the
+    // snapshot primitives (stop -> snapshot create -> rm -> msb restore --disk-only), which restarts the
     // workload, hence checkpointRestartsWorkload = true (see docs/checkpoints.md and
-    // BackendCapabilities' doc).
+    // BackendCapabilities' doc). checkpointRestoreOverridable = false: msb restore's disk-only
+    // mode has no -e/--env flag and no command override at all (see MsbCommands.restore's doc).
     override val capabilities = BackendCapabilities(
-        hardwareIsolated = true, checkpoint = true, checkpointRestartsWorkload = true)
+        hardwareIsolated = true, checkpoint = true, checkpointRestartsWorkload = true,
+        checkpointRestoreOverridable = false)
 
     internal class Handle(override val spec: ContainerSpec) : SandboxHandle {
         override val id = spec.name
@@ -206,12 +208,15 @@ class MsbCliBackend private constructor(
     )
 
     /**
-     * Spawns `msb run` for [spec], draining its combined output to a tail kept for diagnostics
-     * only — msb's own boot output (registry/pull errors, a crash before the sandbox exists),
-     * never the workload's. [logs] never reads from this tail; it always shells out to `msb logs`.
+     * Spawns `msb run` (or, for a checkpoint restore, `msb restore ... --disk-only` — see
+     * [MsbCommands.restore]'s doc) for [spec], draining its combined output to a tail kept for
+     * diagnostics only — msb's own boot output (registry/pull errors, a crash before the sandbox
+     * exists), never the workload's. [logs] never reads from this tail; it always shells out to
+     * `msb logs`.
      */
     private fun spawnAttachedRun(spec: ContainerSpec): Triple<Process, ConcurrentLinkedDeque<String>, Thread> {
-        val proc = ProcessBuilder(listOf(msb.toString()) + MsbCommands.run(spec))
+        val argv = if (spec.checkpointRef != null) MsbCommands.restore(spec) else MsbCommands.run(spec)
+        val proc = ProcessBuilder(listOf(msb.toString()) + argv)
             .redirectErrorStream(true).start()
         runCatching { proc.outputStream.close() }   // no host stdin to forward; avoid EOF-wait stalls
         val tail = ConcurrentLinkedDeque<String>()
@@ -335,14 +340,16 @@ class MsbCliBackend private constructor(
      * `ERROR_ACCESS_DENIED` whenever msb runs inside a Windows job object that doesn't grant
      * breakaway rights, which is exactly the case when this JVM is itself a child of a Gradle
      * test process or a CI runner's job. That denial is deterministic, not transient, so no
-     * retry ever clears it. Attached `msb run` — this backend's ordinary boot, no creation
-     * flags — works everywhere, including a `--from-snapshot` boot, so the resume step here is
-     * instead: remove the stopped sandbox (its disk state now lives entirely in the snapshot)
-     * and boot a fresh attached sandbox from that snapshot under the SAME name/ports/env/memory
-     * limit, via [spawnAndAwaitRunning] — the exact boot path [start] itself uses, just fed
-     * [handle]'s own spec with `checkpointRef` set to the new ref (`MsbCommands.run` then emits
-     * `--from-snapshot <ref>` in place of the image arg). [Handle.attached] is swapped to the new
-     * child; `id`/`spec` — the ledger-relevant identity — are untouched.
+     * retry ever clears it. Attached `msb run`/`msb restore` — this backend's ordinary boot and
+     * its restore counterpart, neither with creation flags — work everywhere, so the resume step
+     * here is instead: remove the stopped sandbox (its disk state now lives entirely in the
+     * snapshot) and boot a fresh attached sandbox from that snapshot under the SAME name/ports/
+     * memory limit (NOT env — see [MsbCommands.restore]'s doc), via [spawnAndAwaitRunning] — the
+     * exact boot path [start] itself uses, just fed [handle]'s own spec with `checkpointRef` set
+     * to the new ref (`spawnAttachedRun` then routes to `MsbCommands.restore`, emitting
+     * `restore <ref> --name <name> --disk-only` in place of an ordinary `run <image>` boot).
+     * [Handle.attached] is swapped to the new child; `id`/`spec` — the ledger-relevant identity —
+     * are untouched.
      *
      * `capabilities.checkpointRestartsWorkload = true` is exactly why: the rebooted workload
      * starts from scratch, so `GenericContainer.checkpoint()` re-applies the container's own
@@ -364,7 +371,7 @@ class MsbCliBackend private constructor(
      * directory is created up front and passed to `snapshot create` as `--dest-dir`, with the
      * path's basename as the snapshot name; msb writes the artifact there instead of its own
      * default `~/.microsandbox/snapshots/` location. Either shape reboots identically: [ref]
-     * itself flows straight into `--from-snapshot`.
+     * itself flows straight into `restore`'s positional argument.
      *
      * A [ContainerSpec.tmpfsRootMb] container is refused before [stop] even runs — its root disk
      * lives in guest memory and there is nothing durable to snapshot.
@@ -496,7 +503,7 @@ class MsbCliBackend private constructor(
      * `sha256:<64hex>` digest — is the EFFECTIVE ref this returns: verified empirically that msb
      * does not resolve the full digest as a snapshot ref at all (`msb snapshot inspect
      * sha256:<full>` fails "snapshot not found", treating it as a literal path), while the
-     * digest-dir name resolves for `run --from-snapshot`, `snapshot rm`, and `snapshot inspect` alike.
+     * digest-dir name resolves for `restore`, `snapshot rm`, and `snapshot inspect` alike.
      */
     override fun importCheckpoint(src: Path, ref: String): String {
         val r = invoke(MsbCommands.snapshotImport(src), SNAPSHOT_IMPORT_TIMEOUT_SEC)
