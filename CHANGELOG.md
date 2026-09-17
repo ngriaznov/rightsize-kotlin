@@ -93,6 +93,41 @@ reaches its first tagged release.
   than assuming either one outright; only if neither stream yields an absolute path does
   `importFrom` throw.
 
+### Fixed
+
+- **A restored microsandbox container's workload is now actually running again.** Confirmed
+  empirically against the real msb 0.7.1 binary: `msb restore` brings a sandbox up with only
+  `agentd` inside — the checkpointed command never re-runs on its own (`msb start` on the same
+  sandbox boots equally idle, and `msb run` has no snapshot option at 0.7.1) — so every restored
+  container used to silently break this library's own checkpoint contract (workload running,
+  ports served, wait strategies satisfiable, logs flowing). This backend now revives the
+  workload itself: once a restore (both `GenericContainer.fromCheckpoint(cp).start()` and
+  `checkpoint()`'s own re-boot of the source container) reaches Running, it spawns `msb exec
+  [-e KEY=VALUE]... <name> -- <command>` as a long-lived attached child — carrying the
+  checkpoint's own env, which `msb restore` itself has no flag for at all — and that session
+  becomes the boot's new supervising attached child: it's reaped on `stop()` exactly like an
+  ordinary attached `run` child, and the container's wait strategy now runs against a workload
+  that's actually there. The workload command comes from, in order: the checkpoint's own explicit
+  command when it had one (the common case — nothing else to do here); otherwise a cmdline
+  CAPTURED FROM THE GUEST at checkpoint time, before the source sandbox is stopped (walks
+  `/proc` for the first non-kernel child of PID 1 and reads its `/proc/<pid>/cmdline`) and
+  persisted keyed by the checkpoint's own ref, for a container that ran its image's default
+  entrypoint with no explicit command; a checkpoint with neither — a registry predating this
+  capture, or one whose capture itself failed — now refuses to restore at all, with a typed
+  `CheckpointMissingWorkloadCommandException`, rather than silently booting an idle sandbox that
+  merely looks started. No public API changed: `Checkpoint`/`CheckpointSpec` and the named-
+  checkpoint registry's file format are untouched: the captured cmdline is exclusively an
+  internal, additive lookup keyed by ref, invisible to `Checkpoint.list()`/`find()`/`exportTo`.
+- **`msb restore` retries once on Windows' deferred snapshot-file-release access-denied error.**
+  Immediately after `createCheckpoint`'s own stop -> snapshot -> rm teardown of the source
+  sandbox, `msb restore` reading the just-written snapshot artifact can occasionally race
+  Windows' own deferred file-handle release (msb's docs describe this lag) and fail with `error:
+  io error: Access is denied. (os error 5)`. That specific signature — the access-denied phrase
+  together with the Rust-appended errno suffix, so an unrelated permission failure is never
+  misclassified — is now treated as a transient boot failure and retried, bounded, with a short
+  backoff, the same shape this library's other classified boot-transient retries already use.
+  The classifier itself is platform-agnostic code; the signature simply never occurs on Unix.
+
 ## [0.7.9] - 2026-09-10
 
 ### Changed

@@ -160,6 +160,18 @@ class MsbCommandsTest {
             MsbCommands.imageRemove("floci/floci-az:0.8.0"))
     }
 
+    @Test fun `execWorkload emits -e pairs before the name, then -- and the command`() {
+        assertEquals(
+            listOf("exec", "-e", "FOO=bar", "-e", "BAZ=qux", "rz-abc-1", "--", "nginx", "-g", "daemon off;"),
+            MsbCommands.execWorkload("rz-abc-1", linkedMapOf("FOO" to "bar", "BAZ" to "qux"), listOf("nginx", "-g", "daemon off;")),
+        )
+    }
+
+    @Test fun `execWorkload emits no -e flags at all for an empty env`() {
+        assertEquals(listOf("exec", "rz-abc-1", "--", "serve"),
+            MsbCommands.execWorkload("rz-abc-1", emptyMap(), listOf("serve")))
+    }
+
     @Test fun `snapshot create and snapshot rm`() {
         assertEquals(listOf("snapshot", "create", "--from-sandbox", "rz-abc-1", "rz-ckpt-0123456789ab"),
             MsbCommands.snapshotCreate("rz-abc-1", "rz-ckpt-0123456789ab"))

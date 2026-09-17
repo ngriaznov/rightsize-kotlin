@@ -342,3 +342,25 @@ class NonAbsoluteContainerPathException(path: String) : RuntimeException(
  * silent success. See docs/copy.md.
  */
 class ContainerCopyException(message: String, cause: Throwable? = null) : RuntimeException(message, cause)
+
+/**
+ * Thrown by a `checkpointRestartsWorkload` backend's restore path (microsandbox today — see
+ * `MsbCliBackend`'s restore-revival doc) when the checkpoint being restored has no workload
+ * command to revive: [ContainerSpec.command] was never set on the checkpoint (the source
+ * container ran its image's own default entrypoint) AND no cmdline was ever captured from the
+ * guest at checkpoint time — either because the checkpoint predates that capture support, or the
+ * capture itself failed (see `MsbCliBackend.createCheckpoint`'s pre-stop capture step, which
+ * never fails the checkpoint on a capture miss — it just leaves nothing for a later restore to
+ * find). Restoring such a checkpoint would otherwise boot the sandbox Running-but-idle — nothing
+ * serving any port, producing any log line, or satisfying any wait strategy — so this is refused
+ * outright instead of silently handing back a container that looks started but isn't. Restore
+ * that source container's checkpoint again (which retries the capture) or restore this one with
+ * an explicit command via `GenericContainer.fromCheckpoint(cp).withCommand(...)`.
+ */
+class CheckpointMissingWorkloadCommandException(ref: String) : RuntimeException(
+    "Checkpoint '$ref' has no workload command to restore — its source container ran its image's " +
+        "default entrypoint, and either this checkpoint predates workload-capture support or the " +
+        "capture itself failed when it was made, so restoring it would boot the sandbox idle " +
+        "(Running, but nothing serving any port or producing any log output). Re-checkpoint the " +
+        "source container to retry the capture, or restore with an explicit command via " +
+        "GenericContainer.fromCheckpoint(cp).withCommand(...).")

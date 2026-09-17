@@ -121,6 +121,34 @@ object MsbCommands {
 
     fun exec(name: String, cmd: List<String>) = listOf("exec", name, "--") + cmd
     fun execStream(name: String, cmd: List<String>) = listOf("exec", "--stream", name, "--") + cmd
+
+    /**
+     * `msb exec [-e KEY=VALUE]... <name> -- <cmd...>` — the long-lived workload-revival exec
+     * session [MsbCliBackend] spawns once a restore reaches Running (see
+     * [MsbCliBackend.spawnWorkloadExecChild]'s doc and docs/checkpoints.md): restoring boots the
+     * sandbox idle (only `agentd` inside — confirmed empirically against the real 0.7.1 binary),
+     * so this is what actually re-runs the checkpointed workload, and it becomes this boot's new
+     * supervising attached child (the slot [MsbCliBackend.Handle.attached] left `null` for a plain
+     * restore before this existed). Unlike [exec]'s short one-shot probes, THIS session's own
+     * stdout/stderr are what msb's own log capture records — `msb exec` is exactly what lands in
+     * `exec.log`, served back by `msb logs`/`-f` (confirmed empirically against the real 0.7.1
+     * binary) — so, unlike every other invocation this backend spawns, this process's output is
+     * never drained for THIS backend's own diagnostics beyond a short early-exit tail; `logs()`
+     * keeps sourcing fresh from `msb logs` as it always has.
+     *
+     * [env] pairs are emitted as repeated `-e KEY=VALUE` flags, BEFORE the sandbox name/`--` —
+     * `msb exec --help` documents `-e, --env <ENV>` as repeatable (verified empirically against
+     * the real 0.7.1 binary), the same flag spelling and options-before-positional convention
+     * [run] already uses for the ordinary (non-restore) boot path. `restore` itself has no
+     * `-e`/env flag at all (see [restore]'s own doc) — this is what lets the revived workload see
+     * the checkpoint's own env after all, despite the restore step that brought the sandbox up
+     * dropping it.
+     */
+    fun execWorkload(name: String, env: Map<String, String>, cmd: List<String>): List<String> = buildList {
+        add("exec")
+        env.forEach { (k, v) -> add("-e"); add("$k=$v") }
+        add(name); add("--"); addAll(cmd)
+    }
     fun logs(name: String) = listOf("logs", name, "--tail", "1000")
     /** `msb logs <name> --source system --tail 1000` — the system log, distinct from the
      * workload's own output [logs] reads. [MsbCliBackend]'s fast-exit post-mortem

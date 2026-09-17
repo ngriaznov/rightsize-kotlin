@@ -2,6 +2,7 @@ package dev.rightsize.msb
 
 import dev.rightsize.RunId
 import dev.rightsize.core.*
+import dev.rightsize.core.checkpoint.CheckpointRegistry
 import dev.rightsize.core.reuse.SandboxNameCollisionException
 import java.io.InputStream
 import java.nio.file.Files
@@ -33,11 +34,20 @@ import java.util.concurrent.atomic.AtomicBoolean
  * bytecode and so remain callable from Java — and tests reach it through [forHost], whose
  * name Kotlin mangles for the same reason. `MsbCliBackend(Path)` stays the only public
  * entry point, exactly as before.
+ *
+ * [checkpointRegistryDir] is a third, narrower seam in the same spirit: the directory
+ * [resolveWorkloadArgv]'s captured-command lookup and [createCheckpoint]'s captured-command
+ * persistence construct a [CheckpointRegistry] against, defaulted to the real
+ * [CacheDir.resolve] so production behavior is unchanged. Without it, a fake-`msb`-binary unit
+ * test would read/write the developer's real `~/.cache/rightsize` (or whatever `test` task
+ * pins `RIGHTSIZE_CACHE_DIR` to) instead of its own isolated temp directory; tests reach it via
+ * [forHost], same as the other two seams.
  */
 class MsbCliBackend private constructor(
     internal val msb: Path,
     private val windowsHost: Boolean,
     private val restoreReadinessBudgetMs: Long = FIRST_RUN_PULL_TIMEOUT_MS,
+    private val checkpointRegistryDir: Path = CacheDir.resolve(),
 ) : SandboxBackend {
     constructor(msb: Path) : this(msb, Platform.current()?.isWindows == true)
 
@@ -75,7 +85,8 @@ class MsbCliBackend private constructor(
             msb: Path,
             windowsHost: Boolean,
             restoreReadinessBudgetMs: Long = FIRST_RUN_PULL_TIMEOUT_MS,
-        ) = MsbCliBackend(msb, windowsHost, restoreReadinessBudgetMs)
+            checkpointRegistryDir: Path = CacheDir.resolve(),
+        ) = MsbCliBackend(msb, windowsHost, restoreReadinessBudgetMs, checkpointRegistryDir)
     }
 
     private val startedNames = ConcurrentHashMap.newKeySet<String>()
@@ -152,11 +163,15 @@ class MsbCliBackend private constructor(
      * or the manifest IS committed but the cache file backing one of its layers is gone,
      * where `image remove` clears the stale entry and the retry re-pulls from scratch.
      *
-     * Returns the supervising child [Process] for an ordinary `run` boot, or `null` for a
-     * `restore` boot (`spec.checkpointRef != null`) — that process has already exited by the
-     * time this returns (see [awaitRestoreRunning]), so there is nothing left to hand back;
-     * callers assign the result straight to [Handle.attached], which is `null`-safe everywhere
-     * it's read ([stop]).
+     * Returns the supervising child [Process] for an ordinary `run` boot. For a `restore` boot
+     * (`spec.checkpointRef != null`) the `restore` process ITSELF has already exited by the time
+     * this returns (see [awaitRestoreRunning]) — but this no longer returns `null` for that case:
+     * once the sandbox reaches Running, [spawnWorkloadExecChild] spawns the `msb exec` session
+     * that actually revives the checkpointed workload (upstream's restore boots the sandbox idle
+     * — see that method's doc), and ITS process is what's returned, becoming [Handle.attached]'s
+     * new supervising child for the boot. The one caller still assigns the result straight to
+     * [Handle.attached], which is `null`-safe everywhere it's read ([stop]) for every OTHER
+     * `null`-attached case (e.g. [findRunning]'s adopted handles).
      */
     private fun spawnAndAwaitRunning(handle: Handle, spec: ContainerSpec): Process? {
         val firstOutput = try {
@@ -181,6 +196,28 @@ class MsbCliBackend private constructor(
             error("msb run for sandbox ${handle.id} was refused for ${INSTALL_LOCK_RETRY_BUDGET_MS / 1000}s " +
                 "by msb's install-operation lock — both observed occurrences cleared within seconds, so a " +
                 "lock held this long looks like a genuinely stuck msb install on this host.\n${last.output}")
+        } catch (denied: RestoreAccessDeniedException) {
+            // Windows-only in practice (see isRestoreAccessDenied's doc): msb's deferred file-handle
+            // release on the just-written snapshot artifact can still be in flight the instant
+            // `restore` tries to read it, right after createCheckpoint's own teardown of the source
+            // sandbox. Bounded retry budget, same short-backoff shape as the state-db race below,
+            // just allowing more than one attempt since a release lag is less certain to have
+            // cleared within one retry's worth of wall-clock than a migration race is.
+            var attempts = 1
+            var last = denied
+            while (attempts < RESTORE_ACCESS_DENIED_MAX_ATTEMPTS) {
+                Thread.sleep(RESTORE_ACCESS_DENIED_RETRY_DELAY_MS)
+                try {
+                    return bootOnce(handle, spec)
+                } catch (again: RestoreAccessDeniedException) {
+                    last = again
+                    attempts++
+                }
+            }
+            error("msb restore for sandbox ${handle.id} hit Windows' deferred snapshot-file-release " +
+                "access-denied error $attempts times in a row (msb's own docs describe deferred file " +
+                "release on Windows after a write) — this looks like more than the usual release lag, " +
+                "not a transient race.\n${last.output}")
         } catch (race: MsbStateDbException) {
             // Usually the startup-migration race, transient by construction (see
             // [isMsbStateDbError]): the winning msb invocation's migration commits and a
@@ -231,7 +268,7 @@ class MsbCliBackend private constructor(
         try {
             return if (spec.checkpointRef != null) {
                 awaitRestoreRunning(handle, proc, tail, drainer)   // readiness = name Running in `msb ls`
-                null
+                spawnWorkloadExecChild(handle, spec)               // upstream restore boots idle — revive it
             } else {
                 awaitRunning(handle, proc, tail, drainer)          // readiness = name Running in `msb ls`
                 proc
@@ -366,6 +403,7 @@ class MsbCliBackend private constructor(
             if (isImageCacheCorruption(output)) throw ImageCacheCorruptionException(output)
             if (isMsbStateDbError(output)) throw MsbStateDbException(output)
             if (isMsbInstallLockActive(output)) throw MsbInstallLockException(output)
+            if (isRestoreAccessDenied(output)) throw RestoreAccessDeniedException(output)
             if (isPortBindConflict(output)) {
                 throw PortBindConflictException(
                     "msb restore for sandbox ${handle.id} could not bind a host port: $output")
@@ -417,6 +455,117 @@ class MsbCliBackend private constructor(
         if (status != "Stopped") return false
         val systemLog = invoke(MsbCommands.logsSystem(handle.id), LOGS_TIMEOUT_SEC).stdout
         return hasSandboxStartedMarker(systemLog)
+    }
+
+    /**
+     * Revives a restored sandbox's workload once it reaches Running: confirmed empirically
+     * against the real msb 0.7.1 binary, `msb restore` brings the sandbox up with only `agentd`
+     * inside — the captured command never re-runs on its own, `msb start` on the same sandbox
+     * boots equally idle, and `msb run` has no snapshot option at 0.7.1 — so this backend has to
+     * start the workload itself, exactly once, right here, or every restored container silently
+     * breaks the checkpoint contract (workload running, ports served, wait strategies
+     * satisfiable, logs flowing).
+     *
+     * Spawns `msb exec [-e K=V]... <name> -- <argv>` ([MsbCommands.execWorkload]) as an ATTACHED
+     * child — [resolveWorkloadArgv] decides [argv] (see its own doc for the (a)/(b)/(c) priority)
+     * and throws [CheckpointMissingWorkloadCommandException] before ever spawning anything when
+     * neither an explicit command nor a captured one is available, rather than booting a sandbox
+     * that LOOKS started but never runs anything. `-e` pairs come from [spec]'s own env — the
+     * restore step that brought the sandbox up never got to pass it (see [MsbCommands.restore]'s
+     * doc: `restore` has no env flag at all), so this exec session is the checkpoint's env's only
+     * way back in.
+     *
+     * This process becomes the boot's new supervising attached child (the slot a plain restore
+     * left `null` before this existed — see [bootOnce]'s doc): its own stdout/stderr are what
+     * msb's own log capture records for THIS sandbox from here on (confirmed empirically — an
+     * exec session's output lands in `exec.log`, served by `msb logs`/`-f`), so unlike every
+     * other process this backend spawns, its combined-output tail below is used ONLY for a quick
+     * early-exit diagnosis, never relied on as the workload's log source.
+     *
+     * A brief [WORKLOAD_EXEC_EARLY_EXIT_GRACE_MS] window (mirroring [awaitRunning]'s own
+     * early-exit poll, at the same [READINESS_POLL_MS] interval) catches an immediately-broken
+     * workload command without imposing a real wait — this is not a readiness check (the SANDBOX
+     * is already Running; [GenericContainer]'s own wait strategy runs after this returns and is
+     * what actually judges the workload) or a hang, just a chance for an instant crash-loop to
+     * announce itself. Nonzero exit inside that window is always a classified failure surfacing
+     * [argv] and the exec's own output; a clean exit 0 is classified exactly like an ordinary
+     * attached run's own fast exit — [isCleanFastExit] rescues it when the sandbox's state
+     * backs up "genuinely finished" (mirroring `stop()`/`wait`-strategy semantics for a container
+     * whose command legitimately completes fast), the same failure path as an attached run's own
+     * early exit otherwise. Surviving the window returns the still-live process, same shape
+     * [awaitRunning] hands back for an ordinary boot.
+     */
+    private fun spawnWorkloadExecChild(handle: Handle, spec: ContainerSpec): Process {
+        val argv = resolveWorkloadArgv(spec)
+            ?: throw CheckpointMissingWorkloadCommandException(spec.checkpointRef!!)
+        val proc = ProcessBuilder(listOf(msb.toString()) + MsbCommands.execWorkload(handle.id, spec.env, argv))
+            .redirectErrorStream(true).start()
+        runCatching { proc.outputStream.close() }
+        val tail = ConcurrentLinkedDeque<String>()
+        val drainer = drain(proc.inputStream) { tail.addLast(it); if (tail.size > TAIL_LINES) tail.removeFirst() }
+        val deadline = System.currentTimeMillis() + WORKLOAD_EXEC_EARLY_EXIT_GRACE_MS
+        while (System.currentTimeMillis() < deadline && proc.isAlive) {
+            Thread.sleep(READINESS_POLL_MS)
+        }
+        if (!proc.isAlive) {
+            runCatching { drainer.join(5_000) }
+            val output = tail.joinToString("\n")
+            if (proc.exitValue() == 0 && isCleanFastExit(handle)) return proc
+            error("msb exec for sandbox ${handle.id}'s revived workload (${argv.joinToString(" ")}) exited " +
+                "(code ${proc.exitValue()}) almost immediately after starting — the checkpoint's workload " +
+                "command looks broken; output:\n$output")
+        }
+        return proc
+    }
+
+    /**
+     * Decides the argv a restore revives, in priority order:
+     * 1. [ContainerSpec.command] itself, when the checkpoint had an explicit one — the ordinary
+     *    case: `GenericContainer.fromCheckpoint(cp)` pre-populates it from
+     *    [dev.rightsize.core.CheckpointSpec.command], and `checkpoint()`'s own re-boot (
+     *    [createCheckpoint]) passes the source container's own unchanged spec, which already
+     *    carries whatever command it was started with.
+     * 2. A workload cmdline CAPTURED AT CHECKPOINT TIME (see [captureWorkloadCmdline]) — only
+     *    reachable when (1) is absent (the container ran its image's default entrypoint), read
+     *    back from [dev.rightsize.core.checkpoint.CheckpointRegistry.readCapturedCommand] against
+     *    [ContainerSpec.checkpointRef] — the SAME ref [createCheckpoint] persisted it under,
+     *    whether or not that checkpoint was ever given a name (the store is keyed by ref alone;
+     *    see its own doc for why).
+     * 3. Neither present: `null`, which [spawnWorkloadExecChild] turns into
+     *    [CheckpointMissingWorkloadCommandException] rather than booting an idle sandbox — an old
+     *    registry (pre-dating capture support), a checkpoint whose capture failed at the time, or
+     *    one made without ever going through this backend's own `createCheckpoint` (e.g. an
+     *    imported archive) all end up here identically: nothing to revive with.
+     */
+    private fun resolveWorkloadArgv(spec: ContainerSpec): List<String>? {
+        spec.command?.let { return it }
+        val ref = spec.checkpointRef ?: return null
+        return CheckpointRegistry(checkpointRegistryDir).readCapturedCommand(ref)
+    }
+
+    /**
+     * Guest-side half of requirement (2)/(b) above: before [createCheckpoint] stops the source
+     * sandbox, and ONLY when [ContainerSpec.command] is absent (an explicit command already
+     * covers (a); there is nothing to discover), execs [WORKLOAD_CMDLINE_CAPTURE_SCRIPT] — a
+     * small busybox-compatible `sh` script that walks every `/proc/[0-9]*` entry's own `stat`
+     * file for the first process whose parent is PID 1 (field 4 == `1`) and whose own name isn't
+     * `init.krun` (msb's guest agent/init) or a bracketed kernel-thread name, then prints that process's
+     * `/proc/<pid>/cmdline` verbatim — NUL-separated argv, exactly how the kernel stores it — and
+     * parses the result with [parseNulSeparatedCmdline].
+     *
+     * NEVER throws and NEVER fails the checkpoint on a miss: an exec failure, a nonzero exit (no
+     * matching process found — [WORKLOAD_CMDLINE_CAPTURE_SCRIPT] itself exits 1 then), or empty/
+     * unparseable output all fold into `null` here, exactly as a checkpoint that predates capture
+     * support would look to a later restore ([CheckpointMissingWorkloadCommandException] surfaces
+     * the gap then, not here) — [createCheckpoint] is what's responsible for not persisting a
+     * `null` result.
+     */
+    private fun captureWorkloadCmdline(handle: Handle): List<String>? {
+        val result = runCatching {
+            exec(handle, listOf("sh", "-c", WORKLOAD_CMDLINE_CAPTURE_SCRIPT))
+        }.getOrNull() ?: return null
+        if (result.exitCode != 0) return null
+        return parseNulSeparatedCmdline(result.stdout).takeIf { it.isNotEmpty() }
     }
 
     override fun stop(handle: SandboxHandle) {
@@ -480,16 +629,26 @@ class MsbCliBackend private constructor(
      * [handle]'s own spec with `checkpointRef` set to the EFFECTIVE ref (`spawnAttachedRun`
      * then routes to `MsbCommands.restore`, emitting `restore <ref> --name <name>` in place of
      * an ordinary `run <image>` boot — never `--disk-only`, which msb 0.7.1 rejects for a
-     * disk-scope snapshot; see that method's doc). Unlike [start]'s ordinary boot, a restore
-     * boot is childless by design (see [awaitRestoreRunning]'s doc): [Handle.attached] ends up
-     * `null` here, not swapped to a new child — there is no supervising process left to hold
-     * once [spawnAndAwaitRunning] returns successfully for a restore, and [stop] already treats
-     * a `null` [Handle.attached] as nothing to reap. `id`/`spec` — the ledger-relevant identity
-     * — are untouched.
+     * disk-scope snapshot; see that method's doc). [Handle.attached] ends up holding the
+     * revived workload's `msb exec` child once this returns successfully (see
+     * [spawnWorkloadExecChild]'s doc) — a plain `msb restore` boot is childless by design (see
+     * [awaitRestoreRunning]'s doc), but this backend no longer leaves it that way: upstream's
+     * restore brings the sandbox up idle, so [spawnAndAwaitRunning] itself starts the workload
+     * before returning. `id`/`spec` — the ledger-relevant identity — are untouched.
+     *
+     * When [handle]'s own [ContainerSpec.command] is unset (the container ran its image's
+     * default entrypoint), THIS method captures a workload cmdline from the guest — via
+     * [captureWorkloadCmdline] — before [stop] ever runs, so the re-boot below has something to
+     * revive with (see [resolveWorkloadArgv]'s priority order). A capture failure never fails the
+     * checkpoint itself: it just means nothing is persisted, and a LATER restore of this same ref
+     * throws [CheckpointMissingWorkloadCommandException] instead of booting silently idle — this
+     * method's own immediate re-boot below hits that exact same wall if capture failed here, since
+     * it goes through the identical [spawnAndAwaitRunning] path a separate restore would.
      *
      * `capabilities.checkpointRestartsWorkload = true` is exactly why: the rebooted workload
      * starts from scratch, so `GenericContainer.checkpoint()` re-applies the container's own
-     * wait strategy before returning.
+     * wait strategy before returning — now against a workload THIS re-boot has already revived,
+     * not the idle sandbox upstream's restore alone would leave behind.
      *
      * Failure handling has three distinct shapes:
      * - `snapshot create` fails: the sandbox is left STOPPED, never removed, and this throws
@@ -528,6 +687,11 @@ class MsbCliBackend private constructor(
     override fun createCheckpoint(handle: SandboxHandle, ref: String): String {
         handle as Handle
         if (handle.spec.tmpfsRootMb != null) throw TmpfsRootCheckpointException()
+        // Guest-side capture, BEFORE stop — only when there's no explicit command to fall back
+        // on; see captureWorkloadCmdline's/resolveWorkloadArgv's docs. A miss (null) is not an
+        // error here: it just means nothing gets persisted below, and a later restore of this
+        // ref surfaces CheckpointMissingWorkloadCommandException instead of booting idle.
+        val capturedCommand = if (handle.spec.command == null) captureWorkloadCmdline(handle) else null
         stop(handle)
         val refPath = Path.of(ref)
         val destDir = if (refPath.isAbsolute) refPath.parent else null
@@ -543,6 +707,15 @@ class MsbCliBackend private constructor(
             ?: error("msb snapshot create --from-sandbox ${handle.id} $snapshotName succeeded but its " +
                 "output did not end with an absolute artifact path: '${snap.stdout.trim()}' — sandbox " +
                 "${handle.id} is left stopped; resume it by hand with `msb start ${handle.id}`.")
+        // Persisted against the EFFECTIVE ref (not the input hint) — the exact ref a later
+        // restore's spec.checkpointRef carries, whether this checkpoint is ever given a name or
+        // not (CheckpointRegistry.writeCapturedCommand is keyed by ref alone; see its own doc).
+        // Best-effort: a write failure here must not fail the checkpoint (it already succeeded);
+        // the same gap it would otherwise leave is exactly what CheckpointMissingWorkloadCommandException
+        // surfaces at restore time instead of a silent idle boot.
+        if (capturedCommand != null) {
+            runCatching { CheckpointRegistry(checkpointRegistryDir).writeCapturedCommand(effectiveRef, capturedCommand) }
+        }
         invoke(MsbCommands.rm(handle.id), STOP_TIMEOUT_SEC)
         try {
             handle.attached = spawnAndAwaitRunning(handle, handle.spec.copy(checkpointRef = effectiveRef))
@@ -1066,6 +1239,15 @@ private const val SNAPSHOT_IMPORT_TIMEOUT_SEC = 300L
 private const val ATTACHED_PROC_STOP_TIMEOUT_SEC = 10L
 private const val READER_JOIN_TIMEOUT_MS = 2000L
 private const val TAIL_LINES = 50
+// spawnWorkloadExecChild's brief early-exit grace window — long enough to catch an immediately
+// broken workload command, short enough to never look like a hang; the wait strategy that runs
+// right after is what actually judges whether the workload came up.
+private const val WORKLOAD_EXEC_EARLY_EXIT_GRACE_MS = 1_000L
+// Windows deferred-file-release access-denied retry (see isRestoreAccessDenied's doc): bounded
+// attempt count rather than a wall-clock deadline, so the retry resolves deterministically fast
+// in tests and in practice — the release lag this works around is itself sub-second.
+private const val RESTORE_ACCESS_DENIED_MAX_ATTEMPTS = 3
+private const val RESTORE_ACCESS_DENIED_RETRY_DELAY_MS = 300L
 
 /** The one boot failure [MsbCliBackend] heals and retries — carries the `msb run` child's
  * combined output for the second-failure diagnostic. Internal to the boot path: never
@@ -1195,6 +1377,92 @@ internal fun hasSandboxStartedMarker(output: String): Boolean = "--- sandbox sta
  */
 internal fun isAgentEndpointNotReady(stderr: String): Boolean =
     "agent client error" in stderr && "connect" in stderr
+
+/** The other boot failure [MsbCliBackend] retries for a `restore` boot specifically — the
+ * spawned `msb restore` invocation hit Windows' deferred snapshot-file-release access-denied
+ * signature (see [isRestoreAccessDenied]). Internal to the boot path, like its siblings above;
+ * [MsbCliBackend.spawnAndAwaitRunning] owns the bounded retry policy. */
+internal class RestoreAccessDeniedException(val output: String) :
+    RuntimeException("msb restore access-denied (Windows deferred file release):\n$output")
+
+/**
+ * True if [output] (an `msb restore` invocation's combined stdout/stderr) carries Windows' own
+ * deferred-file-release access-denied errno, immediately following [MsbCliBackend.createCheckpoint]'s
+ * own stop -> snapshot create -> rm teardown of the source sandbox: msb's own docs describe
+ * deferred file-handle release on Windows after a write, and a `restore` invocation reading the
+ * just-written snapshot artifact a moment later can still race that release. Captured verbatim
+ * from a windows-2025 hosted CI runner:
+ *
+ * ```
+ * error: io error: Access is denied. (os error 5)
+ * ```
+ *
+ * Deliberately requires BOTH the literal "Access is denied" phrase (English-locale Windows
+ * wording rendered through FormatMessage — see [isSnapshotSaveAccessDenied]'s own note on why
+ * that text alone is not relied on) AND either "io error" or "(os error 5)" (the locale-
+ * independent framing Rust itself appends), the same conservative AND-of-two-markers discipline
+ * [isSnapshotSaveAccessDenied] uses for its own, different msb subcommand — so a genuinely
+ * unrelated permission denial is never misclassified as this specific, known-transient release
+ * lag. This signature and [isSnapshotSaveAccessDenied]'s are deliberately kept as two separate
+ * classifiers even though both key off the same Windows errno: they cover two different msb
+ * subcommands (`restore` vs `snapshot save`) with two different remedies (a bounded retry of the
+ * whole invocation here vs [salvageStagedArchive]'s salvage-by-rename there, since a `restore`
+ * that fails this way has written nothing itself to salvage).
+ */
+internal fun isRestoreAccessDenied(output: String): Boolean =
+    "Access is denied" in output && ("io error" in output || "(os error 5)" in output)
+
+/**
+ * A small busybox-compatible POSIX `sh` script ([MsbCliBackend.captureWorkloadCmdline] execs it
+ * via `sh -c`) that walks every `/proc/[0-9]*` entry's own `stat` file for the first process
+ * whose parent is PID 1 (the `stat` file's 4th whitespace-separated field, per `man proc`, AFTER
+ * the `(comm)` parenthesized group — `comm` itself can contain spaces or parens, so this strips
+ * from the first `(` to the LAST `)` before splitting the remainder on whitespace, the standard
+ * shell-safe way to parse this file) whose own name is neither `init.krun` (msb's guest
+ * agent/init — never the workload) nor a bracketed kernel-thread name (`[kworker/0:1]` and
+ * similar — a kernel thread's own `comm` is literally wrapped in brackets), then prints that
+ * process's own `/proc/<pid>/cmdline` verbatim: NUL-separated argv, exactly the shape the kernel stores it in,
+ * parsed back out by [parseNulSeparatedCmdline]. No match at all (nothing but kernel threads and
+ * the agent parented at 1 — should not happen for a running workload, but the script must never
+ * hang or crash if it does) exits 1 with no output, which [captureWorkloadCmdline] folds into a
+ * plain miss (`null`), the same as any other capture failure.
+ *
+ * Pure `sh` builtins only (`for`, `case`, parameter expansion, `set --`) — no `awk`/`grep`/`cut`,
+ * so this runs unmodified in a minimal busybox-ash guest image with nothing else installed.
+ */
+internal val WORKLOAD_CMDLINE_CAPTURE_SCRIPT = """
+    for d in /proc/[0-9]*; do
+      [ -r "${'$'}d/stat" ] || continue
+      stat=$(cat "${'$'}d/stat" 2>/dev/null) || continue
+      rest=${'$'}{stat##*) }
+      comm=${'$'}{stat#*(}
+      comm=${'$'}{comm%)*}
+      set -- ${'$'}rest
+      ppid="${'$'}2"
+      [ "${'$'}ppid" = "1" ] || continue
+      case "${'$'}comm" in
+        init.krun|\[*) continue ;;
+      esac
+      [ -r "${'$'}d/cmdline" ] || continue
+      cat "${'$'}d/cmdline"
+      exit 0
+    done
+    exit 1
+""".trimIndent()
+
+/**
+ * Parses `cat /proc/<pid>/cmdline`'s own output — NUL-separated argv, no trailing NUL guaranteed
+ * — as captured by [MsbCliBackend.captureWorkloadCmdline] and relayed through
+ * [MsbCliBackend.invoke]'s line-buffered draining (which appends its own trailing `\n` after the
+ * NUL-delimited blob, since the guest output itself carries no newline for `forEachLine` to stop
+ * at). Splits on `\u0000` first, then trims any stray `\n`/`\r` off each token (only ever
+ * possible on the LAST one, from that appended trailing newline) and drops empty tokens (the
+ * blank tail after a trailing NUL, and the wholly-blank result of empty/unparseable input alike)
+ * — an empty result either way is what tells [MsbCliBackend.captureWorkloadCmdline] to treat the
+ * capture as a miss rather than an empty argv.
+ */
+internal fun parseNulSeparatedCmdline(output: String): List<String> =
+    output.split('\u0000').map { it.trim('\n', '\r') }.filter { it.isNotEmpty() }
 
 /**
  * True if [stderr] (from `msb snapshot inspect <ref>`) names msb's own "no such snapshot"

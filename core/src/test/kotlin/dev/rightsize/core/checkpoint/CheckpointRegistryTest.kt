@@ -386,4 +386,58 @@ class CheckpointRegistryTest {
         Files.writeString(registry.file("bad"), "{ not valid json")
         assertEquals(ref, registry.findByRef(ref, "docker")?.ref)
     }
+
+    // --- writeCapturedCommand/readCapturedCommand: the ref-keyed workload-cmdline store a
+    // --- checkpointRestartsWorkload backend's restore path consults when a checkpoint has no
+    // --- explicit command (see the doc on writeCapturedCommand). ---
+
+    @Test fun `readCapturedCommand returns null when nothing was ever captured for this ref`(@TempDir tmp: Path) {
+        assertNull(CheckpointRegistry(tmp).readCapturedCommand("/snapshots/some-sandbox/snap_abc"))
+    }
+
+    @Test fun `write then read round-trips a captured command`(@TempDir tmp: Path) {
+        val registry = CheckpointRegistry(tmp)
+        val ref = "/snapshots/some-sandbox/snap_abc"
+        registry.writeCapturedCommand(ref, listOf("nginx", "-g", "daemon off;"))
+        assertEquals(listOf("nginx", "-g", "daemon off;"), registry.readCapturedCommand(ref))
+    }
+
+    @Test fun `write then read round-trips a captured command argument containing brackets, quotes and backslashes`(@TempDir tmp: Path) {
+        val registry = CheckpointRegistry(tmp)
+        val ref = "/snapshots/some-sandbox/snap_def"
+        val argv = listOf("sh", "-c", "echo \"hi [there]\" && printf 'back\\\\slash'")
+        registry.writeCapturedCommand(ref, argv)
+        assertEquals(argv, registry.readCapturedCommand(ref))
+    }
+
+    @Test fun `writeCapturedCommand is keyed by ref alone, independent of any named entry`(@TempDir tmp: Path) {
+        val registry = CheckpointRegistry(tmp)
+        val ref = "/snapshots/some-sandbox/snap_abc"
+        // No named checkpoint() entry was ever written for this ref — the capture store must
+        // still work for a checkpoint that was never given a name.
+        registry.writeCapturedCommand(ref, listOf("serve"))
+        assertEquals(listOf("serve"), registry.readCapturedCommand(ref))
+        assertNull(registry.read("some-name"), "no named entry should exist")
+        assertEquals(emptyList<Checkpoint>(), registry.list(),
+            "a captured-command entry must never show up in list() — it carries no checkpoint metadata")
+    }
+
+    @Test fun `a later writeCapturedCommand for the same ref replaces the earlier value`(@TempDir tmp: Path) {
+        val registry = CheckpointRegistry(tmp)
+        val ref = "/snapshots/some-sandbox/snap_abc"
+        registry.writeCapturedCommand(ref, listOf("old-command"))
+        registry.writeCapturedCommand(ref, listOf("new-command"))
+        assertEquals(listOf("new-command"), registry.readCapturedCommand(ref))
+    }
+
+    @Test fun `readCapturedCommand returns null for a corrupt capture file rather than throwing`(@TempDir tmp: Path) {
+        val registry = CheckpointRegistry(tmp)
+        val ref = "/snapshots/some-sandbox/snap_abc"
+        registry.writeCapturedCommand(ref, listOf("serve"))
+        // Corrupt the file directly, bypassing the registry's own writer.
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+            .digest(ref.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
+        Files.writeString(tmp.resolve("checkpoints").resolve(".workload-cmdline").resolve("$digest.json"), "not json at all")
+        assertNull(registry.readCapturedCommand(ref))
+    }
 }

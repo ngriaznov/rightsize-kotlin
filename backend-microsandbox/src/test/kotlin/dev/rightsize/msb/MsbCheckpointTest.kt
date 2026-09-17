@@ -21,24 +21,31 @@ import java.nio.file.Path
 class MsbCheckpointTest {
 
     /**
-     * Extends the lifecycle fake with `snapshot create`/`rm`/a `restore` re-boot: `run`/`ls`/
-     * `stop` behave exactly as [MsbCliBackendTest]'s own fake; `rm` is always a no-op success
-     * (its own failure is not one of [MsbCliBackend.createCheckpoint]'s typed-failure shapes);
-     * `snapshot create` exits non-zero when [snapshotFailFlag] exists, otherwise prints a fake
-     * `Snapshot ID:` line followed by an ABSOLUTE artifact path as its LAST stdout line — msb
-     * 0.7.1's own shape (`<dest-dir-or-fixed-base>/<sandbox>/snap_<32-hex>`, using `--dest-dir`
-     * when the argv carries one) — UNLESS [malformedCreateOutputFlag] exists, in which case it
-     * instead prints a line that is not a parseable absolute path at all, to drive
+     * Extends the lifecycle fake with `snapshot create`/`rm`/a `restore` re-boot/the workload
+     * revival `exec` that follows it: `run`/`ls`/`stop` behave exactly as [MsbCliBackendTest]'s
+     * own fake; `rm` is always a no-op success (its own failure is not one of
+     * [MsbCliBackend.createCheckpoint]'s typed-failure shapes); `snapshot create` exits non-zero
+     * when [snapshotFailFlag] exists, otherwise prints a fake `Snapshot ID:` line followed by an
+     * ABSOLUTE artifact path as its LAST stdout line — msb 0.7.1's own shape
+     * (`<dest-dir-or-fixed-base>/<sandbox>/snap_<32-hex>`, using `--dest-dir` when the argv
+     * carries one) — UNLESS [malformedCreateOutputFlag] exists, in which case it instead prints a
+     * line that is not a parseable absolute path at all, to drive
      * [MsbCliBackend.createCheckpoint]'s defensive-parsing failure mode; a `restore` invocation
      * (the re-boot, as opposed to the initial ordinary `run` boot) exits non-zero with no marker
      * written when [rebootFailFlag] exists — otherwise, matching msb's own detached-restore
      * contract (see [MsbCliBackend.awaitRestoreRunning]'s doc), it recreates [marker] (so the
      * sandbox reports Running on the next `ls`) and THEN exits 0 immediately, never blocking the
      * way the ordinary `run` case above does — [MsbCliBackend] must wait for this short-lived
-     * process to exit and poll `ls` separately, not treat it as a supervising child. Every
-     * invocation's full argv is appended to [callLog], one line per call, so the tests below can
-     * assert on the order and shape of the commands [createCheckpoint] actually drives instead of
-     * re-implementing msb's own CLI.
+     * process to exit and poll `ls` separately, not treat it as a supervising child. `exec` — the
+     * workload-revival session [MsbCliBackend.spawnWorkloadExecChild] spawns once THAT restore
+     * reaches Running — blocks on the SAME [marker] `run`/`restore` themselves populate, so
+     * `stop`'s existing `rm -f "$marker"` wakes it too, instantly, with no separate teardown
+     * plumbing needed, then it exits 0. Every invocation's full argv is appended to [callLog], one
+     * line per call, so the tests below can assert on the order and shape of the commands
+     * [createCheckpoint] actually drives instead of re-implementing msb's own CLI. Every spec
+     * these tests boot carries an explicit `command`, so [MsbCliBackend.createCheckpoint]'s
+     * pre-stop guest-capture step (only attempted when a spec has none) never fires here — its own
+     * coverage lives in [MsbCheckpointCaptureTest].
      */
     private fun fakeMsbCheckpointLifecycle(
         marker: Path,
@@ -82,6 +89,16 @@ class MsbCheckpointTest {
             |      exit 1
             |    fi
             |    echo "${'$'}name" > "$marker"
+            |    exit 0
+            |    ;;
+            |  exec)
+            |    while [ "${'$'}#" -gt 0 ]; do
+            |      case "${'$'}1" in
+            |        --) shift; break ;;
+            |        *) shift ;;
+            |      esac
+            |    done
+            |    while [ -f "$marker" ]; do sleep 0.05; done
             |    exit 0
             |    ;;
             |  ls)
@@ -148,6 +165,7 @@ class MsbCheckpointTest {
             name = "rz-ckpt-test", image = "irrelevant", runId = "run1",
             env = mapOf("FOO" to "bar"),
             ports = listOf(PortBinding(hostPort = 23456, guestPort = 80)),
+            command = listOf("serve"),
         )
         val handle = backend.create(spec)
         try {
@@ -168,7 +186,8 @@ class MsbCheckpointTest {
                 "snapshot create --from-sandbox rz-ckpt-test rz-ckpt-0123456789ab",
                 "rm rz-ckpt-test",
             ), calls.take(3))
-            assertEquals(4, calls.size, "no extra commands beyond stop/snapshot-create/rm/run: $calls")
+            assertEquals(5, calls.size,
+                "no extra commands beyond stop/snapshot-create/rm/restore/exec-revival: $calls")
             val reboot = calls[3]
             assertTrue(reboot.startsWith("restore $effectiveRef --name rz-ckpt-test"),
                 "unexpected re-boot argv: $reboot")
@@ -178,6 +197,13 @@ class MsbCheckpointTest {
             assertFalse("-e" in reboot.split(" "), "restore has no -e/--env flag — env must never be emitted: $reboot")
             assertFalse("FOO=bar" in reboot, "restore has no -e/--env flag — env must never be emitted: $reboot")
             assertFalse("irrelevant" in reboot, "the ordinary image arg must not appear on a restore: $reboot")
+
+            // The workload-revival exec: upstream's restore boots the sandbox idle, so this is
+            // what actually re-runs the checkpointed workload — WITH the env restore itself drops.
+            val revival = calls[4]
+            assertEquals("exec -e FOO=bar rz-ckpt-test -- serve", revival,
+                "the revival exec must carry the checkpoint's own env (which restore itself never " +
+                    "gets to pass) and the spec's explicit command: $revival")
         } finally {
             backend.stop(handle)
             backend.remove(handle)
@@ -192,7 +218,7 @@ class MsbCheckpointTest {
         val rebootFailFlag = unsetFlag("rz-rebootfail-")
         val malformedFlag = unsetFlag("rz-malformed-")
         val backend = MsbCliBackend(fakeMsbCheckpointLifecycle(marker, callLog, snapshotFailFlag, rebootFailFlag, malformedFlag))
-        val spec = ContainerSpec(name = "rz-ckpt-fail-test", image = "irrelevant", runId = "run1")
+        val spec = ContainerSpec(name = "rz-ckpt-fail-test", image = "irrelevant", runId = "run1", command = listOf("serve"))
         val handle = backend.create(spec)
         try {
             backend.start(handle)
@@ -227,7 +253,7 @@ class MsbCheckpointTest {
         val rebootFailFlag = unsetFlag("rz-rebootfail-")
         val malformedFlag = Files.createTempFile("rz-malformed-", "")   // present => malformed create output
         val backend = MsbCliBackend(fakeMsbCheckpointLifecycle(marker, callLog, snapshotFailFlag, rebootFailFlag, malformedFlag))
-        val spec = ContainerSpec(name = "rz-ckpt-malformed-test", image = "irrelevant", runId = "run1")
+        val spec = ContainerSpec(name = "rz-ckpt-malformed-test", image = "irrelevant", runId = "run1", command = listOf("serve"))
         val handle = backend.create(spec)
         try {
             backend.start(handle)
@@ -262,7 +288,7 @@ class MsbCheckpointTest {
         val rebootFailFlag = Files.createTempFile("rz-rebootfail-", "")   // present => the restore re-boot fails
         val malformedFlag = unsetFlag("rz-malformed-")
         val backend = MsbCliBackend(fakeMsbCheckpointLifecycle(marker, callLog, snapshotFailFlag, rebootFailFlag, malformedFlag))
-        val spec = ContainerSpec(name = "rz-ckpt-reboot-fail-test", image = "irrelevant", runId = "run1")
+        val spec = ContainerSpec(name = "rz-ckpt-reboot-fail-test", image = "irrelevant", runId = "run1", command = listOf("serve"))
         val handle = backend.create(spec)
         try {
             backend.start(handle)
@@ -354,7 +380,7 @@ class MsbCheckpointTest {
         val rebootFailFlag = unsetFlag("rz-rebootfail-")
         val malformedFlag = unsetFlag("rz-malformed-")
         val backend = MsbCliBackend(fakeMsbCheckpointLifecycle(marker, callLog, snapshotFailFlag, rebootFailFlag, malformedFlag))
-        val spec = ContainerSpec(name = "rz-ckpt-path-test", image = "irrelevant", runId = "run1")
+        val spec = ContainerSpec(name = "rz-ckpt-path-test", image = "irrelevant", runId = "run1", command = listOf("serve"))
         val handle = backend.create(spec)
         val destDir = tmp.resolve("checkpoints")
         val refHint = destDir.resolve("rz-ckpt-0123456789ab").toString()
@@ -412,6 +438,35 @@ class MsbCheckpointTest {
         assertNull(parseSnapshotCreateArtifactPath("Snapshot ID: abc123\n$relative"))
         assertNull(parseSnapshotCreateArtifactPath("Snapshot ID: abc123\nsnap_0123456789abcdef0123456789abcdef"))
         assertNull(parseSnapshotCreateArtifactPath("not a path at all, just words"))
+    }
+
+    // --- parseNulSeparatedCmdline: pure, no binary needed ---
+
+    @Test fun `parseNulSeparatedCmdline splits on NUL and drops the trailing empty token`() {
+        assertEquals(listOf("nginx", "-g", "daemon off;"), parseNulSeparatedCmdline("nginx\u0000-g\u0000daemon off;\u0000"))
+    }
+
+    @Test fun `parseNulSeparatedCmdline tolerates the trailing newline MsbCliBackend invoke's line draining appends`() {
+        // invoke() drains the guest's raw NUL-separated bytes (no trailing newline of their own)
+        // through appendLine, which adds one — captureWorkloadCmdline's real input shape.
+        assertEquals(listOf("nginx", "-g", "daemon off;"), parseNulSeparatedCmdline("nginx\u0000-g\u0000daemon off;\u0000\n"))
+    }
+
+    @Test fun `parseNulSeparatedCmdline returns an empty list for blank or unparseable input`() {
+        assertEquals(emptyList<String>(), parseNulSeparatedCmdline(""))
+        assertEquals(emptyList<String>(), parseNulSeparatedCmdline("\n"))
+    }
+
+    // --- isRestoreAccessDenied: pure, no binary needed ---
+
+    @Test fun `isRestoreAccessDenied matches msb's Windows deferred-file-release errno`() {
+        assertTrue(isRestoreAccessDenied("error: io error: Access is denied. (os error 5)"))
+    }
+
+    @Test fun `isRestoreAccessDenied requires both the access-denied phrase and the errno marker`() {
+        assertFalse(isRestoreAccessDenied("Access is denied."), "the errno-suffix marker alone is missing")
+        assertFalse(isRestoreAccessDenied("error: io error: something else entirely"), "the access-denied phrase is missing")
+        assertFalse(isRestoreAccessDenied("error: permission denied"), "an unrelated denial must not match")
     }
 
     /**
