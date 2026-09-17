@@ -32,7 +32,7 @@ testImplementation("dev.rightsize:modules")
 | [`Neo4jContainer`](neo4j.md) | `neo4j:latest` | `httpUrl`, `boltUrl`, `username`, `password`, `withPassword(...)` |
 | [`FlociContainer`](floci.md) | `floci/floci(-az\|-gcp):latest` | `FlociContainer.aws()`/`.azure()`/`.gcp()`, `endpointUrl` |
 | [`FlinkContainer`](flink.md) | `flink:latest` | `restUrl`, `withTaskManager()` (docker only) |
-| [`MinIOContainer`](minio.md) | `minio/minio:latest` | `endpointUrl`, `username`, `password`, `withUsername/withPassword(...)` |
+| [`MinIOContainer`](minio.md) | `quay.io/minio/minio:latest` | `endpointUrl`, `username`, `password`, `withUsername/withPassword(...)` |
 | [`CassandraContainer`](cassandra.md) | `cassandra:latest` | `contactPoint`, `cqlPort`, `localDatacenter` |
 | [`ElasticsearchContainer`](elasticsearch.md) | none — no floating tag exists; an explicit image is required | `restUrl` |
 | [`QdrantContainer`](qdrant.md) | `qdrant/qdrant:latest` | `restUrl` |

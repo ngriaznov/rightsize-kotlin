@@ -32,6 +32,12 @@ reaches its first tagged release.
   `false` there, `true` on Docker, which has no such restriction); re-supplying exactly
   what the checkpoint already captured never throws. No other checkpoint/restore public
   API changed.
+- **The MinIO module's default image moved to `quay.io/minio/minio:latest`.** Docker
+  Hub's `minio/minio` repository was removed upstream (`docker pull minio/minio` now
+  fails "repository does not exist"); the floating default now points at MinIO's
+  maintained `quay.io` mirror. Compatibility checking stays registry-agnostic, so a
+  `minio/minio:<tag>` override is still accepted alongside a `quay.io/minio/minio:<tag>`
+  one — only the default moved.
 
 ## [0.7.9] - 2026-09-10
 

@@ -9,13 +9,25 @@ import dev.rightsize.core.wait.Wait
  * what [endpointUrl] wraps) and the console (port 9001, exposed but not wrapped by a helper, the
  * same "exposed but unwrapped" treatment [ClickHouseContainer] gives its native-protocol port).
  *
- * ### Defaults to `minio/minio:latest` — this image's floating reference
+ * ### Defaults to `quay.io/minio/minio:latest` — this image's floating reference
  *
  * With no image given, this module tracks upstream's `latest` tag rather than a version this
  * library pins, so the version moves with MinIO's own releases instead of this library's release
  * cycle. The facts below were verified against `minio/minio:RELEASE.2025-09-07T16-13-09Z`
- * specifically — pass that image explicitly to pin it:
- * `MinIOContainer("minio/minio:RELEASE.2025-09-07T16-13-09Z")`.
+ * specifically — pass an image explicitly to pin it:
+ * `MinIOContainer("quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z")`.
+ *
+ * ### Why `quay.io`, not Docker Hub
+ *
+ * The default used to be the bare `minio/minio:latest` (Docker Hub). MinIO pulled that
+ * repository from Docker Hub entirely — `docker pull minio/minio` now fails "repository does not
+ * exist" — so this module's floating default moved to MinIO's maintained mirror,
+ * `quay.io/minio/minio`. [EXPECTED_REPOSITORY] stays the bare `minio/minio`: repository
+ * compatibility ([dev.rightsize.core.image.DockerImageName.assertCompatibleWith]) is checked
+ * after stripping any registry host, so both the new `quay.io/minio/minio:<tag>` default and an
+ * old-style `minio/minio:<tag>` override (still meaningful if you have that image cached, or a
+ * private Docker Hub proxy in front of it) are accepted identically — only a genuinely different
+ * repository (not just a different registry) is rejected.
  *
  * ### The default entrypoint does not serve — a command is required
  *
@@ -55,8 +67,8 @@ import dev.rightsize.core.wait.Wait
  * [withMemoryLimit] override; callers who hit memory pressure can call it themselves.
  */
 class MinIOContainer(image: DockerImageName) : GenericContainer<MinIOContainer>(image.toString()) {
-    /** Defaults to `minio/minio:latest` — this image's floating reference (see the class doc). */
-    constructor(image: String = "minio/minio:latest") : this(DockerImageName.parse(image))
+    /** Defaults to `quay.io/minio/minio:latest` — this image's floating reference (see the class doc). */
+    constructor(image: String = "quay.io/minio/minio:latest") : this(DockerImageName.parse(image))
 
     private var usernameState = "testuser"
     private var passwordState = "testpassword"

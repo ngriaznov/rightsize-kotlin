@@ -8,7 +8,7 @@ credential pair.
 
 | | |
 |---|---|
-| Default image | `minio/minio:latest` — this image's floating reference (see below) |
+| Default image | `quay.io/minio/minio:latest` — this image's floating reference (see below) |
 | Exposed ports | `9000` (S3 API — what the helpers use), `9001` (console, exposed but not wrapped by a helper) |
 | Command | `server /data --console-address :9001` |
 | Env | `MINIO_ROOT_USER=testuser`, `MINIO_ROOT_PASSWORD=testpassword` |
@@ -17,12 +17,18 @@ credential pair.
 With no image given, this module tracks upstream's `latest` tag rather than a version
 this library pins, so the version moves with MinIO's own releases instead of this
 library's release cycle. The facts below were verified against
-`minio/minio:RELEASE.2025-09-07T16-13-09Z` specifically — pass that image explicitly to
+`minio/minio:RELEASE.2025-09-07T16-13-09Z` specifically — pass an image explicitly to
 pin it:
 
 ```kotlin
-MinIOContainer("minio/minio:RELEASE.2025-09-07T16-13-09Z")
+MinIOContainer("quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z")
 ```
+
+**Why `quay.io`, not Docker Hub:** the default used to be the bare `minio/minio:latest`.
+MinIO pulled that repository from Docker Hub entirely (`docker pull minio/minio` now
+fails "repository does not exist"), so this module's floating default moved to MinIO's
+maintained mirror, `quay.io/minio/minio`. Compatibility checking (below) still accepts
+a bare `minio/minio:<tag>` override too — only the *default* moved, not what's accepted.
 
 ## Helpers
 
@@ -114,7 +120,10 @@ memory pressure can call it themselves.
 Passing an explicit image checks its repository against the one this module
 understands (`minio/minio`) before any port, wait-strategy, or backend work runs — a
 mismatched image fails fast with a typed `IncompatibleImageException` naming both
-repositories, rather than degrading into a bare wait-strategy timeout. To use a
+repositories, rather than degrading into a bare wait-strategy timeout. The check is
+registry-agnostic (the registry host, e.g. `quay.io`, is stripped before comparing), so
+both `quay.io/minio/minio:<tag>` and a bare `minio/minio:<tag>` are accepted
+identically — only a genuinely different repository is rejected. To use a
 differently-named image on purpose (a private mirror, a hardened rebuild), wrap it
 with the escape hatch:
 
