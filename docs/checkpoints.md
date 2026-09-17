@@ -61,10 +61,14 @@ A checkpoint of a `withTmpfsRoot()` container is refused up front: `checkpoint()
 memory and there is nothing durable on disk to snapshot — this applies whether the call is an
 unnamed `checkpoint()` or a named `checkpoint("existing-name")`, so a refused named
 re-checkpoint leaves the existing checkpoint entirely untouched. Restoring the other direction has
-a matching constraint: `msb restore` has no root-disk flag at all (`withDiskLimit`/`withTmpfsRoot`
-on a `fromCheckpoint` restore go unhonored rather than erroring), because the snapshot already
-pins the root disk — the same reasoning that keeps this restore command from taking an env or
-command override either (see the "API" section below).
+a matching constraint: `msb restore` has no root-disk or network-policy flag at all, because the
+snapshot already pins the disk/network geometry — the same reasoning that keeps this restore
+command from taking an env or command override either. Calling `withDiskLimit`/`withTmpfsRoot`/
+`withNetworkDisabled` on a `fromCheckpoint` restore throws `CheckpointRestoreOverrideUnsupportedException`
+at `start()`, the same exception and the same guard env/command overrides trip (see the "API"
+section below) — none of the three is ever part of what a checkpoint captures, so using any of
+them after `fromCheckpoint` is always a genuine divergence, never a re-statement of a captured
+value.
 Because of that, `checkpoint()` re-applies the container's own wait strategy before returning
 whenever the active backend's `capabilities.checkpointRestartsWorkload` is `true` — a bare return
 would otherwise hand back a container that looks ready but whose workload hasn't actually come
@@ -141,6 +145,13 @@ restored.start()   // fresh container, migrated schema and seed rows already on 
   `false` (microsandbox: `msb restore`'s disk-only mode has no `-e`/`--env` flag and no
   command-override flag at all — it always replays the snapshot's own captured configuration, so
   a caller's override would otherwise be silently dropped rather than genuinely applied);
+- calling `withDiskLimit`/`withTmpfsRoot`/`withNetworkDisabled` at all, for any value, after
+  `fromCheckpoint` is gated the same way: fine on a backend whose
+  `capabilities.checkpointRestoreOverridable` is `true`, but throws
+  `CheckpointRestoreOverrideUnsupportedException` before any backend call on microsandbox — none
+  of the three is ever part of `cp.spec` (a checkpoint never captures disk/network geometry), so
+  unlike env/command there is no "re-supplying the same captured value" case that's allowed
+  through; any use of them after `fromCheckpoint` on microsandbox is rejected;
 - requires the active backend at `start()` time to match `cp.backend` — restoring an msb
   snapshot under the docker backend (or vice versa) throws `CheckpointBackendMismatchException`
   before any backend call, naming both backends and the `RIGHTSIZE_BACKEND=<creator>` remedy;

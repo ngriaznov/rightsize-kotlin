@@ -30,8 +30,12 @@ reaches its first tagged release.
   changing either now throws the new typed `CheckpointRestoreOverrideUnsupportedException`
   before any backend call on microsandbox (new `BackendCapabilities.checkpointRestoreOverridable`,
   `false` there, `true` on Docker, which has no such restriction); re-supplying exactly
-  what the checkpoint already captured never throws. No other checkpoint/restore public
-  API changed.
+  what the checkpoint already captured never throws. The same guard also covers
+  `withDiskLimit`/`withTmpfsRoot`/`withNetworkDisabled` called after `fromCheckpoint`: since
+  a checkpoint never captures disk/network geometry in the first place, any use of these
+  three after `fromCheckpoint` is now always rejected with the same exception on
+  microsandbox, rather than silently booting with the snapshot's own geometry instead of
+  the one requested. No other checkpoint/restore public API changed.
 - **The MinIO module's default image moved to `quay.io/minio/minio:latest`.** Docker
   Hub's `minio/minio` repository was removed upstream (`docker pull minio/minio` now
   fails "repository does not exist"); the floating default now points at MinIO's

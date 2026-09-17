@@ -300,20 +300,29 @@ class CheckpointBackendMismatchException(creatorBackend: String, activeBackend: 
         "checkpoint() again under '$activeBackend' to create one it can restore")
 
 /**
- * Thrown by `GenericContainer.fromCheckpoint(cp).start()` when `withEnv`/`withCommand`/
- * `removeEnv` were used, after `fromCheckpoint`, to change env or command away from what
- * [Checkpoint.spec] captured — and the active backend's
- * [BackendCapabilities.checkpointRestoreOverridable] is `false`. Raised before any backend
- * call, same as [CheckpointBackendMismatchException]; re-supplying the SAME env/command
- * `fromCheckpoint` already pre-populated from [Checkpoint.spec] never throws this, whatever the
- * backend — only a genuine divergence does. See [BackendCapabilities.checkpointRestoreOverridable]'s
- * doc for why microsandbox's disk-only restore can't honor an override at all.
+ * Thrown by `GenericContainer.fromCheckpoint(cp).start()` when either:
+ * - `withEnv`/`withCommand`/`removeEnv` were used, after `fromCheckpoint`, to change env or
+ *   command away from what [Checkpoint.spec] captured, or
+ * - `withDiskLimit`/`withTmpfsRoot`/`withNetworkDisabled` were used at all, after
+ *   `fromCheckpoint` — these are never part of [Checkpoint.spec] in the first place (a restore
+ *   always inherits the snapshot's own captured disk/network geometry), so calling any of them
+ *   on a restored container is by definition a divergence, never a re-statement of a captured
+ *   value,
+ *
+ * and the active backend's [BackendCapabilities.checkpointRestoreOverridable] is `false`. Raised
+ * before any backend call, same as [CheckpointBackendMismatchException]; re-supplying the SAME
+ * env/command `fromCheckpoint` already pre-populated from [Checkpoint.spec] never throws this,
+ * whatever the backend — only a genuine divergence does. See
+ * [BackendCapabilities.checkpointRestoreOverridable]'s doc for why microsandbox's disk-only
+ * restore can't honor any of these overrides at all.
  */
 class CheckpointRestoreOverrideUnsupportedException(backend: String) : RuntimeException(
-    "This checkpoint would restore under the '$backend' backend, which cannot override env or " +
-        "command on restore — its restore primitive always replays the snapshot's own captured " +
-        "configuration. Remove the withEnv()/withCommand()/removeEnv() calls made after " +
-        "fromCheckpoint(), or capture a new checkpoint with the env/command you want restored.")
+    "This checkpoint would restore under the '$backend' backend, which cannot override env, " +
+        "command, disk limit, tmpfs root, or network-disabled on restore — its restore primitive " +
+        "always replays the snapshot's own captured configuration and geometry verbatim. Remove " +
+        "the withEnv()/withCommand()/removeEnv()/withDiskLimit()/withTmpfsRoot()/" +
+        "withNetworkDisabled() calls made after fromCheckpoint(), or capture a new checkpoint " +
+        "with the configuration you want restored.")
 
 /**
  * Thrown by `GenericContainer.copyFileToContainer`/`copyContentToContainer`/

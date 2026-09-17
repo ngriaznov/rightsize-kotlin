@@ -332,6 +332,76 @@ class GenericContainerCheckpointTest {
         } finally { restored.stop() }
     }
 
+    // --- checkpointRestoreOverridable also gates disk/tmpfs/network overrides at restore (msb:
+    // false) — these are never part of CheckpointSpec at all, so ANY use of withDiskLimit/
+    // withTmpfsRoot/withNetworkDisabled after fromCheckpoint is by definition a divergence, with
+    // no "re-supplying the same captured value" case to allow through (unlike env/command).
+
+    @Test fun `fromCheckpoint with withDiskLimit throws before any backend call when the backend cannot honor a restore override`() {
+        val backend = CheckpointFakeBackend(checkpointRestoreOverridable = false)
+        val cp = Checkpoint(
+            ref = "rz-ckpt-0123456789ab", backend = "fake",
+            spec = CheckpointSpec(env = emptyMap(), command = null, exposedPorts = emptyList(), memoryLimitMb = null),
+        )
+        val restored = GenericContainer.fromCheckpoint(cp).withBackend(backend).waitingFor(CheckpointReady)
+            .withDiskLimit(4096)
+        val e = assertThrows(CheckpointRestoreOverrideUnsupportedException::class.java) { restored.start() }
+        assertTrue(backend.created.isEmpty(), "no create call when a restore-time disk-limit override is unsupported")
+        assertTrue(e.message!!.contains("fake"), "message should name the active backend: ${e.message}")
+    }
+
+    @Test fun `fromCheckpoint with withTmpfsRoot throws before any backend call when the backend cannot honor a restore override`() {
+        val backend = CheckpointFakeBackend(checkpointRestoreOverridable = false)
+        val cp = Checkpoint(
+            ref = "rz-ckpt-0123456789ab", backend = "fake",
+            spec = CheckpointSpec(env = emptyMap(), command = null, exposedPorts = emptyList(), memoryLimitMb = null),
+        )
+        val restored = GenericContainer.fromCheckpoint(cp).withBackend(backend).waitingFor(CheckpointReady)
+            .withTmpfsRoot(256).withMemoryLimit(512)
+        assertThrows(CheckpointRestoreOverrideUnsupportedException::class.java) { restored.start() }
+        assertTrue(backend.created.isEmpty(), "no create call when a restore-time tmpfs-root override is unsupported")
+    }
+
+    @Test fun `fromCheckpoint with withNetworkDisabled throws before any backend call when the backend cannot honor a restore override`() {
+        val backend = CheckpointFakeBackend(checkpointRestoreOverridable = false)
+        val cp = Checkpoint(
+            ref = "rz-ckpt-0123456789ab", backend = "fake",
+            spec = CheckpointSpec(env = emptyMap(), command = null, exposedPorts = emptyList(), memoryLimitMb = null),
+        )
+        val restored = GenericContainer.fromCheckpoint(cp).withBackend(backend).waitingFor(CheckpointReady)
+            .withNetworkDisabled()
+        assertThrows(CheckpointRestoreOverrideUnsupportedException::class.java) { restored.start() }
+        assertTrue(backend.created.isEmpty(), "no create call when a restore-time network-disabled override is unsupported")
+    }
+
+    @Test fun `fromCheckpoint disk limit tmpfs root and network-disabled overrides are fine when the backend declares itself overridable`() {
+        // Same overrides as the unsupported-backend tests above must NOT throw when the active
+        // backend declares checkpointRestoreOverridable = true (Docker's shape).
+        val diskBackend = CheckpointFakeBackend(checkpointRestoreOverridable = true)
+        val diskCp = Checkpoint(
+            ref = "rightsize/checkpoint:0123456789ab", backend = "fake",
+            spec = CheckpointSpec(env = emptyMap(), command = null, exposedPorts = emptyList(), memoryLimitMb = null),
+        )
+        val diskRestored = GenericContainer.fromCheckpoint(diskCp).withBackend(diskBackend).waitingFor(CheckpointReady)
+            .withDiskLimit(4096)
+        diskRestored.start()
+        try {
+            assertEquals(4096L, diskBackend.created.single().diskLimitMb)
+        } finally { diskRestored.stop() }
+
+        val netBackend = CheckpointFakeBackend(checkpointRestoreOverridable = true)
+        val netCp = Checkpoint(
+            ref = "rightsize/checkpoint:abcdefabcdef", backend = "fake",
+            spec = CheckpointSpec(env = emptyMap(), command = null, exposedPorts = emptyList(), memoryLimitMb = null),
+        )
+        val netRestored = GenericContainer.fromCheckpoint(netCp).withBackend(netBackend).waitingFor(CheckpointReady)
+            .withNetworkDisabled()
+        netRestored.start()
+        try {
+            assertTrue(netBackend.created.single().networkDisabled)
+        } finally { netRestored.stop() }
+    }
+
     @Test fun `a plain (non-checkpoint) container never trips the restore-override guard regardless of capability`() {
         val backend = CheckpointFakeBackend(checkpointRestoreOverridable = false)
         val c = GenericContainer("alpine:3.19").withBackend(backend).waitingFor(CheckpointReady).withEnv("X", "1")

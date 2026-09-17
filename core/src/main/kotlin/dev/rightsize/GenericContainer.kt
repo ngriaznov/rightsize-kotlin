@@ -113,8 +113,10 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
     /**
      * Caps the writable root disk at [megabytes] — msb-only (`--root-disk`), grow-only across an
      * msb reboot; docker runs without a ceiling. Cannot be combined with [withTmpfsRoot] (see
-     * [RootDiskConflictException], checked at [start]), and msb rejects a root-disk setting on a
-     * [fromCheckpoint] restore before boot — the snapshot pins the root disk.
+     * [RootDiskConflictException], checked at [start]), and on a backend whose
+     * `capabilities.checkpointRestoreOverridable` is `false` (msb), calling this after
+     * [fromCheckpoint] throws [CheckpointRestoreOverrideUnsupportedException] at [start] — the
+     * snapshot pins the root disk and a disk-only restore has no CLI-level way to resize it.
      */
     fun withDiskLimit(megabytes: Long): SELF { diskLimitMb = megabytes; return this as SELF }
     /**
@@ -122,16 +124,20 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
      * runs with its normal disk-backed rootfs. Must fit inside the guest's memory (msb defaults
      * to 512M when [withMemoryLimit] is unset — see [TmpfsRootExceedsMemoryException], checked at
      * [start]), and a tmpfs root cannot be checkpointed (see [TmpfsRootCheckpointException]).
-     * Cannot be combined with [withDiskLimit] (see [RootDiskConflictException]), and msb rejects
-     * a root-disk setting on a [fromCheckpoint] restore before boot — the snapshot pins the
-     * root disk.
+     * Cannot be combined with [withDiskLimit] (see [RootDiskConflictException]), and on a backend
+     * whose `capabilities.checkpointRestoreOverridable` is `false` (msb), calling this after
+     * [fromCheckpoint] throws [CheckpointRestoreOverrideUnsupportedException] at [start] — same
+     * reasoning as [withDiskLimit].
      */
     fun withTmpfsRoot(megabytes: Long): SELF { tmpfsRootMb = megabytes; return this as SELF }
     /**
      * Blocks public-internet access — msb-only, emitted as `--net private` (published ports and
      * private-range network links still work); docker ignores it and runs with normal networking.
      * Cannot be combined with [withNetwork] (see [NetworkDisabledConflictException], checked at
-     * [start]).
+     * [start]). On a backend whose `capabilities.checkpointRestoreOverridable` is `false` (msb),
+     * calling this after [fromCheckpoint] throws [CheckpointRestoreOverrideUnsupportedException]
+     * at [start] — `msb restore`'s disk-only mode has no network-policy flag at all, so there is
+     * no way to honor it on a restored sandbox.
      */
     fun withNetworkDisabled(): SELF { networkDisabled = true; return this as SELF }
     /**
@@ -421,8 +427,18 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
         // from what fromCheckpoint captured before ever reaching that backend, not silently boot
         // with the wrong env/command. Re-supplying the same values fromCheckpoint already seeded
         // (the ordinary case — no extra withEnv/withCommand/removeEnv calls) never trips this.
+        //
+        // diskLimitMb/tmpfsRootMb/networkDisabled ride the SAME guard, for the same reason, even
+        // though fromCheckpoint never pre-populates them (CheckpointSpec has no such fields — a
+        // restore's disk-only boot inherits the snapshot's own captured disk/network geometry
+        // verbatim, with no CLI-level way to resize or repolicy it — see MsbCommands.restore's
+        // doc). That makes their baseline implicitly "unset" for every checkpoint-restored
+        // container, so any withDiskLimit/withTmpfsRoot/withNetworkDisabled call reaching here is
+        // BY DEFINITION a genuine divergence, never a re-statement of a captured value — unlike
+        // env/command there is no "re-supplying the same thing" case to allow through.
         if (checkpointRef != null && !backend.capabilities.checkpointRestoreOverridable &&
-            (env.toMap() != checkpointCapturedEnv || command != checkpointCapturedCommand)) {
+            (env.toMap() != checkpointCapturedEnv || command != checkpointCapturedCommand ||
+                diskLimitMb != null || tmpfsRootMb != null || networkDisabled)) {
             throw CheckpointRestoreOverrideUnsupportedException(backend.name)
         }
         // Same placement again: pure spec conflicts, none of them need a backend to detect, so

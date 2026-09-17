@@ -84,7 +84,16 @@ object MsbCommands {
      * `tmpfsRootMb` container is refused before capture even happens (see
      * [MsbCliBackend.createCheckpoint]'s `TmpfsRootCheckpointException` guard), and mounts are
      * never part of `CheckpointSpec` in the first place (see its own doc comment: the checkpoint's
-     * filesystem already carries whatever a mount would have copied in). [spec.ports] and
+     * filesystem already carries whatever a mount would have copied in). For
+     * [MsbCliBackend.createCheckpoint]'s own re-boot, whatever `diskLimitMb`/`networkDisabled` the
+     * live sandbox already had simply rides along unemitted, same as env/command — the disk-only
+     * restore boots the exact disk state that geometry was already baked into, so nothing
+     * observable changes. A caller reaching this via `GenericContainer.fromCheckpoint(cp)
+     * .withDiskLimit(...)`/`.withTmpfsRoot(...)`/`.withNetworkDisabled()` — asking for GENUINELY
+     * different disk/network geometry than the snapshot captured — never gets here at all: that's
+     * rejected earlier, before any backend call, by the same
+     * [dev.rightsize.core.CheckpointRestoreOverrideUnsupportedException] guard that covers
+     * env/command (see `GenericContainer.start`'s override check). [spec.ports] and
      * [spec.memoryLimitMb] DO carry over — `RestoreResourceArgs`/`RestoreControlArgs` both take
      * `-p`/`-m` for exactly this, sizing the fresh destination sandbox rather than describing
      * what was captured.
