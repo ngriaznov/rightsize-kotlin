@@ -161,11 +161,11 @@ object MsbCommands {
     fun snapshotRemove(ref: String) = listOf("snapshot", "rm", ref, "-f")
     /** `msb snapshot inspect <ref>` — its exit code alone is [MsbCliBackend.hasCheckpoint]'s
      * signal (0 = exists, non-zero = doesn't); see docs/checkpoints.md. As of msb 0.7.1 this
-     * resolves reliably only against the snapshot's own artifact path for a path-shaped [ref]
-     * (name-based resolution does not — verified empirically against the real binary), which is
-     * exactly what every ref [MsbCliBackend.createCheckpoint] mints resolves to; a bare [ref]
-     * (e.g. the digest-dir name [MsbCliBackend.importCheckpoint] returns) is passed through
-     * unchanged, as it always has been. */
+     * resolves reliably only against the snapshot's own artifact path (name-based resolution
+     * does not — verified empirically against the real binary), which is exactly the shape every
+     * ref this library mints resolves to, whether minted by [MsbCliBackend.createCheckpoint] or
+     * [MsbCliBackend.importCheckpoint] — both now return an absolute artifact path, never a bare
+     * name. [ref] is passed through unchanged either way. */
     fun snapshotInspect(ref: String) = listOf("snapshot", "inspect", ref)
 
     /**
@@ -178,15 +178,17 @@ object MsbCommands {
      */
     fun snapshotExport(ref: String, dest: Path) = listOf("snapshot", "save", ref, dest.toString())
 
-    /** `msb snapshot load <archive>` — unpacks [archive] into a digest-derived directory under
-     * `~/.microsandbox/snapshots/`, discarding the original snapshot name entirely (see
-     * [MsbCliBackend.importCheckpoint]). */
-    fun snapshotImport(archive: Path) = listOf("snapshot", "load", archive.toString())
-
-    /** `msb snapshot list --format json` — the only way to confirm the digest-dir basename
-     * `snapshot load` itself prints is genuinely registered (see
-     * [MsbCliBackend.importCheckpoint] and [MsbSnapshotListJson]). */
-    fun snapshotList() = listOf("snapshot", "list", "--format", "json")
+    /** `msb snapshot load <archive> --dest <destDir>` — unpacks [archive] into [destDir], this
+     * library's own checkpoints directory (`CacheDir.resolve()/checkpoints` — the same directory
+     * [snapshotCreate]'s own `--dest-dir` writes under; see [MsbCliBackend.importCheckpoint]'s
+     * doc), rather than msb's own default `~/.microsandbox/snapshots/` store [destDir]'s absence
+     * would target — [destDir] is therefore ALWAYS passed, never omitted. msb 0.7.1 nests the
+     * unpacked artifact under a fresh group/snapshot directory of its own choosing beneath
+     * [destDir] and discards the original snapshot name entirely, printing the resulting absolute
+     * artifact path as the LAST line of stdout on success (see
+     * [parseSnapshotLoadArtifactPath]). */
+    fun snapshotImport(archive: Path, destDir: Path) =
+        listOf("snapshot", "load", archive.toString(), "--dest", destDir.toString())
 
     /**
      * `msb copy -q <src> <name>:<dst>` — copies a host file or directory into the running
@@ -254,40 +256,9 @@ internal object MsbLsJson {
     }.getOrDefault(emptyList()).firstOrNull { it.name == name }?.status
 }
 
-/** One entry of `msb snapshot list --format json`'s output — only the fields
- * [MsbSnapshotListJson.contains] reads; `created_at`/`digest` (and anything a future msb version
- * adds) are ignored by the `ignoreUnknownKeys` [Json] instance. `artifact_path` names the on-disk
- * snapshot directory (whose basename is the digest-dir name `msb snapshot load` itself
- * prints); `name` was confirmed to carry that same digest-dir value against msb 0.6.8 for an
- * imported snapshot — matching on both `name` and `artifact_path`'s basename covers whichever
- * one a future msb version favors.
- */
-@Serializable
-private data class SnapshotEntry(
-    val name: String? = null,
-    val artifact_path: String? = null,
-)
-
-/**
- * Parses `msb snapshot list --format json`, used to confirm the digest-dir basename `msb
- * snapshot import`'s own output names is genuinely a registered snapshot (see
- * [MsbCliBackend.importCheckpoint]). The FULL `sha256:<64hex>` `digest` field is deliberately
- * never surfaced here: msb does not resolve it as a snapshot ref (`msb snapshot inspect
- * sha256:<full>` fails "snapshot not found", treating it as a literal path) — only the
- * digest-dir name (`sha256-<16hex>`) does, for `inspect`, `rm`, and `restore` alike.
- *
- * PIN: keep this in sync with `msb snapshot list --format json`'s actual shape if msb changes it
- * — the msb `sandbox-it` lane is the only guard on that short of a live-CLI shape drift, same as
- * [MsbLsJson]'s own pin.
- */
-internal object MsbSnapshotListJson {
-    private val json = Json { ignoreUnknownKeys = true }
-
-    /** True if an entry's `name` equals [digestDir], or its `artifact_path`'s basename does —
-     * `false` if no entry matches or [json] isn't the documented array shape. */
-    fun contains(json: String, digestDir: String): Boolean = runCatching {
-        this.json.decodeFromString<List<SnapshotEntry>>(json)
-    }.getOrDefault(emptyList()).any { entry ->
-        entry.name == digestDir || entry.artifact_path?.let { Path.of(it).fileName?.toString() } == digestDir
-    }
-}
+// `MsbSnapshotListJson` (parsing `msb snapshot list --format json` to confirm a digest-dir
+// basename was genuinely registered) and the `snapshot list` command builder it backed were
+// removed here: msb 0.7.1's `snapshot load` prints the LOADED ARTIFACT's own absolute path as its
+// last stdout line, which [MsbCliBackend.importCheckpoint] now takes as the effective ref
+// directly (see [parseSnapshotLoadArtifactPath]) — there is nothing left to cross-reference a
+// digest-dir basename against.

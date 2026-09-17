@@ -72,6 +72,21 @@ reaches its first tagged release.
   maintained `quay.io` mirror. Compatibility checking stays registry-agnostic, so a
   `minio/minio:<tag>` override is still accepted alongside a `quay.io/minio/minio:<tag>`
   one — only the default moved.
+- **`msb snapshot load` (checkpoint-archive import) is now always given `--dest
+  <cache-dir>/checkpoints`**, this library's own checkpoints directory — the same one
+  `createCheckpoint`'s `--dest-dir` already writes under — instead of defaulting into
+  msb's own global `~/.microsandbox/snapshots/` store, so an imported artifact and a
+  locally created one now live under the same rightsize-owned tree.
+  `Checkpoint.exportTo`/`importFrom` keep their exact signatures and archive-file
+  behavior — only the underlying `msb snapshot load` invocation and ref derivation
+  changed. **A second user-visible ref-shape change, alongside the one `createCheckpoint`
+  already got**: `Checkpoint.importFrom`'s effective ref is now the LOADED ARTIFACT's own
+  absolute path — parsed, defensively, from `snapshot load`'s own last stdout line, the
+  same `?: error(...)` shape `createCheckpoint`'s own parsing already has — instead of a
+  bare digest-dir name (`sha256-<16hex>`) cross-referenced against `msb snapshot list
+  --format json`; that list-based lookup no longer applies to anything this library mints
+  and has been removed. Docker's `importCheckpoint` is unaffected, always returning its
+  input ref unchanged.
 
 ## [0.7.9] - 2026-09-10
 

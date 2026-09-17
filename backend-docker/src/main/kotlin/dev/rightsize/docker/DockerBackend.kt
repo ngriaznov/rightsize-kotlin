@@ -273,9 +273,9 @@ class DockerBackend : SandboxBackend {
     /**
      * Backs `Checkpoint.importFrom`: `docker load -i <src>` preserves the image's original tag
      * (`Loaded image: <tag>` — reloading over an existing tag re-points it), so the effective ref
-     * this returns is [ref] itself, unchanged — unlike microsandbox, whose `snapshot import`
-     * mints its own content-addressed ref (see `MsbCliBackend.importCheckpoint` in the sibling
-     * `backend-microsandbox` module).
+     * this returns is [ref] itself, unchanged — unlike microsandbox, whose `snapshot load` mints
+     * its own artifact path, discarding the original snapshot name entirely (see
+     * `MsbCliBackend.importCheckpoint` in the sibling `backend-microsandbox` module).
      */
     override fun importCheckpoint(src: Path, ref: String): String {
         runDockerCli("load", "-i", src.toString(), timeoutSec = SAVE_LOAD_TIMEOUT_SEC, onFailure = { error(it) })

@@ -203,6 +203,21 @@ class MsbCommandsTest {
         MsbCommands::class.java.getMethod("snapshotCreate", String::class.java, String::class.java, Path::class.java)
     }
 
+    @Test fun `snapshot save carries the ref and destination verbatim, never --with-image`() {
+        val fullPath = "/home/u/.cache/rightsize/checkpoints/rz-abc-1/snap_0123456789abcdef0123456789abcdef"
+        val dest = Path.of("/home/u/archives/rz-abc-1.tar.zst")
+        val cmd = MsbCommands.snapshotExport(fullPath, dest)
+        assertEquals(listOf("snapshot", "save", fullPath, dest.toString()), cmd)
+        assertFalse("--with-image" in cmd, "export must never bundle the OCI image")
+    }
+
+    @Test fun `snapshot load always carries --dest, never msb's own default snapshots store`() {
+        val archive = Path.of("/home/u/archives/rz-abc-1.tar.zst")
+        val destDir = Path.of("/home/u/.cache/rightsize/checkpoints")
+        assertEquals(listOf("snapshot", "load", archive.toString(), "--dest", destDir.toString()),
+            MsbCommands.snapshotImport(archive, destDir))
+    }
+
     @Test fun `copyTo and copyFrom`() {
         assertEquals(listOf("copy", "-q", "/host/src.txt", "rz-abc-1:/dst.txt"),
             MsbCommands.copyTo("rz-abc-1", Path.of("/host/src.txt"), "/dst.txt"))

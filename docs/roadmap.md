@@ -19,7 +19,7 @@ Portable checkpoint archives have shipped (`exportTo`/`importFrom` — see
 [Checkpoint / Restore](checkpoints.md#moving-checkpoints-between-machines)), but neither backend
 bundles the container image itself: a restored container still pulls it normally on first boot.
 Bundling the OCI image into the archive too — so an archive boots offline, with no registry
-reachable at all — needs msb's `snapshot export --with-image` to stop failing its own import
+reachable at all — needs msb's `snapshot save --with-image` to stop failing its own import
 integrity check (a known issue as of 0.6.6) before it's viable there; the docker side is more
 tractable (an image `save` already exists) but only worth doing once both backends can offer it.
 

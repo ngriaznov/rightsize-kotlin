@@ -437,24 +437,23 @@ fresh pull).
   returned `Checkpoint` restores via `GenericContainer.fromCheckpoint` exactly like any other —
   refs are opaque, and nothing downstream cares how one was minted.
 
-### The effective ref: msb mints a digest, docker round-trips the tag
+### The effective ref: docker round-trips the tag, msb mints its own artifact path under the same checkpoints dir
 
 The ref a checkpoint restores by is not always the archived one:
 
 | | docker | microsandbox |
 |---|---|---|
-| Import mechanism | `docker load -i <archive>` | `msb snapshot load <archive>` |
-| Effective ref after import | The original tag, unchanged (`Loaded image: <tag>`) | A fresh DIGEST — the original snapshot name is never preserved |
+| Import mechanism | `docker load -i <archive>` | `msb snapshot load <archive> --dest <cache-dir>/checkpoints` |
+| Effective ref after import | The original tag, unchanged (`Loaded image: <tag>`) | The LOADED ARTIFACT's own absolute path — the original snapshot name is never preserved |
 
-An imported msb checkpoint therefore shows up in `Checkpoint.find`/`list` with a digest-shaped
-ref (e.g. `sha256-b9c0448ee9d54e33`) instead of the absolute
-`<cache-dir>/checkpoints/<sandbox>/snap_<hex>` path shape a locally created one has — `msb
-snapshot load` writes into msb's own default `~/.microsandbox/snapshots/` store, not the
-rightsize cache directory `--dest-dir` points `createCheckpoint` at, so an imported artifact and
-a locally created one live in different places on disk. `fromCheckpoint`, `snapshot rm`, and
-`snapshot inspect` all accept either shape unchanged (a digest-dir name or a full artifact path).
-Importing an archive whose content already exists on the destination (matched by digest) is
-itself a success, not an error — the artifact is already there.
+An imported msb checkpoint therefore shows up in `Checkpoint.find`/`list` with an absolute
+`<cache-dir>/checkpoints/<msb-group>/snap_<hex>` path — the same `<cache-dir>/checkpoints`
+directory a locally created checkpoint's `--dest-dir` writes under (see above), just with msb's
+own choice of group/snapshot naming nested beneath it, since `--dest` is always passed rather
+than left to default to msb's own `~/.microsandbox/snapshots/` store. `snapshot load` prints that
+full path as the LAST line of its stdout on success; `fromCheckpoint`, `snapshot rm`, and
+`snapshot inspect` all take it verbatim. Importing an archive whose content already exists on the
+destination is itself a success, not an error — the artifact is already there.
 
 ### Archive size expectations
 
