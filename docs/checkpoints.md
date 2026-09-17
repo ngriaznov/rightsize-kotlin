@@ -451,9 +451,11 @@ An imported msb checkpoint therefore shows up in `Checkpoint.find`/`list` with a
 directory a locally created checkpoint's `--dest-dir` writes under (see above), just with msb's
 own choice of group/snapshot naming nested beneath it, since `--dest` is always passed rather
 than left to default to msb's own `~/.microsandbox/snapshots/` store. `snapshot load` prints that
-full path as the LAST line of its stdout on success; `fromCheckpoint`, `snapshot rm`, and
-`snapshot inspect` all take it verbatim. Importing an archive whose content already exists on the
-destination is itself a success, not an error — the artifact is already there.
+full path as the LAST line of its stdout on an ordinary success; `fromCheckpoint`, `snapshot rm`,
+and `snapshot inspect` all take it verbatim. Importing an archive whose content already exists on
+the destination is itself a success, not an error — the artifact is already there. That outcome's
+own stdout shape on msb 0.7.1 isn't independently confirmed, so ref parsing tries stdout first and
+falls back to stderr (the shape verified against msb 0.6.8) before giving up.
 
 ### Archive size expectations
 

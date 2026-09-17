@@ -86,7 +86,12 @@ reaches its first tagged release.
   bare digest-dir name (`sha256-<16hex>`) cross-referenced against `msb snapshot list
   --format json`; that list-based lookup no longer applies to anything this library mints
   and has been removed. Docker's `importCheckpoint` is unaffected, always returning its
-  input ref unchanged.
+  input ref unchanged. On the already-exists-as-success outcome specifically (re-importing
+  an archive whose content is already present), msb 0.7.1's exact stdout shape for that
+  branch is not independently confirmed, so ref parsing tries stdout first and falls back
+  to stderr — the one shape this library has verbatim evidence for, from msb 0.6.8 — rather
+  than assuming either one outright; only if neither stream yields an absolute path does
+  `importFrom` throw.
 
 ## [0.7.9] - 2026-09-10
 

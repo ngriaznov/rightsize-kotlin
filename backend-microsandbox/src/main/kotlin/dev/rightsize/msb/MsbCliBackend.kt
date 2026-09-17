@@ -672,24 +672,40 @@ class MsbCliBackend private constructor(
      * [ref] (the archive's originally recorded ref, possibly from a wholly different machine) is
      * NOT what msb restores from and plays no part in the result — [ref] itself is unused beyond
      * being part of this method's signature (the SPI contract every backend shares; docker's own
-     * [ref] IS its effective ref, unlike this one). msb 0.7.1 nests the unpacked artifact under a
-     * fresh group/snapshot directory of its own choosing beneath [checkpointsDir], discarding the
-     * original snapshot name entirely, and prints that full absolute path as the LAST line of
-     * stdout on success (a `group msb-<hex>: head snap_<digest> (...)` line, then a digest line,
-     * then the artifact path — verified empirically against the real binary).
-     * [parseSnapshotLoadArtifactPath] parses that last line the same defensively-absolute-path way
-     * [parseSnapshotCreateArtifactPath] already does for `snapshot create` — a bad parse here
-     * would otherwise silently mint a ref nothing could ever restore/remove/inspect again, so this
-     * throws quoting the raw stdout instead.
+     * [ref] IS its effective ref, unlike this one). On an ORDINARY success, msb 0.7.1 nests the
+     * unpacked artifact under a fresh group/snapshot directory of its own choosing beneath
+     * [checkpointsDir], discarding the original snapshot name entirely, and prints that full
+     * absolute path as the LAST line of stdout (a `group msb-<hex>: head snap_<digest> (...)`
+     * line, then a digest line, then the artifact path — verified empirically against the real
+     * binary). [parseSnapshotLoadArtifactPath] parses that last line the same
+     * defensively-absolute-path way [parseSnapshotCreateArtifactPath] already does for `snapshot
+     * create` — a bad parse here would otherwise silently mint a ref nothing could ever
+     * restore/remove/inspect again, so this throws quoting the raw output instead.
      *
      * Importing an archive whose content already exists fails with msb's own `error: snapshot
      * already exists: <path>` on stderr — for a content-addressed archive that IS success (the
-     * artifact is already present), so [isSnapshotAlreadyExists] treats it as one and this still
-     * parses the effective ref from stdout exactly as the ordinary success path does; any OTHER
-     * failure surfaces with stderr. The pre-0.7.1 approach of cross-referencing `msb snapshot list
-     * --format json` by a parsed digest-dir basename no longer applies — every ref this library
-     * mints today, from both [createCheckpoint] and this method, is already the absolute path msb
-     * itself reported, so there is nothing left to look up.
+     * artifact is already present), so [isSnapshotAlreadyExists] treats it as one rather than a
+     * genuine failure; any OTHER non-zero exit surfaces with stderr. What this ALREADY-EXISTS
+     * outcome prints on msb 0.7.1 is NOT independently verified — the only real evidence in this
+     * codebase of msb's already-exists shape is [isSnapshotAlreadyExists]'s own doc comment,
+     * observed verbatim against msb 0.6.8, where the artifact path lived ONLY on stderr (stdout
+     * was not captured/verified that way at all). It is plausible 0.7.1 still prints the full
+     * `group ...`/digest/path summary to stdout before failing, matching the ordinary-success
+     * shape — but it is equally plausible the command short-circuits on the duplicate-content
+     * check before ever printing that summary, leaving stdout empty or partial. Rather than bet
+     * on either shape, this tries [r.stdout] first (via [parseSnapshotLoadArtifactPath], the
+     * bare-artifact-path-as-a-whole-line shape) and, only on the already-exists outcome, falls
+     * back to [r.stderr] via [parseSnapshotAlreadyExistsArtifactPath] — a DIFFERENT parse shape,
+     * because msb's already-exists stderr is a sentence with the path as its trailing token
+     * (`error: snapshot already exists: <path>`, per [isSnapshotAlreadyExists]'s doc), not a
+     * bare path line on its own. This mirrors the pre-0.7.1 code's own `val output = if
+     * (alreadyExists) r.stderr else r.stdout` branch, just tried as a fallback rather than
+     * assumed outright, since which stream carries the path on 0.7.1's already-exists outcome has
+     * not been confirmed against the real binary. Only if NEITHER stream parses does this throw.
+     * The pre-0.7.1 approach of cross-referencing `msb snapshot list --format json` by a parsed
+     * digest-dir basename no longer applies — every ref this library mints today, from both
+     * [createCheckpoint] and this method, is already the absolute path msb itself reported, so
+     * there is nothing left to look up.
      */
     override fun importCheckpoint(src: Path, ref: String): String {
         val checkpointsDir = CacheDir.resolve().resolve("checkpoints")
@@ -700,10 +716,15 @@ class MsbCliBackend private constructor(
             error("msb snapshot load $src --dest $checkpointsDir failed (exit ${r.exitCode}): " +
                 "${r.stderr.trim().ifEmpty { r.stdout.trim() }}")
         }
-        return parseSnapshotLoadArtifactPath(r.stdout)
+        val fromStdout = parseSnapshotLoadArtifactPath(r.stdout)
+        val fromStderr = if (alreadyExists) parseSnapshotAlreadyExistsArtifactPath(r.stderr) else null
+        return fromStdout ?: fromStderr
             ?: error("msb snapshot load $src --dest $checkpointsDir " +
-                (if (alreadyExists) "reported the snapshot already exists, but" else "succeeded, but") +
-                " its stdout did not end with an absolute artifact path: '${r.stdout.trim()}'")
+                (if (alreadyExists)
+                    "reported the snapshot already exists, but neither its stdout nor its stderr ended " +
+                        "with an absolute artifact path: stdout='${r.stdout.trim()}' stderr='${r.stderr.trim()}'"
+                 else
+                    "succeeded, but its stdout did not end with an absolute artifact path: '${r.stdout.trim()}'"))
     }
 
     /**
@@ -1273,17 +1294,41 @@ internal fun parseSnapshotCreateArtifactPath(output: String): String? = parseTra
 
 /**
  * Parses the absolute snapshot artifact path `msb snapshot load` prints as its own LAST stdout
- * line, on both an ordinary success and the already-exists-as-success outcome alike (msb 0.7.1: a
- * `group msb-<hex>: head snap_<digest> (...)` line, a digest line, then the artifact path —
- * verified empirically against the real binary). This IS the checkpoint ref
- * [MsbCliBackend.importCheckpoint] returns — unlike msb's pre-0.7.1 shape (a bare digest-DIR
- * basename, resolved separately via `snapshot list`, now dead code and removed), the whole line
- * is the ref: an absolute path nested under this library's own checkpoints directory (see
- * [MsbCommands.snapshotImport]'s `--dest`), msb's own choice of group/snapshot naming beneath it.
- * Delegates to [parseTrailingAbsolutePathLine] — the shared parsing core this and
- * [parseSnapshotCreateArtifactPath] both use.
+ * line on an ORDINARY success (msb 0.7.1: a `group msb-<hex>: head snap_<digest> (...)` line, a
+ * digest line, then the artifact path — verified empirically against the real binary). This IS
+ * the checkpoint ref [MsbCliBackend.importCheckpoint] returns — unlike msb's pre-0.7.1 shape (a
+ * bare digest-DIR basename, resolved separately via `snapshot list`, now dead code and removed),
+ * the whole line is the ref: an absolute path nested under this library's own checkpoints
+ * directory (see [MsbCommands.snapshotImport]'s `--dest`), msb's own choice of group/snapshot
+ * naming beneath it. [MsbCliBackend.importCheckpoint] also tries this same parse against stdout
+ * on the already-exists-as-success outcome FIRST, in case 0.7.1 still prints the same summary
+ * there — but falls back to [parseSnapshotAlreadyExistsArtifactPath] against stderr if it
+ * doesn't, since that outcome's own stdout shape isn't independently confirmed (see
+ * [MsbCliBackend.importCheckpoint]'s doc). Delegates to [parseTrailingAbsolutePathLine] — the
+ * shared parsing core this and [parseSnapshotCreateArtifactPath] both use.
  */
 internal fun parseSnapshotLoadArtifactPath(output: String): String? = parseTrailingAbsolutePathLine(output)
+
+/**
+ * Parses the absolute snapshot artifact path from msb's already-exists STDERR sentence (`error:
+ * snapshot already exists: <path>` — observed verbatim against the real msb 0.6.8 binary, see
+ * [isSnapshotAlreadyExists]'s doc), used by [MsbCliBackend.importCheckpoint] as the fallback ref
+ * source when the already-exists outcome's stdout doesn't itself parse via
+ * [parseSnapshotLoadArtifactPath]. UNLIKE that function, the path here is not the WHOLE last
+ * line — it's a sentence with the path as its trailing whitespace-separated token — so this
+ * takes the last non-blank line's final token (the same `substringAfterLast(' ')` shape the
+ * pre-0.7.1 `parseImportedDigestDir` used) and requires THAT token, on its own, to parse as an
+ * absolute [Path]. Returns `null` — never throws — for blank input, an empty trailing token, or
+ * a token that parses but isn't absolute; [MsbCliBackend.importCheckpoint] turns a `null` here
+ * (with a `null` stdout parse too) into a typed error quoting both raw streams.
+ */
+internal fun parseSnapshotAlreadyExistsArtifactPath(stderr: String): String? {
+    val lastLine = stderr.lines().map { it.trim() }.lastOrNull { it.isNotEmpty() } ?: return null
+    val token = lastLine.substringAfterLast(' ').trim()
+    if (token.isEmpty()) return null
+    val parsed = runCatching { Path.of(token) }.getOrNull() ?: return null
+    return token.takeIf { parsed.isAbsolute }
+}
 
 /**
  * Shared parsing core for [parseSnapshotCreateArtifactPath] and [parseSnapshotLoadArtifactPath]:
