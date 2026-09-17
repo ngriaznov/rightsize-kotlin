@@ -129,8 +129,13 @@ reaches its first tagged release.
   The classifier itself is platform-agnostic code; the signature simply never occurs on Unix.
 - **`createCheckpoint` now waits out msb's asynchronous sandbox-name release on Windows before
   rebooting from the snapshot**, polling `msb ls` (bounded, briefly) after `rm` so the reboot no
-  longer races a lingering name into msb's own "already exists" refusal, with one short bounded
-  retry of the reboot itself as defense in depth if that refusal still slips through.
+  longer races a lingering name into msb's own "already exists" refusal. `msb ls` only proves the
+  sandbox's database record is gone, though — msb 0.7.1's `restore` itself also refuses
+  "already exists" while the sandbox's on-disk directory still exists, and that directory has
+  been observed on Windows CI outliving the database record by more than 3.5 seconds under load.
+  The reboot itself now retries on that refusal with a genuine ~30-second budget (2-second
+  intervals) instead of the handful of retries at a few hundred milliseconds this previously
+  shipped with, so the retry actually outlives the lag instead of merely hedging against it.
 
 ## [0.7.9] - 2026-09-10
 

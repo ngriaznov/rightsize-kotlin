@@ -42,12 +42,20 @@ import java.util.concurrent.atomic.AtomicBoolean
  * test would read/write the developer's real `~/.cache/rightsize` (or whatever `test` task
  * pins `RIGHTSIZE_CACHE_DIR` to) instead of its own isolated temp directory; tests reach it via
  * [forHost], same as the other two seams.
+ *
+ * [checkpointRebootAlreadyExistsBudgetMs] is a fourth seam, same spirit as
+ * [restoreReadinessBudgetMs]: the wall-clock budget [rebootRetryingNameCollision] bounds its
+ * already-exists retry by, defaulted to the real [CHECKPOINT_REBOOT_ALREADY_EXISTS_RETRY_BUDGET_MS]
+ * (~30s) so production behavior is unchanged. Without it, red-proofing "the collision never
+ * clears" would mean a unit test actually blocking for that real budget; tests reach it via
+ * [forHost] to shrink it, exactly like [restoreReadinessBudgetMs].
  */
 class MsbCliBackend private constructor(
     internal val msb: Path,
     private val windowsHost: Boolean,
     private val restoreReadinessBudgetMs: Long = FIRST_RUN_PULL_TIMEOUT_MS,
     private val checkpointRegistryDir: Path = CacheDir.resolve(),
+    private val checkpointRebootAlreadyExistsBudgetMs: Long = CHECKPOINT_REBOOT_ALREADY_EXISTS_RETRY_BUDGET_MS,
 ) : SandboxBackend {
     constructor(msb: Path) : this(msb, Platform.current()?.isWindows == true)
 
@@ -86,7 +94,10 @@ class MsbCliBackend private constructor(
             windowsHost: Boolean,
             restoreReadinessBudgetMs: Long = FIRST_RUN_PULL_TIMEOUT_MS,
             checkpointRegistryDir: Path = CacheDir.resolve(),
-        ) = MsbCliBackend(msb, windowsHost, restoreReadinessBudgetMs, checkpointRegistryDir)
+            checkpointRebootAlreadyExistsBudgetMs: Long = CHECKPOINT_REBOOT_ALREADY_EXISTS_RETRY_BUDGET_MS,
+        ) = MsbCliBackend(
+            msb, windowsHost, restoreReadinessBudgetMs, checkpointRegistryDir,
+            checkpointRebootAlreadyExistsBudgetMs)
     }
 
     private val startedNames = ConcurrentHashMap.newKeySet<String>()
@@ -783,16 +794,28 @@ class MsbCliBackend private constructor(
     }
 
     /**
-     * Bounded retry of [spawnAndAwaitRunning] for [createCheckpoint]'s own re-boot ONLY, specifically
-     * for msb's "sandbox already exists" restore failure ([SandboxNameCollisionException]) — defense
-     * in depth alongside [awaitNameReleased] above, for the exact same Windows deferred-teardown lag
-     * family, in case the name frees in the gap between that poll's last check and the instant
-     * `restore` itself re-checks it. [CHECKPOINT_REBOOT_NAME_COLLISION_MAX_ATTEMPTS]/
-     * [CHECKPOINT_REBOOT_NAME_COLLISION_RETRY_DELAY_MS] mirror [RESTORE_ACCESS_DENIED_MAX_ATTEMPTS]/
-     * [RESTORE_ACCESS_DENIED_RETRY_DELAY_MS]'s own bounded, no-heal, short-backoff shape — kept as
-     * their own constants rather than reused ones, since they classify a different msb failure (a
-     * name collision, not a Windows file-handle release) even though both belong to the same
-     * deferred-teardown lag family.
+     * Bounded-BUDGET retry of [spawnAndAwaitRunning] for [createCheckpoint]'s own re-boot ONLY,
+     * specifically for msb's "sandbox already exists" restore failure
+     * ([SandboxNameCollisionException]) — defense in depth alongside [awaitNameReleased] above,
+     * for the exact same Windows deferred-teardown lag family, in case the name frees in the gap
+     * between that poll's last check and the instant `restore` itself re-checks it.
+     *
+     * Same wall-clock-budget shape as [spawnAndAwaitRunning]'s own install-lock retry above
+     * ([INSTALL_LOCK_RETRY_BUDGET_MS]/[INSTALL_LOCK_RETRY_DELAY_MS]) — a deadline, not an attempt
+     * count — because an attempt count can't be sized against a lag with no fixed bound.
+     * [awaitNameReleased]'s own `msb ls` poll only proves the sandbox's DB RECORD is gone; msb
+     * 0.7.1's `restore` itself refuses "already exists" when EITHER that record OR the sandbox's
+     * on-disk directory still exists (`prepare_create_target` in
+     * sdk/rust/lib/backend/local/sandbox/create.rs upstream: `existing.is_some() || dir_exists`),
+     * and on Windows the directory has been observed on CI outliving the DB record — what `ls`
+     * actually proves absent — by more than 3.5s under load. The previous 3-attempt/300ms budget
+     * (well under 1s of retrying) was nowhere near that; this now spends up to
+     * [checkpointRebootAlreadyExistsBudgetMs] (production default
+     * [CHECKPOINT_REBOOT_ALREADY_EXISTS_RETRY_BUDGET_MS], ~30s — [INSTALL_LOCK_RETRY_BUDGET_MS]'s
+     * own order of magnitude), retrying every [CHECKPOINT_REBOOT_ALREADY_EXISTS_RETRY_DELAY_MS].
+     * [awaitNameReleased]'s cheap `ls` gate above stays in place as a harmless, fast first exit
+     * for the common case — but this budget, not that gate, is what actually guarantees the retry
+     * outlives the lag.
      *
      * Any OTHER exception from [spawnAndAwaitRunning] — including every failure that cascade already
      * retries itself (install-lock, state-db, image-cache, access-denied) — propagates immediately,
@@ -806,16 +829,22 @@ class MsbCliBackend private constructor(
      * exactly as before this method existed.
      */
     private fun rebootRetryingNameCollision(handle: Handle, spec: ContainerSpec): Process? {
-        var attempts = 1
-        while (true) {
+        val deadline = System.nanoTime() + checkpointRebootAlreadyExistsBudgetMs * 1_000_000
+        var lastSeen: SandboxNameCollisionException
+        try {
+            return spawnAndAwaitRunning(handle, spec)
+        } catch (collision: SandboxNameCollisionException) {
+            lastSeen = collision
+        }
+        while (System.nanoTime() < deadline) {
+            Thread.sleep(CHECKPOINT_REBOOT_ALREADY_EXISTS_RETRY_DELAY_MS)
             try {
                 return spawnAndAwaitRunning(handle, spec)
-            } catch (collision: SandboxNameCollisionException) {
-                if (attempts >= CHECKPOINT_REBOOT_NAME_COLLISION_MAX_ATTEMPTS) throw collision
-                attempts++
-                Thread.sleep(CHECKPOINT_REBOOT_NAME_COLLISION_RETRY_DELAY_MS)
+            } catch (again: SandboxNameCollisionException) {
+                lastSeen = again
             }
         }
+        throw lastSeen
     }
 
     /**
@@ -1346,11 +1375,15 @@ private const val RESTORE_ACCESS_DENIED_RETRY_DELAY_MS = 300L
 // only on the Windows lag it exists for.
 private const val CHECKPOINT_NAME_RELEASE_BUDGET_MS = 3_000L
 // createCheckpoint's own already-exists reboot retry (see rebootRetryingNameCollision's doc):
-// same bounded, no-heal, short-backoff shape as RESTORE_ACCESS_DENIED_MAX_ATTEMPTS/
-// RESTORE_ACCESS_DENIED_RETRY_DELAY_MS above, kept as its own constants since it classifies a
-// different msb failure than that pair does.
-private const val CHECKPOINT_REBOOT_NAME_COLLISION_MAX_ATTEMPTS = 3
-private const val CHECKPOINT_REBOOT_NAME_COLLISION_RETRY_DELAY_MS = 300L
+// same wall-clock-budget shape as INSTALL_LOCK_RETRY_BUDGET_MS/INSTALL_LOCK_RETRY_DELAY_MS
+// above, kept as its own constants since it classifies a different msb failure than that pair
+// does. msb 0.7.1's restore refuses "already exists" while EITHER the sandbox's DB record OR its
+// on-disk directory still exists, and on Windows the directory has outlived the DB record — what
+// awaitNameReleased's `ls` poll actually proves absent — by more than 3.5s under CI load, so this
+// budget has to be an order of magnitude bigger than that lag, not a handful of attempts at a
+// few hundred milliseconds.
+private const val CHECKPOINT_REBOOT_ALREADY_EXISTS_RETRY_BUDGET_MS = 30_000L
+private const val CHECKPOINT_REBOOT_ALREADY_EXISTS_RETRY_DELAY_MS = 2_000L
 
 /** The one boot failure [MsbCliBackend] heals and retries — carries the `msb run` child's
  * combined output for the second-failure diagnostic. Internal to the boot path: never

@@ -26,8 +26,10 @@ class MsbCheckpointNameReleaseTest {
      *   still report [sandboxName] lingering (status `Stopped`, msb's own post-teardown status)
      *   before finally reporting it absent — decremented on every such call. Absent (or already at
      *   0) means the name is free on the very first poll, the unix-always shape.
-     * - [restoreFailOnceFlag], when present, makes the NEXT `restore` invocation fail with msb's own
-     *   already-exists wording and deletes itself, so only that one attempt fails.
+     * - [restoreFailCounter], when present, holds a decimal count of how many MORE `restore`
+     *   invocations should fail with msb's own already-exists wording — decremented on every such
+     *   call — before finally succeeding. Absent (or already at 0) means `restore` succeeds on the
+     *   very first invocation, same as [MsbCheckpointTest]'s own fake.
      * - [lsGlitchCounter], when present, holds a decimal count of how many MORE `ls` calls should
      *   fail outright — nonzero exit, unparseable stderr chatter instead of JSON on stdout, the
      *   shape of a transient daemon hiccup while teardown is still in flight — before falling
@@ -41,7 +43,7 @@ class MsbCheckpointNameReleaseTest {
         callLog: Path,
         sandboxName: String,
         rmLingerCounter: Path,
-        restoreFailOnceFlag: Path,
+        restoreFailCounter: Path,
         lsGlitchCounter: Path,
     ): Path {
         val script = Files.createTempFile("rz-fake-msb-namerelease", "")
@@ -74,10 +76,14 @@ class MsbCheckpointNameReleaseTest {
             |        *) shift ;;
             |      esac
             |    done
-            |    if [ -f "$restoreFailOnceFlag" ]; then
-            |      rm -f "$restoreFailOnceFlag"
-            |      echo "error: sandbox already exists: sandbox '${'$'}name' already exists; remove it, start the stopped sandbox, or recreate with .replace()" 1>&2
-            |      exit 1
+            |    if [ -f "$restoreFailCounter" ]; then
+            |      rcnt=${'$'}(cat "$restoreFailCounter")
+            |      if [ "${'$'}rcnt" -gt 0 ]; then
+            |        rcnt=${'$'}((rcnt - 1))
+            |        echo "${'$'}rcnt" > "$restoreFailCounter"
+            |        echo "error: sandbox already exists: sandbox '${'$'}name' already exists; remove it, start the stopped sandbox, or recreate with .replace()" 1>&2
+            |        exit 1
+            |      fi
             |    fi
             |    echo "${'$'}name" > "$marker"
             |    exit 0
@@ -170,11 +176,11 @@ class MsbCheckpointNameReleaseTest {
         // of its decrements before the checkpoint cycle this test is actually pinning down ever
         // begins — see unsetFlag's own convention, used the same way elsewhere in this suite.
         val rmLingerCounter = unsetFlag("rz-linger-")
-        val restoreFailOnceFlag = unsetFlag("rz-restorefail-")
+        val restoreFailCounter = unsetFlag("rz-restorefail-")
         val lsGlitchCounter = unsetFlag("rz-lsglitch-")
         val backend = MsbCliBackend(
             fakeMsbNameReleaseLifecycle(
-                marker, callLog, sandboxName, rmLingerCounter, restoreFailOnceFlag, lsGlitchCounter))
+                marker, callLog, sandboxName, rmLingerCounter, restoreFailCounter, lsGlitchCounter))
         val spec = ContainerSpec(name = sandboxName, image = "irrelevant", runId = "run1", command = listOf("serve"))
         val handle = backend.create(spec)
         try {
@@ -208,11 +214,11 @@ class MsbCheckpointNameReleaseTest {
         // Left UNSET until after start() below — see the identically-named field's comment in the
         // lingering-twice test above for why (start()'s own readiness poll races the marker write).
         val rmLingerCounter = unsetFlag("rz-linger-stuck-")
-        val restoreFailOnceFlag = unsetFlag("rz-restorefail-")
+        val restoreFailCounter = unsetFlag("rz-restorefail-")
         val lsGlitchCounter = unsetFlag("rz-lsglitch-")
         val backend = MsbCliBackend(
             fakeMsbNameReleaseLifecycle(
-                marker, callLog, sandboxName, rmLingerCounter, restoreFailOnceFlag, lsGlitchCounter))
+                marker, callLog, sandboxName, rmLingerCounter, restoreFailCounter, lsGlitchCounter))
         val spec = ContainerSpec(name = sandboxName, image = "irrelevant", runId = "run1", command = listOf("serve"))
         val handle = backend.create(spec)
         try {
@@ -244,17 +250,25 @@ class MsbCheckpointNameReleaseTest {
         }
     }
 
-    @Test fun `createCheckpoint retries the reboot once and succeeds when restore fails with msb's already-exists error exactly once`() {
+    @Test fun `createCheckpoint retries the reboot through 5 already-exists failures and succeeds on the 6th attempt`() {
+        // N=5 is deliberately more than the pre-fix budget (3 attempts total, ~900ms of retrying)
+        // could ever survive — this red-proofs that the reboot retry now runs on a wall-clock
+        // BUDGET (production default ~30s at CHECKPOINT_REBOOT_ALREADY_EXISTS_RETRY_DELAY_MS
+        // intervals) rather than the old fixed attempt count, so it outlives a collision that
+        // clears only after several retries. No budget/delay override needed here: the default
+        // 30s budget comfortably covers the ~10s these 5 retries take at the production 2s
+        // interval.
         assumeFalse(Platform.current()?.isWindows == true, "POSIX-only fake binary; see doc comment")
         val marker = Files.createTempFile("rz-marker-", "").also { Files.deleteIfExists(it) }
         val callLog = Files.createTempFile("rz-calllog-", "")
         val sandboxName = "rz-ckpt-alreadyexists-test"
         val rmLingerCounter = unsetFlag("rz-linger-none-")   // name frees immediately — isolates this retry
-        val restoreFailOnceFlag = Files.createTempFile("rz-restorefail-", "")   // present => next restore fails once
+        val restoreFailCounter = Files.createTempFile("rz-restorefail-", "")
+            .also { Files.writeString(it, "5") }   // next 5 restore invocations fail, the 6th succeeds
         val lsGlitchCounter = unsetFlag("rz-lsglitch-")
         val backend = MsbCliBackend(
             fakeMsbNameReleaseLifecycle(
-                marker, callLog, sandboxName, rmLingerCounter, restoreFailOnceFlag, lsGlitchCounter))
+                marker, callLog, sandboxName, rmLingerCounter, restoreFailCounter, lsGlitchCounter))
         val spec = ContainerSpec(name = sandboxName, image = "irrelevant", runId = "run1", command = listOf("serve"))
         val handle = backend.create(spec)
         try {
@@ -268,8 +282,66 @@ class MsbCheckpointNameReleaseTest {
             assertTrue(effectiveRef.endsWith("snap_0123456789abcdef0123456789abcdef"))
 
             val restoreCalls = Files.readAllLines(callLog).count { it.startsWith("restore ") }
+            assertEquals(6, restoreCalls,
+                "restore must have run exactly 6 times: 5 already-exists failures plus the succeeding retry")
+        } finally {
+            backend.stop(handle)
+            backend.remove(handle)
+        }
+    }
+
+    @Test fun `createCheckpoint fails with a clear typed error naming the sandbox and preserved checkpoint once the already-exists retry budget is exhausted`() {
+        // The budget is shrunk via MsbCliBackend.forHost's own test-only seam (same mechanism
+        // MsbRestoreSupervisionTest's restoreReadinessBudgetMs override uses) so this resolves in
+        // seconds instead of the real ~30s production budget. There is no seam for
+        // CHECKPOINT_REBOOT_ALREADY_EXISTS_RETRY_DELAY_MS itself, so the retry loop still sleeps
+        // the real 2s between attempts; exactly one retry (2 restore invocations) is what that
+        // guarantees, PROVIDED the shrunk budget clears the deadline check right after the first
+        // attempt's own failure. That check races the first attempt's actual subprocess round
+        // trip (JVM ProcessBuilder fork/exec of the fake script, itself forking a nested `cat`
+        // subshell, plus disk I/O) — a budget merely "small" isn't enough margin for that to hold
+        // reliably under CI load, so this picks 500ms: comfortably above one such round trip (a
+        // few hundred ms is the sibling convention's order of magnitude — see
+        // MsbRestoreSupervisionTest's own restoreReadinessBudgetMs=900ms vs its 300ms poll
+        // interval, a similar 3x-ish margin) while still comfortably under the 2s retry delay, so
+        // the second attempt (after that mandatory 2s sleep) is guaranteed to land past the
+        // deadline and stop the loop at exactly one retry either way.
+        assumeFalse(Platform.current()?.isWindows == true, "POSIX-only fake binary; see doc comment")
+        val marker = Files.createTempFile("rz-marker-", "").also { Files.deleteIfExists(it) }
+        val callLog = Files.createTempFile("rz-calllog-", "")
+        val sandboxName = "rz-ckpt-alwaysexists-test"
+        val rmLingerCounter = unsetFlag("rz-linger-none-")   // name frees immediately — isolates this retry
+        // Armed only after start() below (see the identically-named field's comment in the
+        // lingering-twice test): effectively never clears within the shrunk budget.
+        val restoreFailCounter = unsetFlag("rz-restorefail-always-")
+        val lsGlitchCounter = unsetFlag("rz-lsglitch-")
+        val backend = MsbCliBackend.forHost(
+            fakeMsbNameReleaseLifecycle(
+                marker, callLog, sandboxName, rmLingerCounter, restoreFailCounter, lsGlitchCounter),
+            windowsHost = false,
+            checkpointRebootAlreadyExistsBudgetMs = 500L)
+        val spec = ContainerSpec(name = sandboxName, image = "irrelevant", runId = "run1", command = listOf("serve"))
+        val handle = backend.create(spec)
+        try {
+            backend.start(handle)
+            Files.writeString(callLog, "")
+            Files.writeString(restoreFailCounter, "999999")
+
+            val started = System.nanoTime()
+            val e = assertThrows(IllegalStateException::class.java) {
+                backend.createCheckpoint(handle, "rz-ckpt-0123456789ab")
+            }
+            val elapsedMs = (System.nanoTime() - started) / 1_000_000
+
+            assertTrue(e.message!!.contains(sandboxName), "message must name the sandbox: ${e.message}")
+            assertTrue(e.message!!.contains("already exists"), "message must carry msb's own refusal: ${e.message}")
+            assertTrue(e.message!!.contains("restorable via GenericContainer.fromCheckpoint"),
+                "message must point at the preserved checkpoint: ${e.message}")
+            assertTrue(elapsedMs < 10_000, "must fail within the shrunk budget, not hang: took ${elapsedMs}ms")
+
+            val restoreCalls = Files.readAllLines(callLog).count { it.startsWith("restore ") }
             assertEquals(2, restoreCalls,
-                "restore must have run exactly twice: the already-exists attempt plus the one retry")
+                "restore must have run exactly twice against the shrunk budget: the initial attempt plus one retry")
         } finally {
             backend.stop(handle)
             backend.remove(handle)
@@ -290,11 +362,11 @@ class MsbCheckpointNameReleaseTest {
         // The name is otherwise free immediately (no lingering) — isolates the glitch itself as
         // the only reason a naive fix would proceed early.
         val rmLingerCounter = unsetFlag("rz-linger-lsglitch-")
-        val restoreFailOnceFlag = unsetFlag("rz-restorefail-lsglitch-")
+        val restoreFailCounter = unsetFlag("rz-restorefail-lsglitch-")
         val lsGlitchCounter = unsetFlag("rz-lsglitch-")
         val backend = MsbCliBackend(
             fakeMsbNameReleaseLifecycle(
-                marker, callLog, sandboxName, rmLingerCounter, restoreFailOnceFlag, lsGlitchCounter))
+                marker, callLog, sandboxName, rmLingerCounter, restoreFailCounter, lsGlitchCounter))
         val spec = ContainerSpec(name = sandboxName, image = "irrelevant", runId = "run1", command = listOf("serve"))
         val handle = backend.create(spec)
         try {
