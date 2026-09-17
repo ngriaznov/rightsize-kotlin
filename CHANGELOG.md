@@ -16,17 +16,21 @@ reaches its first tagged release.
   keep their existing default). One driven CLI flag was renamed upstream —
   `msb snapshot create --from` became `--from-sandbox` — and this library's
   checkpoint machinery now emits the new spelling; nothing changes for callers.
-- **Checkpoint restore on the microsandbox backend now goes through `msb restore
-  --disk-only`, not `msb run --from-snapshot`.** Upstream 0.7 removed `--from-snapshot`
-  from `run` entirely (clap rejects it outright; `msb run` itself now bails toward `msb
-  restore` for a snapshot-shaped source) and moved restoring into a dedicated `msb
-  restore <ref> --name <name> --disk-only` command. `--disk-only` cold-boots the
-  captured disk without resuming captured RAM/processes — the same filesystem-only
-  semantics this library's checkpoints have always had. `restore` carries no `-e`/
-  `--env` flag and no command override at all, unlike `run`: a disk-only restore
-  replays the sandbox's own captured configuration instead, so this library no longer
-  re-passes env/command on a restore boot. `GenericContainer.fromCheckpoint(cp)` still
-  lets a caller override env/command with `withEnv`/`withCommand` afterward — genuinely
+- **Checkpoint restore on the microsandbox backend now goes through `msb restore`, not
+  `msb run --from-snapshot`.** Upstream 0.7 removed `--from-snapshot` from `run`
+  entirely (clap rejects it outright; `msb run` itself now bails toward `msb restore`
+  for a snapshot-shaped source) and moved restoring into a dedicated `msb restore <ref>
+  --name <name>` command. Restoring a disk-scope snapshot (the only kind this library's
+  checkpoints ever create) is inherently a cold boot of the captured disk without
+  resuming captured RAM/processes — the same filesystem-only semantics this library's
+  checkpoints have always had — with **no** `--disk-only` flag: msb 0.7.1 rejects that
+  flag outright for a disk-scope source (`invalid config: disk_only requires a full
+  snapshot with checkpoint state`); an earlier revision of this same change on this
+  branch passed it, which is now corrected. `restore` carries no `-e`/`--env` flag and
+  no command override at all, unlike `run`: restore replays the sandbox's own captured
+  configuration instead, so this library never re-passes env/command on a restore boot.
+  `GenericContainer.fromCheckpoint(cp)` still lets a caller override env/command with
+  `withEnv`/`withCommand` afterward — genuinely
   changing either now throws the new typed `CheckpointRestoreOverrideUnsupportedException`
   before any backend call on microsandbox (new `BackendCapabilities.checkpointRestoreOverridable`,
   `false` there, `true` on Docker, which has no such restriction); re-supplying exactly
@@ -35,7 +39,33 @@ reaches its first tagged release.
   a checkpoint never captures disk/network geometry in the first place, any use of these
   three after `fromCheckpoint` is now always rejected with the same exception on
   microsandbox, rather than silently booting with the snapshot's own geometry instead of
-  the one requested. No other checkpoint/restore public API changed.
+  the one requested. See the ref-shape entry below for the one other public change this
+  same msb 0.7.1 pin required.
+- **Checkpoint refs on the microsandbox backend now point at msb's own snapshot store
+  layout, not a path this library mints.** As of msb 0.7.1, `msb snapshot create
+  --from-sandbox <sandbox> <name> --dest-dir <D>` no longer writes its artifact at
+  `<D>/<name>` — `<name>` only ever shows up in msb's own index and in `snapshot
+  inspect` output — but at `<D>/<sandbox>/snap_<32-hex digest>`, a path msb decides on
+  its own. `Checkpoint.ref` on this backend is therefore now that captured path (e.g.
+  `<cache-dir>/checkpoints/<sandbox>/snap_<hex>`) instead of the previous
+  `<cache-dir>/checkpoints/rz-ckpt-<12-hex-or-name>` shape — a **user-visible ref-shape
+  change**: `SandboxBackend.createCheckpoint` now returns the EFFECTIVE ref (parsed,
+  defensively, from `snapshot create`'s own last stdout line — a clear error names the
+  unparsed output if it isn't an absolute path) rather than always the ref it was asked
+  to write to, the same "effective ref may differ from the input" shape
+  `SandboxBackend.importCheckpoint` already had; Docker's implementation is unaffected,
+  always returning its input ref unchanged. `Checkpoint.remove`/`removeCheckpoint` and
+  `Checkpoint.find`'s staleness probe now pass that full artifact path straight to `msb
+  snapshot rm <ref> -f`/`msb snapshot inspect <ref>` — msb 0.7.1 resolves neither
+  reliably against a bare name any more, so the previous basename-only `snapshot rm`
+  call (and the pure-filesystem shortcut `hasCheckpoint` used for a path ref) no longer
+  worked and have been removed. One related, separately-discovered msb 0.7.1 behavior worth
+  knowing: removing the NEWEST (head) snapshot of a source sandbox while an older
+  sibling from the same source still exists is refused by msb itself — this library
+  propagates that refusal as-is (both removal calls are best-effort and never inspect
+  msb's exit code, so it's silently absorbed rather than surfaced) and does not attempt
+  automatic head rotation; see docs/checkpoints.md's Cleanup section for the by-hand
+  remedy.
 - **The MinIO module's default image moved to `quay.io/minio/minio:latest`.** Docker
   Hub's `minio/minio` repository was removed upstream (`docker pull minio/minio` now
   fails "repository does not exist"); the floating default now points at MinIO's

@@ -526,12 +526,18 @@ abstract class BackendContractTest {
                 val cp = c.checkpoint()
                 // microsandbox refs are absolute artifact paths under <cacheDir>/checkpoints
                 // (created there via --dest-dir, restored by path); docker refs stay image tags.
+                // As of msb 0.7.1, `snapshot create --from-sandbox` writes the artifact at
+                // <dest-dir>/<source-sandbox>/snap_<32-hex digest> — a path msb decides itself,
+                // one directory level deeper than the <dest-dir>/rz-ckpt-<hex> shape a prior msb
+                // pin produced — so "checkpoints" is only an ANCESTOR of the ref now, not
+                // necessarily its immediate parent, and the artifact's own basename is
+                // msb-minted (`snap_<hex>`), not the rz-ckpt-<hex> name this library passed in.
                 if (backend.name.equals("microsandbox", ignoreCase = true)) {
                     val ref = java.nio.file.Paths.get(cp.ref)
                     assertTrue(ref.isAbsolute, "expected an absolute path ref for '${backend.name}': '${cp.ref}'")
-                    assertEquals("checkpoints", ref.parent?.fileName?.toString(),
-                        "expected the ref to sit in a 'checkpoints' dir: '${cp.ref}'")
-                    assertTrue(Regex("^rz-ckpt-[0-9a-f]{12}$").matches(ref.fileName.toString()),
+                    assertTrue(generateSequence(ref.parent) { it.parent }.any { it.fileName?.toString() == "checkpoints" },
+                        "expected 'checkpoints' to be an ancestor of the ref: '${cp.ref}'")
+                    assertTrue(Regex("^snap_[0-9a-f]{32}$").matches(ref.fileName.toString()),
                         "unexpected ref artifact name for '${backend.name}': '${cp.ref}'")
                 } else {
                     assertTrue(Regex("^rightsize/checkpoint:[0-9a-f]{12}$").matches(cp.ref),
@@ -751,9 +757,10 @@ abstract class BackendContractTest {
             val refPath = Path.of(cp.ref)
             assertTrue(refPath.isAbsolute, "an msb checkpoint ref must be an absolute path: ${cp.ref}")
             assertTrue(refPath.startsWith(CacheDir.resolve()), "the ref must live under the cache dir: ${cp.ref}")
-            assertTrue(Files.isDirectory(refPath), "the checkpoint artifact directory must exist: ${cp.ref}")
-            assertTrue(Files.exists(refPath.resolve("snapshot.json")),
-                "the checkpoint artifact must contain snapshot.json")
+            // msb 0.7.1 decides the artifact's own on-disk shape (nested under the source
+            // sandbox's name, basename `snap_<hex>`) — this only asserts the artifact msb
+            // reported actually exists, not a specific file/directory layout underneath it.
+            assertTrue(Files.exists(refPath), "the checkpoint artifact must exist on disk: ${cp.ref}")
 
             val restored = GenericContainer.fromCheckpoint(cp)
                 .waitingFor(Wait.forLogMessage(".*", 0).withStartupTimeout(Duration.ofSeconds(30)))

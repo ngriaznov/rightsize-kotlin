@@ -51,8 +51,8 @@ data class BackendCapabilities(
      * True when restoring a checkpoint can run with env/command/disk-limit/tmpfs-root/
      * network-disabled DIFFERENT from what was captured — Docker: `true` (a restored container
      * just re-runs the committed image, which takes `-e`/a command override same as any other
-     * `docker run`); microsandbox: `false`, since `msb restore`'s disk-only mode (this backend's
-     * only restore mode — see `MsbCommands.restore`'s doc) has no CLI flag for any of them: it
+     * `docker run`); microsandbox: `false`, since `msb restore` (this backend's only restore
+     * mode — see `MsbCommands.restore`'s doc) has no CLI flag for any of them: it
      * always replays the snapshot's own captured configuration and disk/network geometry
      * verbatim. `GenericContainer.fromCheckpoint(cp).start()` throws
      * [dev.rightsize.core.CheckpointRestoreOverrideUnsupportedException] before any backend call
@@ -122,22 +122,29 @@ interface SandboxBackend : AutoCloseable {
      * don't participate in reaping. */
     val watchdogCommands: WatchdogCommands get() = WatchdogCommands()
     /**
-     * Captures [handle]'s current filesystem as a checkpoint identified by [ref] — the backend
-     * primitive behind `GenericContainer.checkpoint()`. Only ever called when
-     * [capabilities]`.checkpoint` is true: the generic layer gates on that flag BEFORE reaching
-     * this method, so a backend that doesn't support it never needs a real implementation.
-     * [ref]'s shape is backend-specific and already minted by the generic layer before this
-     * call — a docker image tag (`rightsize/checkpoint:<12-hex>`) or an ABSOLUTE msb snapshot
-     * artifact path (`<rightsize cache dir>/checkpoints/rz-ckpt-<12-hex>`); this method does only
-     * the capture. Docker commits the running
-     * container to an image, leaving it undisturbed ([capabilities]`.checkpointRestartsWorkload`
-     * = `false`); microsandbox stops the sandbox, snapshots its disk, then resumes it
-     * (`checkpointRestartsWorkload = true`, since the resumed workload restarts from scratch —
-     * see docs/checkpoints.md). Defaults to throwing [UnsupportedByBackendException] — a
-     * defensive backstop, since the capability gate above should make this unreachable in
-     * practice.
+     * Captures [handle]'s current filesystem as a checkpoint, using [ref] as a backend-specific
+     * HINT for where/how to write it, and returns the EFFECTIVE ref the checkpoint is reachable
+     * by afterward — the backend primitive behind `GenericContainer.checkpoint()`. Only ever
+     * called when [capabilities]`.checkpoint` is true: the generic layer gates on that flag
+     * BEFORE reaching this method, so a backend that doesn't support it never needs a real
+     * implementation. [ref] is already minted by the generic layer before this call — a docker
+     * image tag (`rightsize/checkpoint:<12-hex>`) or an absolute path hint under the rightsize
+     * checkpoint cache dir for microsandbox — but the RETURNED ref is not always [ref] itself:
+     * docker's commit is addressed by the tag it's given, so it returns [ref] unchanged, but
+     * microsandbox's `msb snapshot create` writes its artifact at a path msb itself decides
+     * (nested under [ref]'s own parent directory, never at [ref] verbatim — see
+     * `MsbCliBackend.createCheckpoint`), so it returns the artifact path msb's own output
+     * reports instead. The caller (`GenericContainer.checkpoint()`) uses the RETURNED ref for
+     * the `Checkpoint` object and any named-checkpoint registry entry, never [ref] itself — the
+     * same "effective ref may differ from the input" contract [importCheckpoint] already has.
+     * Docker commits the running container to an image, leaving it undisturbed
+     * ([capabilities]`.checkpointRestartsWorkload` = `false`); microsandbox stops the sandbox,
+     * snapshots its disk, then resumes it (`checkpointRestartsWorkload = true`, since the
+     * resumed workload restarts from scratch — see docs/checkpoints.md). Defaults to throwing
+     * [UnsupportedByBackendException] — a defensive backstop, since the capability gate above
+     * should make this unreachable in practice.
      */
-    fun createCheckpoint(handle: SandboxHandle, ref: String): Unit =
+    fun createCheckpoint(handle: SandboxHandle, ref: String): String =
         throw UnsupportedByBackendException("checkpoint", name,
             "the active backend must advertise capabilities.checkpoint to support this")
     /**

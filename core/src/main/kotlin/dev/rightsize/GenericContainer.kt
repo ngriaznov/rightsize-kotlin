@@ -116,7 +116,7 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
      * [RootDiskConflictException], checked at [start]), and on a backend whose
      * `capabilities.checkpointRestoreOverridable` is `false` (msb), calling this after
      * [fromCheckpoint] throws [CheckpointRestoreOverrideUnsupportedException] at [start] — the
-     * snapshot pins the root disk and a disk-only restore has no CLI-level way to resize it.
+     * snapshot pins the root disk and restoring it has no CLI-level way to resize it.
      */
     fun withDiskLimit(megabytes: Long): SELF { diskLimitMb = megabytes; return this as SELF }
     /**
@@ -136,8 +136,8 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
      * Cannot be combined with [withNetwork] (see [NetworkDisabledConflictException], checked at
      * [start]). On a backend whose `capabilities.checkpointRestoreOverridable` is `false` (msb),
      * calling this after [fromCheckpoint] throws [CheckpointRestoreOverrideUnsupportedException]
-     * at [start] — `msb restore`'s disk-only mode has no network-policy flag at all, so there is
-     * no way to honor it on a restored sandbox.
+     * at [start] — `msb restore` has no network-policy flag at all, so there is no way to honor
+     * it on a restored sandbox.
      */
     fun withNetworkDisabled(): SELF { networkDisabled = true; return this as SELF }
     /**
@@ -159,7 +159,7 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
     fun withRequireIsolation(): SELF { requireIsolationRequested = true; return this as SELF }
     internal fun withBackend(b: SandboxBackend): SELF { backendOverride = b; return this as SELF }
     /** Internal factory seam: `fromCheckpoint` sets [checkpointRef] (msb boots via
-     * `msb restore <ref> --name <name> --disk-only` instead of its normal image path — see
+     * `msb restore <ref> --name <name>` instead of its normal image path — see
      * `MsbCommands.restore`) and [checkpointCreatorBackend] (checked at [start], before any
      * backend call — see [CheckpointBackendMismatchException]). [capturedEnv]/[capturedCommand]
      * are the checkpoint's own env/command, BEFORE `fromCheckpoint` pre-populates this
@@ -278,17 +278,23 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
      * backend's `createCheckpoint` — a filesystem snapshot, not a memory snapshot: [fromCheckpoint]
      * boots a fresh container whose filesystem starts where this one left off, but its processes
      * restart from scratch (see docs/checkpoints.md). [Checkpoint.ref] is backend-shaped (a
-     * docker image tag or an ABSOLUTE msb snapshot artifact path, under [mintCheckpointRef]'s own
-     * checkpoint cache dir — restored via `msb restore <path> --name <name> --disk-only`,
-     * removed via `msb snapshot rm <basename>`); with [name] omitted (the default) it's random
-     * per call and purely in-process
+     * docker image tag, or an ABSOLUTE msb snapshot artifact path nested under
+     * [mintCheckpointRef]'s own checkpoint cache dir — restored via `msb restore <path> --name
+     * <name>`, removed via `msb snapshot rm <path> -f`); [mintCheckpointRef] only mints a HINT
+     * for microsandbox (the dest-dir `createCheckpoint` is asked to write under) — the actual
+     * `ref` used below is [SandboxBackend.createCheckpoint]'s own return value, since msb's
+     * `snapshot create` decides the artifact's exact path itself (see that method's doc). With
+     * [name] omitted (the default) the hint is random per call and purely in-process
      * — nothing is written anywhere, exactly today's behavior.
      *
      * Passing [name] instead makes the checkpoint DURABLE and rediscoverable in any later
      * process, without ever holding onto the returned [Checkpoint] — see docs/checkpoints.md's
-     * "Reusing checkpoints across runs" section. The ref is derived from [name]
-     * (`rightsize/checkpoint:<name>` / `<...>/checkpoints/rz-ckpt-<name>`, replacing the random
-     * hex a nameless call would use), and a registry entry ([dev.rightsize.core.checkpoint.CheckpointRegistry],
+     * "Reusing checkpoints across runs" section. The ref HINT is derived from [name]
+     * (`rightsize/checkpoint:<name>` for docker — its actual ref, verbatim — or
+     * `<...>/checkpoints/rz-ckpt-<name>` for microsandbox, replacing the random hex a nameless
+     * call would use — only the dest-dir/snapshot-name `createCheckpoint` is asked to write
+     * under; the msb-backend's actual ref nests one level deeper, under a directory msb itself
+     * names after the source sandbox), and a registry entry ([dev.rightsize.core.checkpoint.CheckpointRegistry],
      * under the rightsize cache dir) is written ONLY after the backend checkpoint below has
      * already succeeded — a failed capture never leaves a stale entry behind. [name] must match
      * `^[a-z0-9][a-z0-9-]{0,40}$`, checked before any backend call (before even the capability
@@ -327,8 +333,13 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
             throw TmpfsRootCheckpointException()
         }
         if (name != null) replaceExistingNamedCheckpoint(name)
-        val ref = if (name != null) mintCheckpointRef(name) else mintCheckpointRef()
-        backend.createCheckpoint(h, ref)
+        val refHint = if (name != null) mintCheckpointRef(name) else mintCheckpointRef()
+        // The EFFECTIVE ref: not always refHint itself — microsandbox's snapshot create writes
+        // its artifact at a path msb decides on its own, nested under refHint's own parent
+        // directory (see SandboxBackend.createCheckpoint's doc and MsbCliBackend's own). Every
+        // downstream use (the returned Checkpoint, the named-checkpoint registry entry) uses
+        // THIS value, never refHint.
+        val ref = backend.createCheckpoint(h, refHint)
         if (backend.capabilities.checkpointRestartsWorkload) {
             if (startNetworkLinks.isNotEmpty()) backend.installNetworkLinks(h, startNetworkLinks)
             waitStrategy.waitUntilReady(waitTarget())
@@ -368,25 +379,28 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
 
     private fun checkpointCacheDir(): Path = checkpointCacheDirOverride ?: CacheDir.resolve()
 
-    /** `rightsize/checkpoint:<12-hex>` for a docker-shaped ref, an absolute
-     * `<checkpoint cache dir>/checkpoints/rz-ckpt-<12-hex>` path for an msb-shaped one —
-     * [Checkpoint.ref]'s shape is decided by the ACTIVE backend at capture time, since a docker
-     * image tag and an msb snapshot artifact are meaningless to the other backend (see
-     * [CheckpointBackendMismatchException]). */
+    /** `rightsize/checkpoint:<12-hex>` — this IS the docker ref, verbatim. For microsandbox this
+     * is only a HINT (an absolute `<checkpoint cache dir>/checkpoints/rz-ckpt-<12-hex>` path)
+     * telling `createCheckpoint` which dest-dir/snapshot-name to pass `msb snapshot create`; the
+     * msb backend's actual [Checkpoint.ref] is [SandboxBackend.createCheckpoint]'s own return
+     * value, one directory level deeper (msb nests the artifact under a directory it names after
+     * the source sandbox — see that method's doc). Either way the hint/ref shape is decided by
+     * the ACTIVE backend at capture time, since a docker image tag and an msb snapshot artifact
+     * are meaningless to the other backend (see [CheckpointBackendMismatchException]). */
     private fun mintCheckpointRef(): String = mintCheckpointRef(randomCheckpointHex())
 
-    /** Named-checkpoint overload of [mintCheckpointRef]: same backend-shaped form, [suffix]
-     * (the checkpoint name) in place of the random hex a nameless call mints. The msb path lives
+    /** Named-checkpoint overload of [mintCheckpointRef]: same backend-shaped hint, [suffix]
+     * (the checkpoint name) in place of the random hex a nameless call mints. The msb hint lives
      * under [checkpointCacheDir] — the same dir the checkpoint registry itself uses, including
      * the [withCheckpointCacheDir] test seam — so `msb snapshot create --dest-dir` and the
      * registry always agree on where a run's checkpoint state lives. Always minted absolute
      * ([Path.toAbsolutePath] + [Path.normalize]): [checkpointCacheDir] can itself be relative (an
      * explicit relative `RIGHTSIZE_CACHE_DIR`, or a relative dir handed to
-     * [withCheckpointCacheDir]), and every `isAbsolute`-gated path-vs-bare-name branch this ref
-     * later reaches (the msb backend's `hasCheckpoint`/`removeCheckpoint`/`createCheckpoint`)
-     * would otherwise misclassify a relative path ref as a bare snapshot name instead of a path
-     * ref. A ref is still an opaque string publicly; nothing outside the msb backend parses this
-     * shape. */
+     * [withCheckpointCacheDir]), and every `isAbsolute`-gated path-vs-bare-name branch this hint
+     * later reaches on the msb backend (`createCheckpoint`'s own dest-dir/snapshot-name split,
+     * `removeCheckpoint`'s leftover-artifact-dir guard) would otherwise misclassify a relative
+     * path hint as a bare snapshot name instead of a path one. A ref is still an opaque string
+     * publicly; nothing outside the msb backend parses this shape. */
     private fun mintCheckpointRef(suffix: String): String =
         if (canonicalBackendId(backend.name) == "msb")
             checkpointCacheDir().resolve("checkpoints").resolve("rz-ckpt-$suffix")

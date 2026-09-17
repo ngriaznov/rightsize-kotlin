@@ -224,11 +224,15 @@ class DockerBackend : SandboxBackend {
      * a pulled one, and the container itself is left running undisturbed
      * (`capabilities.checkpointRestartsWorkload = false`). [ref] is always `repo:tag` shaped
      * (minted by `GenericContainer.checkpoint` as `rightsize/checkpoint:<12-hex>`); [repoAndTag]
-     * does the split.
+     * does the split. The effective ref this returns is [ref] itself, unchanged — a docker
+     * commit is addressed by the tag it's given, unlike microsandbox's `snapshot create`, whose
+     * artifact path msb decides on its own (see `MsbCliBackend.createCheckpoint` in the sibling
+     * `backend-microsandbox` module).
      */
-    override fun createCheckpoint(handle: SandboxHandle, ref: String) {
+    override fun createCheckpoint(handle: SandboxHandle, ref: String): String {
         val (repo, tag) = repoAndTag(ref)
         client.commitCmd(handle.id).withRepository(repo).withTag(tag).exec()
+        return ref
     }
 
     /** `internal`, not `private`: unit-tested directly in [DockerBackendTest] without a daemon —

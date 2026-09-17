@@ -50,23 +50,27 @@ object MsbCommands {
     }
 
     /**
-     * `msb restore <ref> --name <name> --disk-only [-m <mem>M] [-p host:guest]...` — msb 0.7's
-     * dedicated restore command, the sole survivor of what `run --from-snapshot` used to do. msb
-     * 0.7 removed `--from-snapshot` from `run` outright: clap now rejects it as an unrecognized
+     * `msb restore <ref> --name <name> [-m <mem>M] [-p host:guest]...` — msb 0.7's dedicated
+     * restore command, the sole survivor of what `run --from-snapshot` used to do. msb 0.7
+     * removed `--from-snapshot` from `run` outright: clap now rejects it as an unrecognized
      * flag, and `msb run` itself bails "snapshot sources require `msb restore SNAPSHOT --name
      * NAME`" for a snapshot-shaped source (confirmed against msb's own source at tag v0.7.1 —
      * crates/cli/lib/commands/{run,restore}.rs). [MsbCliBackend] routes here instead of [run]
      * whenever [spec]'s `checkpointRef` is set — both [MsbCliBackend.createCheckpoint]'s own
      * re-boot and a `GenericContainer.fromCheckpoint(cp).start()` call reach this the same way.
      *
-     * `--disk-only` cold-boots only the captured disk, without resuming captured RAM/processes —
-     * the ONE restore mode matching what this backend's checkpoint has always meant (a
-     * filesystem snapshot, not a memory snapshot — see docs/checkpoints.md): the default (no
-     * `--disk-only`) is instead a FULL restore that resumes captured RAM/processes and requires
-     * the captured cpu/memory geometry, which this backend never records. Never omitted.
+     * NEVER `--disk-only`, as of msb 0.7.1: every snapshot this backend ever creates or restores
+     * is DISK-scope (`msb snapshot create --from-sandbox`, no memory capture), and a disk-scope
+     * snapshot now REJECTS `--disk-only` outright — `invalid config: disk_only requires a full
+     * snapshot with checkpoint state` (verified empirically against the real 0.7.1 binary).
+     * Restoring a disk-scope snapshot is inherently a cold boot of the captured disk alone, with
+     * no resumed RAM/processes and no flag needed to ask for that — matching what this backend's
+     * checkpoint has always meant (a filesystem snapshot, not a memory snapshot — see
+     * docs/checkpoints.md). A prior pin of this library against msb 0.7.0 emitted `--disk-only`
+     * here; that flag must stay omitted against 0.7.1 and later.
      *
      * `restore` has no `-e`/`--env` flag AND no trailing command at all — unlike `RunArgs`,
-     * `RestoreArgs` (crates/cli/lib/commands/restore.rs) declares neither. A disk-only restore
+     * `RestoreArgs` (crates/cli/lib/commands/restore.rs) declares neither. A restore
      * replays the sandbox's captured configuration (its own baked env and boot command) exactly
      * as the snapshot recorded it, with no CLI override for either — so [spec.env]/[spec.command]
      * are never emitted here. For [MsbCliBackend.createCheckpoint]'s own re-boot that
@@ -86,7 +90,7 @@ object MsbCommands {
      * never part of `CheckpointSpec` in the first place (see its own doc comment: the checkpoint's
      * filesystem already carries whatever a mount would have copied in). For
      * [MsbCliBackend.createCheckpoint]'s own re-boot, whatever `diskLimitMb`/`networkDisabled` the
-     * live sandbox already had simply rides along unemitted, same as env/command — the disk-only
+     * live sandbox already had simply rides along unemitted, same as env/command — the
      * restore boots the exact disk state that geometry was already baked into, so nothing
      * observable changes. A caller reaching this via `GenericContainer.fromCheckpoint(cp)
      * .withDiskLimit(...)`/`.withTmpfsRoot(...)`/`.withNetworkDisabled()` — asking for GENUINELY
@@ -102,7 +106,6 @@ object MsbCommands {
         val ref = requireNotNull(spec.checkpointRef) { "MsbCommands.restore requires spec.checkpointRef to be set" }
         add("restore"); add(ref)
         add("--name"); add(spec.name)
-        add("--disk-only")
         spec.memoryLimitMb?.let { add("-m"); add("${it}M") }
         spec.ports.forEach { add("-p"); add("${it.hostPort}:${it.guestPort}") }
     }
@@ -120,20 +123,41 @@ object MsbCommands {
     fun stop(name: String) = listOf("stop", name)
     fun rm(name: String) = listOf("rm", name)
     fun ls() = listOf("ls", "--format", "json")
-    /** `msb snapshot create --from <sandbox> <name>` requires [sandbox] STOPPED; writes a sparse
-     * disk snapshot artifact under `~/.microsandbox/snapshots/<name>`, or under [destDir] when
-     * given (a path-ref checkpoint — see [MsbCliBackend.createCheckpoint]). [JvmOverloads] keeps
+    /**
+     * `msb snapshot create --from-sandbox <sandbox> <name>` requires [sandbox] STOPPED and
+     * writes a DISK-scope snapshot artifact — under [destDir] when given (a path-ref checkpoint
+     * — see [MsbCliBackend.createCheckpoint]), or msb's own default `~/.microsandbox/snapshots/`
+     * store otherwise. [name] is NOT the artifact's on-disk location as of msb 0.7.1: it only
+     * appears in msb's index (as `<sandbox>:<name>` in `snapshot list`) and in `snapshot
+     * inspect` output — the real artifact path is `<dest-dir-or-default>/<sandbox>/snap_<32-hex
+     * digest>`, msb's own choice, which `snapshot create` prints as the LAST line of its stdout
+     * on success (see [MsbCliBackend.createCheckpoint]'s stdout-parsing). [JvmOverloads] keeps
      * the original 2-arg `(sandbox, name)` JVM descriptor alongside the 3-arg one — [destDir]
      * getting a default value would otherwise drop that descriptor from a published artifact and
-     * break any compiled-against-the-old-jar caller. */
+     * break any compiled-against-the-old-jar caller.
+     */
     @JvmOverloads
     fun snapshotCreate(sandbox: String, name: String, destDir: Path? = null) =
         listOf("snapshot", "create", "--from-sandbox", sandbox, name) +
             (destDir?.let { listOf("--dest-dir", it.toString()) } ?: emptyList())
-    fun snapshotRemove(name: String) = listOf("snapshot", "rm", name)
-    /** `msb snapshot inspect <name>` — its exit code alone is [MsbCliBackend.hasCheckpoint]'s
-     * signal (0 = exists, non-zero = doesn't); see docs/checkpoints.md. */
-    fun snapshotInspect(name: String) = listOf("snapshot", "inspect", name)
+    /** `msb snapshot rm <ref> -f` — msb 0.7.1 resolves `snapshot rm` reliably only against the
+     * snapshot's own artifact path (a bare name or a `group:member` spec does not resolve —
+     * verified empirically against the real binary), so [ref] is passed through verbatim, never
+     * reduced to a basename; `-f` skips msb's own removal confirmation. Removing the NEWEST
+     * (head) snapshot of a source sandbox while an OLDER sibling still exists is refused by msb
+     * itself (`invalid config: cannot remove current head ...; first select another snapshot
+     * with 'msb snapshot head src:<snapshot>'`) — [MsbCliBackend.removeCheckpoint] propagates
+     * that refusal as-is rather than attempting any automatic head rotation; see
+     * docs/checkpoints.md's Cleanup section. */
+    fun snapshotRemove(ref: String) = listOf("snapshot", "rm", ref, "-f")
+    /** `msb snapshot inspect <ref>` — its exit code alone is [MsbCliBackend.hasCheckpoint]'s
+     * signal (0 = exists, non-zero = doesn't); see docs/checkpoints.md. As of msb 0.7.1 this
+     * resolves reliably only against the snapshot's own artifact path for a path-shaped [ref]
+     * (name-based resolution does not — verified empirically against the real binary), which is
+     * exactly what every ref [MsbCliBackend.createCheckpoint] mints resolves to; a bare [ref]
+     * (e.g. the digest-dir name [MsbCliBackend.importCheckpoint] returns) is passed through
+     * unchanged, as it always has been. */
+    fun snapshotInspect(ref: String) = listOf("snapshot", "inspect", ref)
 
     /**
      * `msb snapshot save <ref> <dest>` — writes a `.tar.zst` artifact archive for [ref] to

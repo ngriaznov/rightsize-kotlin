@@ -58,32 +58,38 @@ class MsbCommandsTest {
 
     // --- MsbCommands.restore: msb 0.7's dedicated restore command ---
 
-    @Test fun `restore command carries the ref, name, --disk-only, memory, and ports - never env, command, or mounts`() {
+    @Test fun `restore command carries the ref, name, memory, and ports - never env, command, mounts, or --disk-only`() {
         val cmd = MsbCommands.restore(spec.copy(
             checkpointRef = "rz-ckpt-0123456789ab", memoryLimitMb = 1024))
         assertEquals(listOf("restore", "rz-ckpt-0123456789ab", "--name", "rz-abc-1",
-            "--disk-only", "-m", "1024M", "-p", "12345:6379"), cmd)
+            "-m", "1024M", "-p", "12345:6379"), cmd)
         assertFalse(cmd.contains("-e"), "restore has no -e/--env flag at all")
         assertFalse(cmd.contains("A=1"))
         assertFalse(cmd.contains("--"), "restore has no trailing-command flag at all")
         assertFalse(cmd.contains("redis-server"))
         assertFalse(cmd.contains("--mount-file"), "restore has no --mount-file equivalent")
         assertFalse(cmd.contains("redis:8.6-alpine"), "the ordinary image arg must not appear on a restore")
+        assertFalse(cmd.contains("--disk-only"),
+            "msb 0.7.1 rejects --disk-only for a disk-scope snapshot — restore must never emit it")
     }
 
     @Test fun `restore command omits -m when memoryLimitMb is null`() {
         val cmd = MsbCommands.restore(spec.copy(checkpointRef = "rz-ckpt-0123456789ab", memoryLimitMb = null))
-        assertEquals(listOf("restore", "rz-ckpt-0123456789ab", "--name", "rz-abc-1", "--disk-only",
+        assertEquals(listOf("restore", "rz-ckpt-0123456789ab", "--name", "rz-abc-1",
             "-p", "12345:6379"), cmd)
     }
 
     @Test fun `restore command omits -p when there are no ports`() {
         val cmd = MsbCommands.restore(spec.copy(checkpointRef = "rz-ckpt-0123456789ab", ports = emptyList()))
-        assertEquals(listOf("restore", "rz-ckpt-0123456789ab", "--name", "rz-abc-1", "--disk-only"), cmd)
+        assertEquals(listOf("restore", "rz-ckpt-0123456789ab", "--name", "rz-abc-1"), cmd)
     }
 
-    @Test fun `restore command always emits --disk-only`() {
-        assertTrue(MsbCommands.restore(spec.copy(checkpointRef = "rz-ckpt-0123456789ab")).contains("--disk-only"))
+    @Test fun `restore command never emits --disk-only`() {
+        // msb 0.7.1: every snapshot this backend creates or restores is disk-scope, and a
+        // disk-scope snapshot now REJECTS --disk-only outright ("invalid config: disk_only
+        // requires a full snapshot with checkpoint state" — verified empirically against the
+        // real binary); restoring one is inherently a cold boot, no flag needed to ask for it.
+        assertFalse(MsbCommands.restore(spec.copy(checkpointRef = "rz-ckpt-0123456789ab")).contains("--disk-only"))
     }
 
     @Test fun `restore throws when checkpointRef is not set`() {
@@ -157,8 +163,18 @@ class MsbCommandsTest {
     @Test fun `snapshot create and snapshot rm`() {
         assertEquals(listOf("snapshot", "create", "--from-sandbox", "rz-abc-1", "rz-ckpt-0123456789ab"),
             MsbCommands.snapshotCreate("rz-abc-1", "rz-ckpt-0123456789ab"))
-        assertEquals(listOf("snapshot", "rm", "rz-ckpt-0123456789ab"),
+        assertEquals(listOf("snapshot", "rm", "rz-ckpt-0123456789ab", "-f"),
             MsbCommands.snapshotRemove("rz-ckpt-0123456789ab"))
+    }
+
+    @Test fun `snapshot rm carries a full path ref verbatim, never reduced to a basename`() {
+        val fullPath = "/home/u/.cache/rightsize/checkpoints/rz-abc-1/snap_0123456789abcdef0123456789abcdef"
+        assertEquals(listOf("snapshot", "rm", fullPath, "-f"), MsbCommands.snapshotRemove(fullPath))
+    }
+
+    @Test fun `snapshot inspect carries the ref verbatim`() {
+        val fullPath = "/home/u/.cache/rightsize/checkpoints/rz-abc-1/snap_0123456789abcdef0123456789abcdef"
+        assertEquals(listOf("snapshot", "inspect", fullPath), MsbCommands.snapshotInspect(fullPath))
     }
 
     @Test fun `snapshot create appends --dest-dir when a destination directory is given`() {

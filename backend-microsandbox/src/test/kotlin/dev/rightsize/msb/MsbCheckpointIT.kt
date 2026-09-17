@@ -56,9 +56,18 @@ class MsbCheckpointIT {
             val beforeLedger = ledgerLines()
             val cp = original.checkpoint()
             snapshotRef = cp.ref
-            assertTrue(Path.of(cp.ref).isAbsolute, "unexpected ref shape: '${cp.ref}'")
-            assertTrue(Regex("^rz-ckpt-[0-9a-f]{12}$").matches(Path.of(cp.ref).fileName.toString()),
-                "unexpected ref basename: '${cp.ref}'")
+            val refPath = Path.of(cp.ref)
+            assertTrue(refPath.isAbsolute, "unexpected ref shape: '${cp.ref}'")
+            // msb 0.7.1's `snapshot create --from-sandbox` writes the artifact at
+            // <checkpoints-dir>/<sandbox>/snap_<32-hex digest> — msb's own choice, not this
+            // library's pre-0.7.1 <checkpoints-dir>/rz-ckpt-<12-hex> shape (see
+            // MsbCliBackend.createCheckpoint's doc). The checkpoints dir is therefore only an
+            // ANCESTOR of the ref now, not its immediate parent, and the basename is msb's own
+            // snap_<hex>, never the flat rz-ckpt-* one.
+            assertTrue(refPath.startsWith(CacheDir.resolve().resolve("checkpoints")),
+                "ref must live under the checkpoint cache dir's checkpoints subdir: '${cp.ref}'")
+            assertTrue(Regex("^snap_[0-9a-f]{32}$").matches(refPath.fileName.toString()),
+                "unexpected ref basename (expected msb 0.7.1's snap_<hex> shape): '${cp.ref}'")
             assertEquals("microsandbox", cp.backend)
             assertEquals(beforeLedger, ledgerLines(),
                 "the stop/snapshot/start cycle must not touch the reaper ledger — same sandbox, still this run's")

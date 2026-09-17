@@ -42,10 +42,10 @@ data class ContainerSpec(
     /**
      * Set by `GenericContainer.fromCheckpoint` to the source [Checkpoint.ref] — docker ignores
      * it (the ref already IS `image`, so the normal create path just works); msb boots via
-     * `msb restore <checkpointRef> --name <name> --disk-only` instead of its normal image boot
-     * when this is set, keeping name/ports/memory identical — but NOT env or command, which
-     * `msb restore` has no flag for at all (see `MsbCommands.restore`'s doc); the disk-only
-     * restore replays the snapshot's own captured configuration instead. Never part of reuse
+     * `msb restore <checkpointRef> --name <name>` instead of its normal image boot when this is
+     * set, keeping name/ports/memory identical — but NOT env or command, which
+     * `msb restore` has no flag for at all (see `MsbCommands.restore`'s doc); the restore
+     * replays the snapshot's own captured configuration instead. Never part of reuse
      * identity (see `dev.rightsize.core.reuse.ReuseFromCheckpointConflictException`) — reuse and
      * `fromCheckpoint` are not a supported combination.
      */
@@ -182,12 +182,13 @@ data class CheckpointSpec(
  * `RIGHTSIZE_BACKEND`) plus enough of the source container's configuration ([spec]) to boot an
  * equivalent one via `GenericContainer.fromCheckpoint`. [ref]'s shape is backend-specific: a
  * docker image tag (`rightsize/checkpoint:<12-hex>`) or an ABSOLUTE msb snapshot artifact path
- * (`<rightsize cache dir>/checkpoints/rz-ckpt-<12-hex>`) for an unnamed checkpoint (random per
- * call), or the same shapes with a caller-chosen name in place of the hex
- * (`rightsize/checkpoint:<name>` / `<...>/checkpoints/rz-ckpt-<name>`) for
- * `GenericContainer.checkpoint(name)`. The msb path is restored via `msb restore <path> --name
- * <name> --disk-only` and removed via `msb snapshot rm <basename>` — msb keys `snapshot rm`/`inspect` on the basename
- * alone even for a path-ref artifact. This is a filesystem capture, not a memory snapshot — a
+ * under the rightsize checkpoint cache dir — `<cache dir>/checkpoints/<source-sandbox>/snap_<32-hex
+ * digest>`, a path msb's own `snapshot create` decides (not minted by this library — see
+ * `SandboxBackend.createCheckpoint`'s doc), whether the call was an unnamed `checkpoint()` or a
+ * named `GenericContainer.checkpoint(name)`. The msb path is restored via `msb restore <path>
+ * --name <name>` (never `--disk-only`: msb 0.7.1 rejects it for a disk-scope snapshot) and
+ * removed via `msb snapshot rm <path> -f` — msb 0.7.1 resolves both `snapshot rm` and `snapshot
+ * inspect` reliably only against the artifact's own full path, never a bare name. This is a filesystem capture, not a memory snapshot — a
  * restored container's processes restart from scratch. Restoring under a different active
  * backend than the one that created it throws [CheckpointBackendMismatchException] before any
  * backend call. See docs/checkpoints.md.

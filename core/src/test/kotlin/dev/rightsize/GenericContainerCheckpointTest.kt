@@ -49,9 +49,14 @@ private open class CheckpointFakeBackend(
     val committed = mutableListOf<Pair<String, String>>()
     val removedRefs = mutableListOf<String>()
     var failCreateCheckpoint = false
-    override fun createCheckpoint(handle: SandboxHandle, ref: String) {
+    // Docker-shaped pass-through: returns ref unchanged, same as the real DockerBackend (unlike
+    // the real MsbCliBackend, which returns an EFFECTIVE ref that can differ from its input —
+    // this fake stays simple since none of these tests exercise that divergence, which is
+    // covered directly in backend-microsandbox's own MsbCheckpointTest).
+    override fun createCheckpoint(handle: SandboxHandle, ref: String): String {
         if (failCreateCheckpoint) error("simulated backend checkpoint failure")
         committed += handle.id to ref
+        return ref
     }
     override fun removeCheckpoint(ref: String) { removedRefs += ref }
 }
