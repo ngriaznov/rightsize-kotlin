@@ -76,7 +76,7 @@ object MsbCommands {
      * break any compiled-against-the-old-jar caller. */
     @JvmOverloads
     fun snapshotCreate(sandbox: String, name: String, destDir: Path? = null) =
-        listOf("snapshot", "create", "--from", sandbox, name) +
+        listOf("snapshot", "create", "--from-sandbox", sandbox, name) +
             (destDir?.let { listOf("--dest-dir", it.toString()) } ?: emptyList())
     fun snapshotRemove(name: String) = listOf("snapshot", "rm", name)
     /** `msb snapshot inspect <name>` — its exit code alone is [MsbCliBackend.hasCheckpoint]'s

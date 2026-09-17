@@ -7,7 +7,15 @@ reaches its first tagged release.
 
 ## [Unreleased]
 
-Nothing yet.
+### Changed
+
+- **The pinned microsandbox release is now 0.7.1** (from 0.6.18). Upstream's 0.7.0/0.7.1
+  bring guest stream-symlink fixes at agent startup, configurable TCP/UDP connection
+  limits, opt-in startup/network traces, and explicit snapshot flush policies (a new
+  optional `--flush` flag; full snapshots — the shape this library's checkpoints use —
+  keep their existing default). One driven CLI flag was renamed upstream —
+  `msb snapshot create --from` became `--from-sandbox` — and this library's
+  checkpoint machinery now emits the new spelling; nothing changes for callers.
 
 ## [0.7.9] - 2026-09-10
 

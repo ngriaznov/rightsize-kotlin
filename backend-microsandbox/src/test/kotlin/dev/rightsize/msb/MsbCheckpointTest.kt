@@ -121,7 +121,7 @@ class MsbCheckpointTest {
             val calls = nonPollingCalls(callLog)
             assertEquals(listOf(
                 "stop rz-ckpt-test",
-                "snapshot create --from rz-ckpt-test rz-ckpt-0123456789ab",
+                "snapshot create --from-sandbox rz-ckpt-test rz-ckpt-0123456789ab",
                 "rm rz-ckpt-test",
             ), calls.take(3))
             assertEquals(4, calls.size, "no extra commands beyond stop/snapshot-create/rm/run: $calls")
@@ -163,7 +163,7 @@ class MsbCheckpointTest {
                 "a failed snapshot step must leave the sandbox stopped, never best-effort resumed")
             assertEquals(listOf(
                 "stop rz-ckpt-fail-test",
-                "snapshot create --from rz-ckpt-fail-test rz-ckpt-0123456789ab",
+                "snapshot create --from-sandbox rz-ckpt-fail-test rz-ckpt-0123456789ab",
             ), nonPollingCalls(callLog), "a failed snapshot create must issue no rm and no re-boot")
         } finally {
             backend.stop(handle)
@@ -197,7 +197,7 @@ class MsbCheckpointTest {
             val calls = nonPollingCalls(callLog)
             assertEquals(listOf(
                 "stop rz-ckpt-reboot-fail-test",
-                "snapshot create --from rz-ckpt-reboot-fail-test rz-ckpt-0123456789ab",
+                "snapshot create --from-sandbox rz-ckpt-reboot-fail-test rz-ckpt-0123456789ab",
                 "rm rz-ckpt-reboot-fail-test",
             ), calls.take(3), "the re-boot attempt must follow a successful snapshot and rm: $calls")
             assertTrue(calls[3].startsWith("run --name rz-ckpt-reboot-fail-test"),
@@ -253,7 +253,7 @@ class MsbCheckpointTest {
             assertTrue(Files.isDirectory(destDir), "createCheckpoint must create the ref's parent dir")
             val calls = nonPollingCalls(callLog)
             assertEquals(
-                "snapshot create --from rz-ckpt-path-test rz-ckpt-0123456789ab --dest-dir $destDir",
+                "snapshot create --from-sandbox rz-ckpt-path-test rz-ckpt-0123456789ab --dest-dir $destDir",
                 calls[1],
             )
             assertTrue("--from-snapshot $ref" in calls[3], "re-boot must use the full path ref verbatim: ${calls[3]}")

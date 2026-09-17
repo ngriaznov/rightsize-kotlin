@@ -118,7 +118,7 @@ class MsbCommandsTest {
     }
 
     @Test fun `snapshot create and snapshot rm`() {
-        assertEquals(listOf("snapshot", "create", "--from", "rz-abc-1", "rz-ckpt-0123456789ab"),
+        assertEquals(listOf("snapshot", "create", "--from-sandbox", "rz-abc-1", "rz-ckpt-0123456789ab"),
             MsbCommands.snapshotCreate("rz-abc-1", "rz-ckpt-0123456789ab"))
         assertEquals(listOf("snapshot", "rm", "rz-ckpt-0123456789ab"),
             MsbCommands.snapshotRemove("rz-ckpt-0123456789ab"))
@@ -126,14 +126,14 @@ class MsbCommandsTest {
 
     @Test fun `snapshot create appends --dest-dir when a destination directory is given`() {
         assertEquals(
-            listOf("snapshot", "create", "--from", "rz-abc-1", "rz-ckpt-0123456789ab",
+            listOf("snapshot", "create", "--from-sandbox", "rz-abc-1", "rz-ckpt-0123456789ab",
                 "--dest-dir", "/home/u/.cache/rightsize/checkpoints"),
             MsbCommands.snapshotCreate("rz-abc-1", "rz-ckpt-0123456789ab", Path.of("/home/u/.cache/rightsize/checkpoints")),
         )
     }
 
     @Test fun `snapshot create without a destination directory is byte-identical to today`() {
-        assertEquals(listOf("snapshot", "create", "--from", "rz-abc-1", "rz-ckpt-0123456789ab"),
+        assertEquals(listOf("snapshot", "create", "--from-sandbox", "rz-abc-1", "rz-ckpt-0123456789ab"),
             MsbCommands.snapshotCreate("rz-abc-1", "rz-ckpt-0123456789ab", null))
     }
 
@@ -144,7 +144,7 @@ class MsbCommandsTest {
      * new signature regardless of `@JvmOverloads`, so it can't catch a regression here. */
     @Test fun `snapshotCreate keeps the original 2-arg JVM descriptor via @JvmOverloads`() {
         val twoArg = MsbCommands::class.java.getMethod("snapshotCreate", String::class.java, String::class.java)
-        assertEquals(listOf("snapshot", "create", "--from", "rz-abc-1", "rz-ckpt-0123456789ab"),
+        assertEquals(listOf("snapshot", "create", "--from-sandbox", "rz-abc-1", "rz-ckpt-0123456789ab"),
             twoArg.invoke(MsbCommands, "rz-abc-1", "rz-ckpt-0123456789ab"))
         // The 3-arg descriptor must still exist too — this is an addition, not a replacement.
         MsbCommands::class.java.getMethod("snapshotCreate", String::class.java, String::class.java, Path::class.java)
