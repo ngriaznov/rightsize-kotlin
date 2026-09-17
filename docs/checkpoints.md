@@ -41,17 +41,27 @@ Both backends support checkpoint/restore today, via different mechanisms:
 
 microsandbox's `msb snapshot create` requires the sandbox stopped, so `checkpoint()` there runs
 `msb stop` → `msb snapshot create --from-sandbox <sandbox> <name> --dest-dir <cache-dir>/checkpoints`
-→ `msb rm <sandbox>` → a fresh attached `msb restore <ref> --name <sandbox>` under the same name
-and ports — the sandbox ends up running again under the same name, but its workload command
-re-ran from scratch to get there. As of msb 0.7.1, `--from-sandbox` always writes a DISK-scope
-snapshot, and restoring one is inherently a cold boot of the captured disk alone (no resumed
-RAM/processes, matching this library's filesystem-only checkpoint semantics) — with **no**
-`--disk-only` flag: msb 0.7.1 REJECTS that flag outright for a disk-scope source (`invalid
-config: disk_only requires a full snapshot with checkpoint state`; an earlier msb pin of this
-library did pass it). Env and the boot command are never re-passed either way (`msb restore` has
-no `-e`/`--env` flag and no trailing-command flag at all, unlike `msb run`) — restore replays the
-sandbox's own captured configuration instead, which for this same-container reboot is exactly
-what was already running a moment earlier.
+→ `msb rm <sandbox>` → `msb restore <ref> --name <sandbox>` under the same name and ports — the
+sandbox ends up running again under the same name, but its workload command re-ran from scratch
+to get there. As of msb 0.7.1, `--from-sandbox` always writes a DISK-scope snapshot, and restoring
+one is inherently a cold boot of the captured disk alone (no resumed RAM/processes, matching this
+library's filesystem-only checkpoint semantics) — with **no** `--disk-only` flag: msb 0.7.1
+REJECTS that flag outright for a disk-scope source (`invalid config: disk_only requires a full
+snapshot with checkpoint state`; an earlier msb pin of this library did pass it). Env and the boot
+command are never re-passed either way (`msb restore` has no `-e`/`--env` flag and no
+trailing-command flag at all, unlike `msb run`) — restore replays the sandbox's own captured
+configuration instead, which for this same-container reboot is exactly what was already running a
+moment earlier.
+
+`msb restore` is **not** supervised the way `msb run` is. Per upstream's own doc, `restore` boots
+a new *detached* sandbox: the `restore` process activates it and exits — typically within seconds,
+often with no output — while the sandbox keeps booting toward `Running` in the background; a
+nonzero exit means the restore itself failed. This library waits for that process to exit
+(classifying a nonzero exit the same transient-failure-aware way an ordinary boot's early exit
+is), then polls `msb ls` for `Running` separately, on the same budget an ordinary attached boot
+polls on. The resulting sandbox handle has no supervising child process to reap, kill, or watch
+for an early death — `stop()`/`exec()`/`logs()` all already operate through the CLI by name and
+are unaffected.
 
 **`ref` is not what this library asks msb to write to.** `--dest-dir` only tells msb where to
 root the artifact — under the rightsize cache directory instead of its own default

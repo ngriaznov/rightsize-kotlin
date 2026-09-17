@@ -59,6 +59,15 @@ object MsbCommands {
      * whenever [spec]'s `checkpointRef` is set — both [MsbCliBackend.createCheckpoint]'s own
      * re-boot and a `GenericContainer.fromCheckpoint(cp).start()` call reach this the same way.
      *
+     * `restore.rs`'s own doc calls this "Restore a snapshot into a new **detached** sandbox" —
+     * confirmed empirically against the real 0.7.1 binary: the `restore` process activates the
+     * sandbox and EXITS (typically within seconds, with little or no stdout) once activation
+     * succeeds, while the sandbox keeps booting toward Running in the background; a nonzero exit
+     * means the restore itself failed, the reason on stderr/stdout. This is NOT the attached-child
+     * supervision `msb run` gives [MsbCliBackend] (see [MsbCliBackend.awaitRunning]'s doc) — a
+     * restore boot is supervised by [MsbCliBackend.awaitRestoreRunning] instead: wait for this
+     * process to exit, then poll `msb ls` for Running separately. See docs/checkpoints.md.
+     *
      * NEVER `--disk-only`, as of msb 0.7.1: every snapshot this backend ever creates or restores
      * is DISK-scope (`msb snapshot create --from-sandbox`, no memory capture), and a disk-scope
      * snapshot now REJECTS `--disk-only` outright — `invalid config: disk_only requires a full

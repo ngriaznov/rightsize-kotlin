@@ -19,6 +19,15 @@ import java.util.concurrent.atomic.AtomicBoolean
  * fsync). It exists so tests can drive those branches from a POSIX machine — a real Windows
  * host is CI-only, so without this seam they would ship with no unit coverage at all.
  *
+ * [restoreReadinessBudgetMs] is a second, narrower seam: the same wall-clock budget
+ * [awaitRestoreRunning] bounds a checkpoint restore's post-activation `msb ls` poll by,
+ * defaulted to the real [FIRST_RUN_PULL_TIMEOUT_MS] so production behavior is unchanged.
+ * Without it, red-proofing "the sandbox never reaches Running" would mean a unit test
+ * actually blocking for that real ten-minute budget; tests reach it via [forHost] to shrink
+ * it instead. It never touches the ordinary attached-run path ([awaitRunning] reads
+ * [FIRST_RUN_PULL_TIMEOUT_MS] directly, unseamed, exactly as before) or restore's own
+ * process-exit wait, which shares this same budget rather than getting a third constant.
+ *
  * The seam is deliberately kept off the public surface entirely. The two-argument
  * constructor is `private` — `internal` would still emit a public constructor into the
  * bytecode and so remain callable from Java — and tests reach it through [forHost], whose
@@ -28,6 +37,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 class MsbCliBackend private constructor(
     internal val msb: Path,
     private val windowsHost: Boolean,
+    private val restoreReadinessBudgetMs: Long = FIRST_RUN_PULL_TIMEOUT_MS,
 ) : SandboxBackend {
     constructor(msb: Path) : this(msb, Platform.current()?.isWindows == true)
 
@@ -56,11 +66,16 @@ class MsbCliBackend private constructor(
     // class, where no bytecode-public accessor is ever emitted for them.
     internal companion object {
         /**
-         * Builds a backend pinned to [windowsHost] rather than to the real platform — the
-         * test-only seam described on this class. `internal`, so Kotlin mangles its name in
-         * the bytecode and it never becomes a Java-callable entry point either.
+         * Builds a backend pinned to [windowsHost] rather than to the real platform, and
+         * optionally to a shrunk [restoreReadinessBudgetMs] — the two test-only seams described
+         * on this class. `internal`, so Kotlin mangles its name in the bytecode and it never
+         * becomes a Java-callable entry point either.
          */
-        internal fun forHost(msb: Path, windowsHost: Boolean) = MsbCliBackend(msb, windowsHost)
+        internal fun forHost(
+            msb: Path,
+            windowsHost: Boolean,
+            restoreReadinessBudgetMs: Long = FIRST_RUN_PULL_TIMEOUT_MS,
+        ) = MsbCliBackend(msb, windowsHost, restoreReadinessBudgetMs)
     }
 
     private val startedNames = ConcurrentHashMap.newKeySet<String>()
@@ -73,10 +88,10 @@ class MsbCliBackend private constructor(
     override fun create(spec: ContainerSpec): SandboxHandle = Handle(spec)
 
     /**
-     * ATTACHED-mode supervision (detached mode never starts the image ENTRYPOINT — confirmed
-     * empirically against the real binary). The `msb run` child lives as long as the sandbox;
-     * readiness = name Running in `msb ls --format json`. Workload logs come from `msb logs`,
-     * not this process's stdout.
+     * ATTACHED-mode supervision when `handle.spec.checkpointRef` is unset (detached `-d` mode
+     * never starts the image ENTRYPOINT — confirmed empirically against the real binary). The
+     * `msb run` child lives as long as the sandbox; readiness = name Running in `msb ls --format
+     * json`. Workload logs come from `msb logs`, not this process's stdout.
      *
      * A workload that completes before this backend's poll ever samples Running (e.g. a short
      * build or script — see [isCleanFastExit]) is not a failed boot: the child still exits 0,
@@ -85,12 +100,19 @@ class MsbCliBackend private constructor(
      * `stop`/state-reporting surfaces treat it as not running, same as any other Stopped
      * sandbox, because it genuinely is one.
      *
+     * When `handle.spec.checkpointRef` IS set (a `GenericContainer.fromCheckpoint(cp).start()`
+     * call), this instead boots via a `msb restore` invocation, which is childless-by-design —
+     * see [awaitRestoreRunning]'s doc. [Handle.attached] ends up `null` for that boot, same as
+     * for any other sandbox this backend never launched a supervising child for (e.g.
+     * [findRunning]'s adopted handles); [stop] already treats a `null` [Handle.attached] as
+     * nothing to reap.
+     *
      * A first boot attempt that exits before Running with msb's image-cache-corruption
      * signature (see [isImageCacheCorruption]) is healed by removing the affected image's
      * cache entry and retried exactly once — see [spawnAndAwaitRunning]. The failed attempt
      * never reached Running, so [Handle.attached] and [startedNames] (both populated only
      * after [spawnAndAwaitRunning] returns) carry no state from it to double-register, and
-     * its child has already been reaped by [bootOnce].
+     * its child (when the boot had one) has already been reaped by [bootOnce].
      *
      * A `keepAlive` sandbox (container reuse, see docs/reuse.md) is never added to
      * [startedNames]: that set drives both the constructor shutdown hook and [close]'s
@@ -104,7 +126,10 @@ class MsbCliBackend private constructor(
     }
 
     /**
-     * Boots via [bootOnce], retrying two classified transient failures once each. [spec] is
+     * Boots via [bootOnce], retrying two classified transient failures once each — the same
+     * retry/heal wrapper around ordinary `run` boots AND `restore` boots alike (requirement:
+     * boot-transient classification applies to a restore's output the same way it does for
+     * run; only [bootOnce]'s internal supervision shape differs by boot kind). [spec] is
      * ordinarily [Handle.spec] itself (from [start]), but [createCheckpoint]'s re-boot passes a
      * copy with `checkpointRef` set instead — [handle] still supplies the identity (`id`) both
      * callers boot under. A boot that hit msb's state-database error — usually the
@@ -126,8 +151,14 @@ class MsbCliBackend private constructor(
      * because by then the concurrent winner has finished materializing the shared layer —
      * or the manifest IS committed but the cache file backing one of its layers is gone,
      * where `image remove` clears the stale entry and the retry re-pulls from scratch.
+     *
+     * Returns the supervising child [Process] for an ordinary `run` boot, or `null` for a
+     * `restore` boot (`spec.checkpointRef != null`) — that process has already exited by the
+     * time this returns (see [awaitRestoreRunning]), so there is nothing left to hand back;
+     * callers assign the result straight to [Handle.attached], which is `null`-safe everywhere
+     * it's read ([stop]).
      */
-    private fun spawnAndAwaitRunning(handle: Handle, spec: ContainerSpec): Process {
+    private fun spawnAndAwaitRunning(handle: Handle, spec: ContainerSpec): Process? {
         val firstOutput = try {
             return bootOnce(handle, spec)
         } catch (locked: MsbInstallLockException) {
@@ -181,21 +212,34 @@ class MsbCliBackend private constructor(
     }
 
     /**
-     * One boot attempt: spawns the attached `msb run` child for [spec] and waits for [handle] to
-     * reach Running. On any failure the child is reaped here (for the classified early-exit
+     * One boot attempt, dispatched by `spec.checkpointRef`:
+     * - unset: spawns the attached `msb run` child and waits for [handle] to reach Running via
+     *   [awaitRunning] — unchanged from before restore got its own supervision. Returns the
+     *   still-live child.
+     * - set: spawns `msb restore ...` and waits for IT (a short-lived activation launcher, not a
+     *   supervising child — see [awaitRestoreRunning]'s doc) to exit, then polls [handle] to
+     *   Running the same way. Returns `null`: by the time [awaitRestoreRunning] returns
+     *   successfully the process has already exited, so there is nothing live to hand back.
+     *
+     * On any failure the process is reaped here (for the classified early-exit/nonzero-exit
      * failures it has already exited; a readiness timeout leaves it alive and it is
      * force-killed), so a failed attempt leaves no live process behind — the caller owns retry
      * policy, never cleanup.
      */
-    private fun bootOnce(handle: Handle, spec: ContainerSpec): Process {
-        val (proc, tail, drainer) = spawnAttachedRun(spec)   // ATTACHED mode: -d never runs the ENTRYPOINT
+    private fun bootOnce(handle: Handle, spec: ContainerSpec): Process? {
+        val (proc, tail, drainer) = spawnAttachedRun(spec)   // ATTACHED run, or a detached restore launch
         try {
-            awaitRunning(handle, proc, tail, drainer)          // readiness = name Running in `msb ls`
+            return if (spec.checkpointRef != null) {
+                awaitRestoreRunning(handle, proc, tail, drainer)   // readiness = name Running in `msb ls`
+                null
+            } else {
+                awaitRunning(handle, proc, tail, drainer)          // readiness = name Running in `msb ls`
+                proc
+            }
         } catch (t: Throwable) {
             if (proc.isAlive) proc.destroyForcibly()
             throw t
         }
-        return proc
     }
 
     /** Renders a heal attempt's outcome for the second-failure message — the heal's own
@@ -213,7 +257,9 @@ class MsbCliBackend private constructor(
      * [MsbCommands.restore]'s doc) for [spec], draining its combined output to a tail kept for
      * diagnostics only — msb's own boot output (registry/pull errors, a crash before the sandbox
      * exists), never the workload's. [logs] never reads from this tail; it always shells out to
-     * `msb logs`.
+     * `msb logs`. What the caller does with the returned [Process] differs by boot kind: [awaitRunning]
+     * treats it as a supervising child that lives as long as the sandbox; [awaitRestoreRunning]
+     * treats it as a short-lived launcher and waits for it to exit before polling separately.
      */
     private fun spawnAttachedRun(spec: ContainerSpec): Triple<Process, ConcurrentLinkedDeque<String>, Thread> {
         val argv = if (spec.checkpointRef != null) MsbCommands.restore(spec) else MsbCommands.run(spec)
@@ -261,6 +307,91 @@ class MsbCliBackend private constructor(
         error("Sandbox ${handle.id} did not reach Running within ${FIRST_RUN_PULL_TIMEOUT_MS / 1000}s — this can " +
             "mean a slow image pull, a crash-looping entrypoint, or msb itself being unresponsive; last output:\n" +
             tail.joinToString("\n"))
+    }
+
+    /**
+     * The `restore` counterpart of [awaitRunning] — necessary because `msb restore` is NOT an
+     * attached supervising child the way `msb run` is. Per `restore.rs`'s own doc ("Restore a
+     * snapshot into a new **detached** sandbox") and confirmed empirically against the real
+     * msb 0.7.1 binary: [proc] activates the sandbox and exits — typically within seconds, with
+     * little or no stdout — once activation succeeds, while the sandbox keeps booting in the
+     * background toward Running on its own. A nonzero exit unambiguously means the restore
+     * itself failed (msb's own contract for this command, unlike `run`'s exit-before-Running
+     * ambiguity — there is no `restore`-side equivalent of [isCleanFastExit] to rescue a clean
+     * exit here, because a clean exit is always just "activation succeeded", never "the
+     * workload already finished").
+     *
+     * Two phases share one deadline ([restoreReadinessBudgetMs] — the same budget [awaitRunning]
+     * itself bounds its own wait by, made injectable so tests don't block on the real ten-minute
+     * value; see the class doc):
+     *
+     * 1. Wait for [proc] to exit. Non-exit within the deadline is itself a boot failure (the
+     *    caller, [bootOnce], force-kills it on any throw from here, same as an attached-run
+     *    readiness timeout). A nonzero exit is classified from the combined output through the
+     *    exact same boot-transient signatures [awaitRunning] uses — image-cache corruption,
+     *    msb's state-database race, its install lock, a host-port bind conflict, a name
+     *    collision — so [spawnAndAwaitRunning]'s retry/heal wrapper covers a restore boot
+     *    exactly like it always has an ordinary one (boot-transient classification applies to
+     *    the restore process's output the same way it does for `run`; only this method's
+     *    supervision shape differs). Anything else surfaces the raw output.
+     * 2. Once [proc] has exited 0, [handle] has no supervising child left AT ALL — activation
+     *    succeeded, but the sandbox may still be `Starting` in the background. Poll `msb ls` on
+     *    the remaining budget, same interval as [awaitRunning]'s own poll ([READINESS_POLL_MS]):
+     *    `Running` returns normally. The sandbox reads `Stopped`, or drops out of `msb ls`
+     *    entirely after having been seen at least once — [seen] is what tells a boot that
+     *    crashed immediately after activation apart from one that just hasn't been picked up by
+     *    `msb ls` yet — is a boot failure, surfaced with `msb logs <name> --source system`
+     *    diagnostics (the same system-log channel [isCleanFastExit] reads) rather than the
+     *    generic message, since a genuinely crashed restore boot has exactly the same
+     *    diagnostic shape as a crashed attached one.
+     *
+     * Never returns a [Process]: unlike [awaitRunning], by the time this returns successfully
+     * [proc] has already exited, so [bootOnce] hands [Handle.attached] `null` for this boot
+     * kind rather than a value from here.
+     */
+    private fun awaitRestoreRunning(
+        handle: Handle, proc: Process, tail: ConcurrentLinkedDeque<String>, drainer: Thread,
+    ) {
+        val deadline = System.currentTimeMillis() + restoreReadinessBudgetMs
+        if (!proc.waitFor(maxOf(deadline - System.currentTimeMillis(), 0L), TimeUnit.MILLISECONDS)) {
+            error("msb restore for sandbox ${handle.id} did not exit within ${restoreReadinessBudgetMs / 1000}s " +
+                "— msb itself may be unresponsive; last output:\n${tail.joinToString("\n")}")
+        }
+        // Same reasoning as awaitRunning's own join: the drainer thread may not have consumed
+        // the process's final buffered output yet.
+        runCatching { drainer.join(5_000) }
+        val output = tail.joinToString("\n")
+        val exitCode = proc.exitValue()
+        if (exitCode != 0) {
+            if (isImageCacheCorruption(output)) throw ImageCacheCorruptionException(output)
+            if (isMsbStateDbError(output)) throw MsbStateDbException(output)
+            if (isMsbInstallLockActive(output)) throw MsbInstallLockException(output)
+            if (isPortBindConflict(output)) {
+                throw PortBindConflictException(
+                    "msb restore for sandbox ${handle.id} could not bind a host port: $output")
+            }
+            if (isNameCollision(output)) {
+                throw SandboxNameCollisionException(
+                    "sandbox named ${handle.id} already exists: $output")
+            }
+            error("msb restore for sandbox ${handle.id} failed (exit $exitCode): $output")
+        }
+        var seen = false
+        while (System.currentTimeMillis() < deadline) {
+            val status = MsbLsJson.statusOf(invoke(MsbCommands.ls(), LOGS_TIMEOUT_SEC).stdout, handle.id)
+            if (status == "Running") return
+            if (status == "Stopped" || (seen && status == null)) {
+                val systemLog = invoke(MsbCommands.logsSystem(handle.id), LOGS_TIMEOUT_SEC).stdout
+                error("msb restore for sandbox ${handle.id} exited 0 (restore activation succeeded) but the " +
+                    "sandbox ${if (status == "Stopped") "stopped" else "disappeared from `msb ls`"} before " +
+                    "reaching Running — system log:\n$systemLog")
+            }
+            if (status != null) seen = true
+            Thread.sleep(READINESS_POLL_MS)
+        }
+        error("Sandbox ${handle.id} did not reach Running within ${restoreReadinessBudgetMs / 1000}s after " +
+            "msb restore exited 0 — this can mean a slow disk-snapshot boot or msb itself being unresponsive; " +
+            "system log:\n${invoke(MsbCommands.logsSystem(handle.id), LOGS_TIMEOUT_SEC).stdout}")
     }
 
     /**
@@ -341,17 +472,20 @@ class MsbCliBackend private constructor(
      * `ERROR_ACCESS_DENIED` whenever msb runs inside a Windows job object that doesn't grant
      * breakaway rights, which is exactly the case when this JVM is itself a child of a Gradle
      * test process or a CI runner's job. That denial is deterministic, not transient, so no
-     * retry ever clears it. Attached `msb run`/`msb restore` — this backend's ordinary boot and
-     * its restore counterpart, neither with creation flags — work everywhere, so the resume step
-     * here is instead: remove the stopped sandbox (its disk state now lives entirely in the
-     * snapshot) and boot a fresh attached sandbox from that snapshot under the SAME name/ports/
-     * memory limit (NOT env — see [MsbCommands.restore]'s doc), via [spawnAndAwaitRunning] — the
-     * exact boot path [start] itself uses, just fed [handle]'s own spec with `checkpointRef` set
-     * to the EFFECTIVE ref (`spawnAttachedRun` then routes to `MsbCommands.restore`, emitting
-     * `restore <ref> --name <name>` in place of an ordinary `run <image>` boot — never
-     * `--disk-only`, which msb 0.7.1 rejects for a disk-scope snapshot; see that method's doc).
-     * [Handle.attached] is swapped to the new child; `id`/`spec` — the ledger-relevant identity —
-     * are untouched.
+     * retry ever clears it. `msb restore` (unlike `msb start`) passes no creation flags and
+     * works everywhere, so the resume step here is instead: remove the stopped sandbox (its
+     * disk state now lives entirely in the snapshot) and boot a fresh sandbox from that
+     * snapshot under the SAME name/ports/memory limit (NOT env — see [MsbCommands.restore]'s
+     * doc), via [spawnAndAwaitRunning] — the exact boot path [start] itself uses, just fed
+     * [handle]'s own spec with `checkpointRef` set to the EFFECTIVE ref (`spawnAttachedRun`
+     * then routes to `MsbCommands.restore`, emitting `restore <ref> --name <name>` in place of
+     * an ordinary `run <image>` boot — never `--disk-only`, which msb 0.7.1 rejects for a
+     * disk-scope snapshot; see that method's doc). Unlike [start]'s ordinary boot, a restore
+     * boot is childless by design (see [awaitRestoreRunning]'s doc): [Handle.attached] ends up
+     * `null` here, not swapped to a new child — there is no supervising process left to hold
+     * once [spawnAndAwaitRunning] returns successfully for a restore, and [stop] already treats
+     * a `null` [Handle.attached] as nothing to reap. `id`/`spec` — the ledger-relevant identity
+     * — are untouched.
      *
      * `capabilities.checkpointRestartsWorkload = true` is exactly why: the rebooted workload
      * starts from scratch, so `GenericContainer.checkpoint()` re-applies the container's own

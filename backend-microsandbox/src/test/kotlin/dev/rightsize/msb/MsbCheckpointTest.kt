@@ -30,11 +30,15 @@ class MsbCheckpointTest {
      * when the argv carries one) — UNLESS [malformedCreateOutputFlag] exists, in which case it
      * instead prints a line that is not a parseable absolute path at all, to drive
      * [MsbCliBackend.createCheckpoint]'s defensive-parsing failure mode; a `restore` invocation
-     * (the re-boot, as opposed to the initial ordinary `run` boot) exits non-zero when
-     * [rebootFailFlag] exists, otherwise it recreates [marker] (so the sandbox reports Running
-     * again) exactly like an ordinary boot. Every invocation's full argv is appended to
-     * [callLog], one line per call, so the tests below can assert on the order and shape of the
-     * commands [createCheckpoint] actually drives instead of re-implementing msb's own CLI.
+     * (the re-boot, as opposed to the initial ordinary `run` boot) exits non-zero with no marker
+     * written when [rebootFailFlag] exists — otherwise, matching msb's own detached-restore
+     * contract (see [MsbCliBackend.awaitRestoreRunning]'s doc), it recreates [marker] (so the
+     * sandbox reports Running on the next `ls`) and THEN exits 0 immediately, never blocking the
+     * way the ordinary `run` case above does — [MsbCliBackend] must wait for this short-lived
+     * process to exit and poll `ls` separately, not treat it as a supervising child. Every
+     * invocation's full argv is appended to [callLog], one line per call, so the tests below can
+     * assert on the order and shape of the commands [createCheckpoint] actually drives instead of
+     * re-implementing msb's own CLI.
      */
     private fun fakeMsbCheckpointLifecycle(
         marker: Path,
@@ -78,7 +82,6 @@ class MsbCheckpointTest {
             |      exit 1
             |    fi
             |    echo "${'$'}name" > "$marker"
-            |    while [ -f "$marker" ]; do sleep 0.05; done
             |    exit 0
             |    ;;
             |  ls)
