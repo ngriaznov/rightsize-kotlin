@@ -717,14 +717,105 @@ class MsbCliBackend private constructor(
             runCatching { CheckpointRegistry(checkpointRegistryDir).writeCapturedCommand(effectiveRef, capturedCommand) }
         }
         invoke(MsbCommands.rm(handle.id), STOP_TIMEOUT_SEC)
+        // Windows-only in practice (same deferred-teardown lag family as RestoreAccessDeniedException's
+        // file-handle release, see awaitNameReleased's own doc): `rm` above can return before the
+        // sandbox record/name is actually released, and a restore issued into that gap fails outright
+        // with msb's own "already exists" error instead of ever reaching the sandbox it's recreating.
+        awaitNameReleased(handle.id)
         try {
-            handle.attached = spawnAndAwaitRunning(handle, handle.spec.copy(checkpointRef = effectiveRef))
+            // Defense in depth alongside the wait just above, for the same lag family — see
+            // rebootRetryingNameCollision's own doc for why this, not spawnAndAwaitRunning directly.
+            handle.attached = rebootRetryingNameCollision(handle, handle.spec.copy(checkpointRef = effectiveRef))
         } catch (e: Exception) {
             error("re-booting sandbox ${handle.id} from checkpoint $effectiveRef failed: ${e.message} — the " +
                 "sandbox was removed but its state is preserved in checkpoint $effectiveRef, restorable via " +
                 "GenericContainer.fromCheckpoint.")
         }
         return effectiveRef
+    }
+
+    /**
+     * Sits between [createCheckpoint]'s own `rm` and its restore re-boot: polls `msb ls --format
+     * json` until [name] is no longer listed at all, bounded by [CHECKPOINT_NAME_RELEASE_BUDGET_MS].
+     * Confirmed against real Windows msb CI lanes (rust and kotlin alike): `msb rm <name>` can
+     * return before the sandbox record/name is fully released on Windows — the same deferred-
+     * teardown lag family as [RestoreAccessDeniedException]'s snapshot-file-handle release — and a
+     * `restore` issued into that gap fails outright with msb's own `error: sandbox already exists:
+     * sandbox '<name>' already exists; remove it, start the stopped sandbox, or recreate with
+     * .replace()`, never even reaching the sandbox it's trying to recreate. Unix frees the name
+     * synchronously with `rm` returning, so production callers there always clear this on the very
+     * first poll below; the budget only ever gets spent on Windows.
+     *
+     * Checks first, sleeps [READINESS_POLL_MS] after — the same interval [awaitRunning]/
+     * [awaitRestoreRunning] already poll at — so a name that's already free never pays even one
+     * poll's delay. A name STILL listed once the budget elapses is treated as a genuinely stuck
+     * teardown, not a race worth waiting out further: this throws naming the stuck sandbox rather
+     * than looping forever or leaving the restore's own confusing already-exists error to surface
+     * as the checkpoint's failure message instead.
+     *
+     * A FAILED probe never counts as a confirmed release. [invoke] only throws on a hard
+     * timeout ([check]'s own `proc.waitFor` guard) — never on a nonzero `msb ls` exit code, which
+     * it returns as an ordinary [ExecResult] like any other — so a nonzero exit is checked here
+     * explicitly. And [MsbLsJson.isListed] (unlike [MsbLsJson.statusOf], whose `null` is
+     * deliberately ambiguous between "not listed" and "couldn't parse" for callers that treat
+     * both the same way) reports that ambiguity back as its own `null` rather than folding it into
+     * "absent", so a transient daemon hiccup on `msb ls` itself — plausible precisely because
+     * teardown is still in flight — polls again instead of reading as the name being free. Only an
+     * exit-0, successfully-parsed listing that omits [name] is a confirmed release; anything else
+     * (a nonzero exit, unparseable stdout, or the name still present) keeps polling.
+     */
+    private fun awaitNameReleased(name: String) {
+        val deadline = System.currentTimeMillis() + CHECKPOINT_NAME_RELEASE_BUDGET_MS
+        while (true) {
+            val ls = invoke(MsbCommands.ls(), LOGS_TIMEOUT_SEC)
+            val confirmedAbsent = ls.exitCode == 0 && MsbLsJson.isListed(ls.stdout, name) == false
+            if (confirmedAbsent) return
+            if (System.currentTimeMillis() >= deadline) {
+                error("sandbox $name still appeared in `msb ls` (or `msb ls` itself never confirmed it " +
+                    "absent) ${CHECKPOINT_NAME_RELEASE_BUDGET_MS / 1000}s after `msb rm $name` — msb's own " +
+                    "teardown of this name never completed, so restoring a fresh sandbox under it would only " +
+                    "hit msb's own already-exists error; the sandbox's disk state is preserved in the " +
+                    "just-created snapshot, restorable via GenericContainer.fromCheckpoint once the stuck " +
+                    "name clears.")
+            }
+            Thread.sleep(READINESS_POLL_MS)
+        }
+    }
+
+    /**
+     * Bounded retry of [spawnAndAwaitRunning] for [createCheckpoint]'s own re-boot ONLY, specifically
+     * for msb's "sandbox already exists" restore failure ([SandboxNameCollisionException]) — defense
+     * in depth alongside [awaitNameReleased] above, for the exact same Windows deferred-teardown lag
+     * family, in case the name frees in the gap between that poll's last check and the instant
+     * `restore` itself re-checks it. [CHECKPOINT_REBOOT_NAME_COLLISION_MAX_ATTEMPTS]/
+     * [CHECKPOINT_REBOOT_NAME_COLLISION_RETRY_DELAY_MS] mirror [RESTORE_ACCESS_DENIED_MAX_ATTEMPTS]/
+     * [RESTORE_ACCESS_DENIED_RETRY_DELAY_MS]'s own bounded, no-heal, short-backoff shape — kept as
+     * their own constants rather than reused ones, since they classify a different msb failure (a
+     * name collision, not a Windows file-handle release) even though both belong to the same
+     * deferred-teardown lag family.
+     *
+     * Any OTHER exception from [spawnAndAwaitRunning] — including every failure that cascade already
+     * retries itself (install-lock, state-db, image-cache, access-denied) — propagates immediately,
+     * unretried here; this exists for exactly one known-transient signature, not as a generic reboot
+     * retry.
+     *
+     * Never reached by the ordinary `start()` path — a `GenericContainer.fromCheckpoint(cp).start()`
+     * restore of a fresh name goes through [spawnAndAwaitRunning] directly, whose own catch cascade
+     * has never caught [SandboxNameCollisionException] and still doesn't: an already-exists failure
+     * there (only reachable if a caller reuses a name that's still live) keeps propagating as-is,
+     * exactly as before this method existed.
+     */
+    private fun rebootRetryingNameCollision(handle: Handle, spec: ContainerSpec): Process? {
+        var attempts = 1
+        while (true) {
+            try {
+                return spawnAndAwaitRunning(handle, spec)
+            } catch (collision: SandboxNameCollisionException) {
+                if (attempts >= CHECKPOINT_REBOOT_NAME_COLLISION_MAX_ATTEMPTS) throw collision
+                attempts++
+                Thread.sleep(CHECKPOINT_REBOOT_NAME_COLLISION_RETRY_DELAY_MS)
+            }
+        }
     }
 
     /**
@@ -1248,6 +1339,18 @@ private const val WORKLOAD_EXEC_EARLY_EXIT_GRACE_MS = 1_000L
 // in tests and in practice — the release lag this works around is itself sub-second.
 private const val RESTORE_ACCESS_DENIED_MAX_ATTEMPTS = 3
 private const val RESTORE_ACCESS_DENIED_RETRY_DELAY_MS = 300L
+// createCheckpoint's post-rm name-release wait (see awaitNameReleased's doc): a short wall-clock
+// budget, not an attempt count, since presence/absence in `msb ls` is a state to observe, not a
+// command to retry — READINESS_POLL_MS above is reused as the poll cadence, so this is the only
+// new tuning knob the wait needs. Unix always clears this on the first poll; the budget is spent
+// only on the Windows lag it exists for.
+private const val CHECKPOINT_NAME_RELEASE_BUDGET_MS = 3_000L
+// createCheckpoint's own already-exists reboot retry (see rebootRetryingNameCollision's doc):
+// same bounded, no-heal, short-backoff shape as RESTORE_ACCESS_DENIED_MAX_ATTEMPTS/
+// RESTORE_ACCESS_DENIED_RETRY_DELAY_MS above, kept as its own constants since it classifies a
+// different msb failure than that pair does.
+private const val CHECKPOINT_REBOOT_NAME_COLLISION_MAX_ATTEMPTS = 3
+private const val CHECKPOINT_REBOOT_NAME_COLLISION_RETRY_DELAY_MS = 300L
 
 /** The one boot failure [MsbCliBackend] heals and retries — carries the `msb run` child's
  * combined output for the second-failure diagnostic. Internal to the boot path: never

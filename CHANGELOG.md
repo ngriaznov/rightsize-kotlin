@@ -127,6 +127,10 @@ reaches its first tagged release.
   misclassified — is now treated as a transient boot failure and retried, bounded, with a short
   backoff, the same shape this library's other classified boot-transient retries already use.
   The classifier itself is platform-agnostic code; the signature simply never occurs on Unix.
+- **`createCheckpoint` now waits out msb's asynchronous sandbox-name release on Windows before
+  rebooting from the snapshot**, polling `msb ls` (bounded, briefly) after `rm` so the reboot no
+  longer races a lingering name into msb's own "already exists" refusal, with one short bounded
+  retry of the reboot itself as defense in depth if that refusal still slips through.
 
 ## [0.7.9] - 2026-09-10
 

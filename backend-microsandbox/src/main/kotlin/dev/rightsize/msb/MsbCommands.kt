@@ -282,6 +282,23 @@ internal object MsbLsJson {
     fun statusOf(json: String, name: String): String? = runCatching {
         this.json.decodeFromString<List<LsEntry>>(json)
     }.getOrDefault(emptyList()).firstOrNull { it.name == name }?.status
+
+    /** Whether [json] lists an entry named [name] at all, regardless of its status — or `null`
+     * when [json] doesn't parse as the documented array shape, i.e. the listing itself is
+     * inconclusive rather than a confirmed absence.
+     *
+     * [statusOf]/[runningNames] deliberately fold a parse failure into their own "no such
+     * entry"/"not Running" default, which is safe for their callers (a malformed or empty `msb
+     * ls` result should read as "nothing confirmed yet", not crash a readiness poll). This
+     * function exists because [MsbCliBackend.awaitNameReleased] is NOT one of those callers: it
+     * treats "the name is gone from `msb ls`" as a green light to reboot into a fresh restore,
+     * so a listing it can't confirm the presence OR absence of must never be read as "released"
+     * — unlike [statusOf]'s `null`, which conflates "not listed" with "couldn't tell", this keeps
+     * those two outcomes distinct so the caller can require the former specifically.
+     */
+    fun isListed(json: String, name: String): Boolean? = runCatching {
+        this.json.decodeFromString<List<LsEntry>>(json)
+    }.map { entries -> entries.any { it.name == name } }.getOrNull()
 }
 
 // `MsbSnapshotListJson` (parsing `msb snapshot list --format json` to confirm a digest-dir
