@@ -170,6 +170,31 @@ reaches its first tagged release.
   or not, instead of only on a successful return — a failed reboot after a rename used to leave
   `LiveContainers`, and therefore `Diagnostics.render`, permanently mislabeling the container
   under its stale pre-checkpoint name. Neither change touches any public signature.
+- **`createCheckpoint`'s reboot now mints a FRESH sandbox name on every retry, never the same one
+  twice.** msb 0.7.1's `restore` validates the snapshot artifact first (an integrity failure exits
+  1 with no sandbox record left behind), but a failure AFTER validation — chiefly Windows'
+  deferred-file-release access-denied error — can still leave the attempted name itself as a
+  STOPPED sandbox record, and a same-name retry into that gap then collides with its own leftover
+  for as long as msb's teardown of it takes. That was exactly what msb-windows CI hit: the
+  already-exists-refusal retry and the access-denied retry each used to retry the SAME name for
+  their whole budget, so an access-denied failure on attempt 1 left a record that every same-name
+  retry then collided with, burning the entire ~30s budget without ever advancing. Both retries now
+  best-effort `msb rm` the just-failed name and mint another fresh name from the same generator
+  ordinary boots use before retrying, bounded by the same wall-clock budget as before (an outer
+  bound on total retry time across as many names as it takes, not a name-specific attempt count).
+  The Windows access-denied retry no longer runs its own same-name loop for this path at all — it
+  now surfaces the raw, unretried failure so the fresh-name loop above is what classifies and
+  retries it; an ordinary `GenericContainer.fromCheckpoint(cp).start()` restore (outside
+  `checkpoint()`'s own reboot) is unaffected and keeps its original same-name access-denied retry,
+  since it has no second name of its own to advance to. Every attempted name — not just the first —
+  is tracked in the reaper's run ledger before its own restore attempt, the same append-before-create
+  discipline an ordinary create already gets, so a process dying mid-retry still leaves every
+  attempted name discoverable by the ledger's own not-found-tolerant end-of-run sweep. No public
+  signature changed; the sandbox's name across a checkpoint was never a documented contract. A
+  related, previously-incorrect test expectation is also fixed: the reaper ledger is no longer
+  asserted to be untouched by the checkpoint/restore cycle (that was only ever true back when the
+  reboot reused the source sandbox's own name) — it now gains exactly the fresh name(s) the cycle
+  actually minted, one in the happy path, with every prior entry preserved unchanged.
 
 ## [0.7.9] - 2026-09-10
 

@@ -49,19 +49,30 @@ are rewritten to the fresh name in place before the reboot is attempted, so ever
 against it — `exec`/`logs`/`stop`/`removeCheckpoint`'s later use — keeps working transparently
 without the caller ever seeing or needing to know the new name.
 
-**Why not the same name.** `msb rm` on Windows can return before the sandbox's on-disk directory
-is actually released — msb's own existence check for a restore target is "DB record present OR
-directory present", and the directory has been observed on Windows CI outliving the DB record by
-multiple seconds under load. A same-name restore issued into that gap fails outright with msb's
-own "already exists" error, for as long as the directory lingers — not a fixed bound, so no retry
-budget can be sized to reliably outlast it. A restore under a freshly generated name never
-collides with the just-removed sandbox's own lingering directory at all, sidestepping the whole
-lag rather than racing it. The sandbox's name across a checkpoint was always an implementation
-detail, never a documented contract — nothing in this library's public API names it. (The
-already-exists retry budget and the post-`rm` `msb ls` name-release wait below both predate this
-fix and still run, as harmless, now largely dormant defense in depth — a freshly generated name
+**Why not the same name — and why never the same RETRY name either.** `msb rm` on Windows can
+return before the sandbox's on-disk directory is actually released — msb's own existence check for
+a restore target is "DB record present OR directory present", and the directory has been observed
+on Windows CI outliving the DB record by multiple seconds under load. A same-name restore issued
+into that gap fails outright with msb's own "already exists" error, for as long as the directory
+lingers — not a fixed bound, so no retry budget can be sized to reliably outlast it. A restore
+under a freshly generated name never collides with the just-removed sandbox's own lingering
+directory at all, sidestepping the whole lag rather than racing it. The sandbox's name across a
+checkpoint was always an implementation detail, never a documented contract — nothing in this
+library's public API names it. (The post-`rm` `msb ls` name-release wait below predates this fix
+and still runs, as harmless, now largely dormant defense in depth — a freshly generated name
 colliding with some other still-live sandbox is vanishingly unlikely, unlike the near-certainty a
 same-name restore risked on a loaded Windows host.)
+
+A fresh name is not immune to the same lag family, though: `msb restore <name>` validates the
+snapshot artifact first (an integrity failure exits 1 with no sandbox record left at all), but a
+failure AFTER validation — most often Windows' deferred-file-release access-denied error — can
+still leave that fresh name itself behind as a stopped sandbox record, and a retry under the SAME
+name then collides with its own leftover exactly as a same-name restore of the original name would
+have. The reboot's retry loop therefore never reuses a name either: on msb's already-exists refusal
+or the access-denied signature, it best-effort removes the just-failed name and mints ANOTHER fresh
+name from the same generator before retrying, bounded by the same ~30-second wall-clock budget (not
+an attempt count) the retry has always used — so the retry outlives the lag across as many distinct
+names as it takes, rather than exhausting its budget colliding with one.
 
 As of msb 0.7.1, `--from-sandbox` always writes a DISK-scope snapshot, and restoring
 one is inherently a cold boot of the captured disk alone (no resumed RAM/processes, matching this
@@ -73,10 +84,15 @@ trailing-command flag at all, unlike `msb run`) — restore replays the sandbox'
 configuration instead, which for this same-container reboot is exactly what was already running a
 moment earlier.
 
-The reaper's run ledger (see [reaping.md](reaping.md)) tracks the fresh name the same way it
-tracks an ordinary create — appended before the restore is attempted — and simply leaves the old
-name's own entry for its existing not-found-tolerant sweep to pick up, since the sandbox under
-that name is already gone by then.
+The reaper's run ledger (see [reaping.md](reaping.md)) tracks EVERY name the reboot mints the same
+way it tracks an ordinary create — each one appended before its own restore attempt, including a
+retry's fresh name after a refused one — and simply leaves the old (pre-checkpoint) name's own
+entry, and any refused attempt's own entry, for its existing not-found-tolerant sweep to pick up,
+since the sandbox under each of those names is already gone (or best-effort removed) by then. A
+successful cycle therefore adds exactly ONE new entry to the ledger beyond what was there before —
+the winning name — not zero: this is a deliberate change from this library's earlier,
+pre-fresh-name checkpoint behavior, where the reboot reused the source sandbox's own name and so
+never touched the ledger at all.
 
 `msb restore` is **not** supervised the way `msb run` is. Per upstream's own doc, `restore` boots
 a new *detached* sandbox: the `restore` process activates it and exits — typically within seconds,

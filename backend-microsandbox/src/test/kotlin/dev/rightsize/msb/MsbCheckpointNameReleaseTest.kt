@@ -9,9 +9,9 @@ import java.nio.file.Path
 
 /**
  * Red-proofs [MsbCliBackend.createCheckpoint]'s post-`rm` name-release wait
- * ([MsbCliBackend.awaitNameReleased]) and its already-exists reboot retry
- * ([MsbCliBackend.rebootRetryingNameCollision]) — both driven entirely against a local fake `msb`
- * script, same pattern as [MsbCheckpointTest]/[MsbRestoreSupervisionTest]. POSIX-only; the
+ * ([MsbCliBackend.awaitNameReleased]) and its fresh-name-per-attempt already-exists reboot retry
+ * ([MsbCliBackend.rebootCheckpointRetryingFreshName]) — both driven entirely against a local fake
+ * `msb` script, same pattern as [MsbCheckpointTest]/[MsbRestoreSupervisionTest]. POSIX-only; the
  * msb-windows CI lane's own integration test is what exercises this against the real binary on
  * Windows, where the lag this covers actually occurs.
  */
@@ -251,14 +251,19 @@ class MsbCheckpointNameReleaseTest {
         }
     }
 
-    @Test fun `createCheckpoint retries the reboot through 5 already-exists failures and succeeds on the 6th attempt`() {
+    /** Sandbox name that a `restore ... --name <name> ...` call line targeted. */
+    private fun restoreTarget(line: String): String =
+        line.substringAfter("--name ").substringBefore(" ")
+
+    @Test fun `createCheckpoint retries the reboot through 5 already-exists failures, minting a distinct fresh name each time, and succeeds on the 6th`() {
         // N=5 is deliberately more than the pre-fix budget (3 attempts total, ~900ms of retrying)
         // could ever survive — this red-proofs that the reboot retry now runs on a wall-clock
         // BUDGET (production default ~30s at CHECKPOINT_REBOOT_ALREADY_EXISTS_RETRY_DELAY_MS
         // intervals) rather than the old fixed attempt count, so it outlives a collision that
         // clears only after several retries. No budget/delay override needed here: the default
         // 30s budget comfortably covers the ~10s these 5 retries take at the production 2s
-        // interval.
+        // interval. Also red-proofs the POLICY change itself: no two attempts ever share a name,
+        // and each refused attempt's name is best-effort `rm`'d before the next one is tried.
         assumeFalse(Platform.current()?.isWindows == true, "POSIX-only fake binary; see doc comment")
         val marker = Files.createTempFile("rz-marker-", "").also { Files.deleteIfExists(it) }
         val callLog = Files.createTempFile("rz-calllog-", "")
@@ -277,27 +282,46 @@ class MsbCheckpointNameReleaseTest {
             Files.writeString(callLog, "")
 
             val effectiveRef = backend.createCheckpoint(handle, "rz-ckpt-0123456789ab")
-            val freshName = handle.id   // rewritten in place by the reboot — never sandboxName
+            val winningName = handle.id   // rewritten in place by the reboot — never sandboxName
 
-            assertTrue(freshName in backend.runningSandboxNames(),
-                "the sandbox must be Running again, under the fresh name, once createCheckpoint returns")
+            assertTrue(winningName in backend.runningSandboxNames(),
+                "the sandbox must be Running again, under the winning name, once createCheckpoint returns")
             assertTrue(effectiveRef.endsWith("snap_0123456789abcdef0123456789abcdef"))
 
-            val restoreCalls = Files.readAllLines(callLog).filter { it.startsWith("restore ") }
+            val lines = Files.readAllLines(callLog)
+            val restoreCalls = lines.filter { it.startsWith("restore ") }
             assertEquals(6, restoreCalls.size,
                 "restore must have run exactly 6 times: 5 already-exists failures plus the succeeding retry")
-            assertTrue(restoreCalls.all { "--name $freshName" in it },
-                "every retry must keep targeting the SAME fresh name: $restoreCalls")
+            val attemptedNames = restoreCalls.map(::restoreTarget)
+            assertEquals(attemptedNames.size, attemptedNames.toSet().size,
+                "no two attempts may ever share a name: $attemptedNames")
+            assertFalse(sandboxName in attemptedNames,
+                "the reboot must never retry under the ORIGINAL (pre-checkpoint) name: $attemptedNames")
+            assertEquals(winningName, attemptedNames.last(),
+                "the winning attempt's name must be the one handle.id ends up rewritten to: $attemptedNames")
+
+            // Every failed attempt's name (the first 5) must be best-effort `rm`'d before the next
+            // fresh name is even minted — never the winning 6th, which is still live.
+            val rmCallsAfterFirstRestore =
+                lines.subList(lines.indexOfFirst { it.startsWith("restore ") }, lines.size)
+                    .filter { it == "rm ${attemptedNames[0]}" || it == "rm ${attemptedNames[1]}" ||
+                        it == "rm ${attemptedNames[2]}" || it == "rm ${attemptedNames[3]}" ||
+                        it == "rm ${attemptedNames[4]}" }
+            assertEquals(listOf("rm ${attemptedNames[0]}", "rm ${attemptedNames[1]}", "rm ${attemptedNames[2]}",
+                "rm ${attemptedNames[3]}", "rm ${attemptedNames[4]}"), rmCallsAfterFirstRestore,
+                "each of the 5 failed attempts' names must be best-effort removed, in order, before advancing: $lines")
+            assertFalse(lines.contains("rm $winningName"),
+                "the winning (still-live) name must never itself be rm'd by the retry loop")
         } finally {
             backend.stop(handle)
             backend.remove(handle)
         }
     }
 
-    @Test fun `createCheckpoint retries once on a single already-exists refusal against the fresh name, then succeeds`() {
-        // Red-proof (c): the already-exists retry machinery still fires against the FRESH name
-        // (not the original) — a single forced refusal, the minimal case, distinct from the
-        // 5-failures test above which exists to pin the wall-clock-budget shape itself.
+    @Test fun `createCheckpoint retries once on a single already-exists refusal, minting a fresh name distinct from the refused one, then succeeds`() {
+        // Red-proof (c): the already-exists retry machinery still fires against a FRESH name (not
+        // the original) — a single forced refusal, the minimal case, distinct from the 5-failures
+        // test above which exists to pin the wall-clock-budget shape itself.
         assumeFalse(Platform.current()?.isWindows == true, "POSIX-only fake binary; see doc comment")
         val marker = Files.createTempFile("rz-marker-", "").also { Files.deleteIfExists(it) }
         val callLog = Files.createTempFile("rz-calllog-", "")
@@ -316,17 +340,139 @@ class MsbCheckpointNameReleaseTest {
             Files.writeString(callLog, "")
 
             backend.createCheckpoint(handle, "rz-ckpt-0123456789ab")
-            val freshName = handle.id
+            val winningName = handle.id
 
-            assertNotEquals(sandboxName, freshName)
-            assertTrue(freshName in backend.runningSandboxNames(),
-                "the sandbox must be Running again, under the fresh name, once createCheckpoint returns")
-            val restoreCalls = Files.readAllLines(callLog).filter { it.startsWith("restore ") }
+            assertNotEquals(sandboxName, winningName)
+            assertTrue(winningName in backend.runningSandboxNames(),
+                "the sandbox must be Running again, under the winning name, once createCheckpoint returns")
+            val lines = Files.readAllLines(callLog)
+            val restoreCalls = lines.filter { it.startsWith("restore ") }
             assertEquals(2, restoreCalls.size,
-                "restore must have run exactly twice: the fresh name's own already-exists refusal, " +
-                    "plus the succeeding retry")
-            assertTrue(restoreCalls.all { "--name $freshName" in it },
-                "every retry must keep targeting the SAME fresh name, never falling back to the original: $restoreCalls")
+                "restore must have run exactly twice: the refused attempt, plus the succeeding retry " +
+                    "under a fresh name")
+            val attemptedNames = restoreCalls.map(::restoreTarget)
+            assertEquals(2, attemptedNames.toSet().size,
+                "the two attempts must never share a name: $attemptedNames")
+            assertEquals(winningName, attemptedNames[1],
+                "the second (winning) attempt's name must be the one handle.id ends up rewritten to")
+            assertTrue("rm ${attemptedNames[0]}" in lines,
+                "the refused first attempt's name must be best-effort removed before the retry: $lines")
+        } finally {
+            backend.stop(handle)
+            backend.remove(handle)
+        }
+    }
+
+    @Test fun `createCheckpoint retries once on msb's Windows access-denied restore failure, minting a fresh name distinct from the refused one, never looping bootOnce on the same name`() {
+        // Red-proof for the second classified failure the POLICY covers: msb validates the
+        // snapshot artifact FIRST, so a failure AFTER validation (the access-denied errno) can
+        // still leave the attempted name behind as a stopped sandbox record — exactly the CI
+        // failure this fix addresses. Two restore invocations under two DISTINCT names is the
+        // only shape that proves BOTH halves at once: if spawnAndAwaitRunning's own inline
+        // same-name access-denied retry had fired instead (the bug this fixes), the two calls
+        // would share the SAME name rather than differing, and/or a 3rd/4th same-name call could
+        // appear before ever advancing — neither happens here.
+        assumeFalse(Platform.current()?.isWindows == true, "POSIX-only fake binary; see doc comment")
+        val marker = Files.createTempFile("rz-marker-", "").also { Files.deleteIfExists(it) }
+        val callLog = Files.createTempFile("rz-calllog-", "")
+        val counter = Files.createTempFile("rz-accessdenied-counter-", "")
+        val sandboxName = "rz-ckpt-accessdenied-test"
+        val script = Files.createTempFile("rz-fake-msb-ckpt-accessdenied", "")
+        Files.writeString(
+            script,
+            """
+            |#!/bin/sh
+            |cmd="${'$'}1"
+            |echo "${'$'}*" >> "$callLog"
+            |shift
+            |case "${'$'}cmd" in
+            |  run)
+            |    name=""
+            |    while [ "${'$'}#" -gt 0 ]; do
+            |      case "${'$'}1" in --name) name="${'$'}2"; shift 2 ;; *) shift ;; esac
+            |    done
+            |    echo "${'$'}name" > "$marker"
+            |    while [ -f "$marker" ]; do sleep 0.05; done
+            |    exit 0
+            |    ;;
+            |  restore)
+            |    snapshot="${'$'}1"; shift
+            |    name=""
+            |    while [ "${'$'}#" -gt 0 ]; do
+            |      case "${'$'}1" in --name) name="${'$'}2"; shift 2 ;; *) shift ;; esac
+            |    done
+            |    n=${'$'}(cat "$counter" 2>/dev/null || echo 0)
+            |    n=${'$'}((n + 1))
+            |    echo "${'$'}n" > "$counter"
+            |    if [ "${'$'}n" -eq 1 ]; then
+            |      echo "error: io error: Access is denied. (os error 5)" 1>&2
+            |      exit 1
+            |    fi
+            |    echo "${'$'}name" > "$marker"
+            |    exit 0
+            |    ;;
+            |  exec)
+            |    while [ "${'$'}#" -gt 0 ]; do
+            |      case "${'$'}1" in --) shift; break ;; *) shift ;; esac
+            |    done
+            |    while [ -f "$marker" ]; do sleep 0.05; done
+            |    exit 0
+            |    ;;
+            |  ls)
+            |    if [ -f "$marker" ]; then
+            |      n2=${'$'}(cat "$marker")
+            |      echo "[{\"name\":\"${'$'}n2\",\"status\":\"Running\"}]"
+            |    else
+            |      echo "[]"
+            |    fi
+            |    ;;
+            |  stop) rm -f "$marker"; exit 0 ;;
+            |  rm) exit 0 ;;
+            |  snapshot)
+            |    if [ "${'$'}1" = "create" ]; then
+            |      shift 2
+            |      sandbox="${'$'}1"; shift
+            |      shift
+            |      destdir="/fake-msb-store"
+            |      while [ "${'$'}#" -gt 0 ]; do
+            |        case "${'$'}1" in --dest-dir) destdir="${'$'}2"; shift 2 ;; *) shift ;; esac
+            |      done
+            |      echo "Snapshot ID: fake0000-0000-0000-0000-000000000000"
+            |      echo "${'$'}destdir/${'$'}sandbox/snap_0123456789abcdef0123456789abcdef"
+            |      exit 0
+            |    fi
+            |    exit 0
+            |    ;;
+            |  *) exit 0 ;;
+            |esac
+            |""".trimMargin(),
+        )
+        script.toFile().setExecutable(true)
+        val backend = MsbCliBackend(script)
+        val spec = ContainerSpec(name = sandboxName, image = "irrelevant", runId = "run1", command = listOf("serve"))
+        val handle = backend.create(spec)
+        try {
+            backend.start(handle)
+            Files.writeString(callLog, "")
+
+            backend.createCheckpoint(handle, "rz-ckpt-0123456789ab")
+            val winningName = handle.id
+
+            assertNotEquals(sandboxName, winningName)
+            assertTrue(winningName in backend.runningSandboxNames(),
+                "the sandbox must be Running again, under the winning name, once createCheckpoint returns")
+            val lines = Files.readAllLines(callLog)
+            val restoreCalls = lines.filter { it.startsWith("restore ") }
+            assertEquals(2, restoreCalls.size,
+                "restore must run exactly twice: the access-denied attempt, plus the succeeding retry " +
+                    "under a fresh name — never a same-name inline retry loop")
+            val attemptedNames = restoreCalls.map(::restoreTarget)
+            assertEquals(2, attemptedNames.toSet().size,
+                "the two attempts must never share a name: $attemptedNames")
+            assertEquals(winningName, attemptedNames[1],
+                "the second (winning) attempt's name must be the one handle.id ends up rewritten to")
+            assertTrue("rm ${attemptedNames[0]}" in lines,
+                "the access-denied attempt's name must be best-effort removed before the retry: $lines")
         } finally {
             backend.stop(handle)
             backend.remove(handle)

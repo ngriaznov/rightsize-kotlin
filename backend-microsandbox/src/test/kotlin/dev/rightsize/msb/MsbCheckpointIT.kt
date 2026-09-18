@@ -20,10 +20,12 @@ import java.time.Duration
  * End-to-end checkpoint/restore against a real msb disk snapshot (see docs/checkpoints.md): boot
  * a sandbox, write a marker file into it, checkpoint — proving both that the SAME sandbox still
  * works afterward (the stop/snapshot/start cycle brings it back up, and `checkpoint()` re-runs
- * the wait strategy since `checkpointRestartsWorkload` is true) and that the reaper ledger is
- * untouched by the cycle (same sandbox name throughout, still owned by this run) — then restores
- * from the snapshot and proves the marker survived. Cleanup is guard-style (an outer `finally`),
- * so a mid-test assertion failure still removes both sandboxes and the snapshot.
+ * the wait strategy since `checkpointRestartsWorkload` is true) and that the reaper ledger gains
+ * EXACTLY the fresh name(s) the cycle minted — one in the happy path — never touching or reordering
+ * whatever was already there (the reboot restores under a freshly generated sandbox name, not the
+ * source sandbox's own; see [MsbCliBackend.createCheckpoint]'s doc) — then restores from the
+ * snapshot and proves the marker survived. Cleanup is guard-style (an outer `finally`), so a
+ * mid-test assertion failure still removes both sandboxes and the snapshot.
  */
 @Tag("sandbox-it")
 class MsbCheckpointIT {
@@ -41,7 +43,7 @@ class MsbCheckpointIT {
             if (Files.exists(it)) Files.readAllLines(it) else emptyList()
         }
 
-    @Test fun `checkpoint then restore preserves filesystem state, and the stop-snapshot-start cycle never touches the ledger`() {
+    @Test fun `checkpoint then restore preserves filesystem state, and the stop-snapshot-start cycle appends exactly the minted fresh name(s) to the ledger`() {
         val original = GenericContainer("alpine:3.19")
             .withCommand("sh", "-c", "sleep 120")
             .waitingFor(Wait.forLogMessage(".*", 0).withStartupTimeout(Duration.ofSeconds(30)))
@@ -69,8 +71,23 @@ class MsbCheckpointIT {
             assertTrue(Regex("^snap_[0-9a-f]{32}$").matches(refPath.fileName.toString()),
                 "unexpected ref basename (expected msb 0.7.1's snap_<hex> shape): '${cp.ref}'")
             assertEquals("microsandbox", cp.backend)
-            assertEquals(beforeLedger, ledgerLines(),
-                "the stop/snapshot/start cycle must not touch the reaper ledger — same sandbox, still this run's")
+            // The reboot restores under a FRESHLY GENERATED sandbox name (see
+            // MsbCliBackend.createCheckpoint's doc), never the source sandbox's own — so the cycle
+            // is no longer a ledger no-op the way a same-name reboot would have been. The correct
+            // invariant: prior entries (including the removed source's own — left for the ledger's
+            // own not-found-tolerant end-of-run sweep to pick up) are never removed or reordered,
+            // and the cycle appends EXACTLY the name(s) it minted — one in this happy path, where
+            // the first attempt succeeds outright.
+            val afterLedger = ledgerLines()
+            assertEquals(beforeLedger, afterLedger.take(beforeLedger.size),
+                "the stop/snapshot/start cycle must never remove or reorder the ledger's prior " +
+                    "entries — including the checkpointed sandbox's own pre-checkpoint name, left for " +
+                    "the not-found-tolerant sweep — only ever append the name(s) it minted: " +
+                    "before=$beforeLedger after=$afterLedger")
+            assertEquals(beforeLedger.size + 1, afterLedger.size,
+                "the happy-path cycle mints exactly one fresh name (no already-exists/access-denied " +
+                    "retries here), so the ledger must gain exactly that one entry beyond its prior " +
+                    "contents: before=$beforeLedger after=$afterLedger")
 
             // Proves the start-back-up + post-checkpoint wait re-run: the SAME container is
             // usable again, not left stopped or in a not-yet-ready state.

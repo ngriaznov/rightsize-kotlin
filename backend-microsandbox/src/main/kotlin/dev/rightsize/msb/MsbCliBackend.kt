@@ -46,21 +46,28 @@ import java.util.concurrent.atomic.AtomicBoolean
  * [forHost], same as the other two seams.
  *
  * [checkpointRebootAlreadyExistsBudgetMs] is a fourth seam, same spirit as
- * [restoreReadinessBudgetMs]: the wall-clock budget [rebootRetryingNameCollision] bounds its
- * already-exists retry by, defaulted to the real [CHECKPOINT_REBOOT_ALREADY_EXISTS_RETRY_BUDGET_MS]
- * (~30s) so production behavior is unchanged. Without it, red-proofing "the collision never
- * clears" would mean a unit test actually blocking for that real budget; tests reach it via
- * [forHost] to shrink it, exactly like [restoreReadinessBudgetMs].
+ * [restoreReadinessBudgetMs]: the wall-clock budget [rebootCheckpointRetryingFreshName] bounds its
+ * whole fresh-name-per-attempt retry by, defaulted to the real
+ * [CHECKPOINT_REBOOT_ALREADY_EXISTS_RETRY_BUDGET_MS] (~30s) so production behavior is unchanged.
+ * Without it, red-proofing "the collision/access-denied never clears" would mean a unit test
+ * actually blocking for that real budget; tests reach it via [forHost] to shrink it, exactly like
+ * [restoreReadinessBudgetMs].
  *
  * [createCheckpoint]'s reboot restores under a FRESHLY GENERATED sandbox name (via
  * [dev.rightsize.nextSandboxName], the same `rz-<runId>-<n>` generator/counter an ordinary boot
  * uses), never the checkpointed container's own pre-checkpoint name — see that method's doc for
  * why (msb's Windows-only sandbox-directory-retention lag, which a same-name restore cannot
  * outrun no matter how long it waits, but a fresh name sidesteps outright). [awaitNameReleased]
- * and [rebootRetryingNameCollision] both predate that fix and still run, unchanged, as defense in
- * depth against a name collision that is now vanishingly unlikely (a freshly generated name
- * colliding with something else live) rather than the near-certainty a same-name restore faced —
- * kept live deliberately, per the class's own don't-remove-working-defenses posture, not dead code.
+ * predates that fix and still runs, unchanged, as defense in depth against a name collision that
+ * is now vanishingly unlikely (a freshly generated name colliding with something else live)
+ * rather than the near-certainty a same-name restore faced. [rebootCheckpointRetryingFreshName]
+ * (the renamed, restructured successor of what used to be a same-name-only retry) stays live for
+ * the same residual reason, but no longer assumes the fresh name never needs replacing: a real
+ * `msb restore` failure AFTER msb validates the artifact — the Windows access-denied errno chief
+ * among them — can still leave the fresh name itself behind as a stopped sandbox record, so this
+ * now mints ANOTHER fresh name per failed attempt rather than retrying the same one forever (see
+ * that method's own doc — this is the fix for the CI collision on already-fresh names, not dead
+ * code kept per the class's own don't-remove-working-defenses posture).
  */
 class MsbCliBackend private constructor(
     internal val msb: Path,
@@ -204,8 +211,21 @@ class MsbCliBackend private constructor(
      * new supervising child for the boot. The one caller still assigns the result straight to
      * [Handle.attached], which is `null`-safe everywhere it's read ([stop]) for every OTHER
      * `null`-attached case (e.g. [findRunning]'s adopted handles).
+     *
+     * [retryAccessDeniedInline] gates ONLY the [RestoreAccessDeniedException] catch below: `true`
+     * (every caller except [rebootCheckpointRetryingFreshName]) keeps retrying [bootOnce] against
+     * the SAME [spec]/name, exactly as before this parameter existed — an ordinary
+     * `GenericContainer.fromCheckpoint(cp).start()` restore has no second name to advance to, so
+     * same-name retry is the only option there and stays the whole story. `false` — used
+     * exclusively by [createCheckpoint]'s own reboot — skips that inline retry entirely and
+     * rethrows [denied] immediately, so the CALLER's own fresh-name-per-attempt loop classifies
+     * and retries it instead (see that method's doc for why: a same-name retry into msb's Windows
+     * deferred-file-release access-denied error is exactly the failure mode that leaves a stopped
+     * sandbox record behind for a same-name retry to then collide with).
      */
-    private fun spawnAndAwaitRunning(handle: Handle, spec: ContainerSpec): Process? {
+    private fun spawnAndAwaitRunning(
+        handle: Handle, spec: ContainerSpec, retryAccessDeniedInline: Boolean = true,
+    ): Process? {
         val firstOutput = try {
             return bootOnce(handle, spec)
         } catch (locked: MsbInstallLockException) {
@@ -235,6 +255,13 @@ class MsbCliBackend private constructor(
             // sandbox. Bounded retry budget, same short-backoff shape as the state-db race below,
             // just allowing more than one attempt since a release lag is less certain to have
             // cleared within one retry's worth of wall-clock than a migration race is.
+            //
+            // See retryAccessDeniedInline's own doc: createCheckpoint's reboot opts OUT of this
+            // same-name retry entirely — a same-name retry into THIS exact error is what used to
+            // leave a stopped sandbox record behind for the very next same-name attempt to collide
+            // with (the CI failure this class's fresh-name-per-attempt fix addresses) — and instead
+            // wants the raw, unretried exception so its own loop can advance to a fresh name.
+            if (!retryAccessDeniedInline) throw denied
             var attempts = 1
             var last = denied
             while (attempts < RESTORE_ACCESS_DENIED_MAX_ATTEMPTS) {
@@ -669,43 +696,63 @@ class MsbCliBackend private constructor(
      * backend no longer leaves it that way: upstream's restore brings the sandbox up idle, so
      * [spawnAndAwaitRunning] itself starts the workload before returning.
      *
-     * **Fresh name, not the original.** msb's own existence check for a restore target is
-     * "DB record present OR on-disk directory present", and on Windows the just-`rm`'d sandbox's
-     * directory has been observed on CI outliving its DB record by seconds under load — a lag
-     * [awaitNameReleased] (which only proves the DB record gone) and [rebootRetryingNameCollision]
-     * (a bounded already-exists retry) were both added to wait out, but a same-name restore issued
-     * into that gap can still refuse "already exists" for as long as the directory lingers, which
-     * is not a fixed bound. A restore under a FRESHLY GENERATED name — minted via
+     * **Fresh name, not the original — and a FRESH name again on every retry, never the same one
+     * twice.** msb's own existence check for a restore target is "DB record present OR on-disk
+     * directory present", and on Windows the just-`rm`'d sandbox's directory has been observed on
+     * CI outliving its DB record by seconds under load — a lag [awaitNameReleased] (which only
+     * proves the DB record gone) was added to wait out, but a same-name restore issued into that
+     * gap can still refuse "already exists" for as long as the directory lingers, which is not a
+     * fixed bound. A restore under a FRESHLY GENERATED name — minted via
      * [dev.rightsize.nextSandboxName], the exact `rz-<runId>-<n>` generator/counter an ordinary
      * boot already uses, never a second naming scheme — never collides with the just-removed
      * sandbox's own lingering directory at all, sidestepping the lag entirely rather than racing
-     * it. The sandbox's NAME across a checkpoint was always an implementation detail, never a
-     * documented contract (ports/env/memory/disk state all still carry over unchanged); this is
-     * a behavior note, not an API break — see the CHANGELOG. [awaitNameReleased] and
-     * [rebootRetryingNameCollision] both stay exactly as they were: harmless, dormant defense
-     * in depth (a freshly generated name colliding with something else live is now
-     * vanishingly unlikely, not the near-certainty a same-name restore risked), never removed.
+     * it. [awaitNameReleased] stays exactly as it was: harmless, dormant defense in depth (a
+     * freshly generated name colliding with something else live is now vanishingly unlikely, not
+     * the near-certainty a same-name restore risked), never removed.
      *
-     * The fresh name is what [handle]'s own `id`/`spec` are rewritten to IN PLACE before the
-     * reboot is attempted (so every subsequent operation against [handle] —
-     * `GenericContainer.checkpoint()`'s own post-return `stop()`/`exec()`/`logs()`, and this
-     * reboot's own [awaitRestoreRunning]/[spawnWorkloadExecChild] steps — already target the new
-     * name, whether or not the reboot itself ultimately succeeds), and it is what's appended to
-     * the reaper's run ledger via [Reaper.beforeCreate] — BEFORE the restore attempt, the exact
-     * same append-before-create discipline [Reaper.beforeCreate]'s own doc describes for an
-     * ordinary [SandboxBackend.create] — and to [startedNames], ALSO before the restore attempt,
-     * deliberately UNLIKE [start]'s own after-success-only ordering: a failure here can still
-     * leave a genuinely live sandbox behind under [freshName] (see the reboot's own try/catch
-     * below), and this backend's own shutdown-hook/[close] cleanup net is the only thing that can
-     * ever reap it, since neither `bootOnce`'s failure handling nor `GenericContainer.checkpoint()`
-     * itself does an explicit stop/remove on that path.
+     * A fresh name is not immune to msb's OWN validated-then-failed restore, though: `msb restore
+     * <name>` validates the snapshot artifact FIRST (an integrity failure exits 1 with no sandbox
+     * record left at all), but a failure AFTER validation — a block-device open returning access
+     * denied chief among them, Windows' `Access is denied. (os error 5)` — can still leave THAT
+     * fresh name behind as a stopped sandbox record, and any retry under the SAME name then
+     * collides with its own leftover exactly the way a same-name restore of the ORIGINAL name
+     * used to (this was the actual CI failure the fresh-name fix above didn't yet cover: attempt 1
+     * hit the access-denied error after msb had already created the record, and the old code's
+     * same-name retry then burned its whole budget colliding with it). [rebootCheckpointRetryingFreshName]
+     * is what closes that gap: on EITHER msb's already-exists refusal ([SandboxNameCollisionException])
+     * or the Windows access-denied signature ([RestoreAccessDeniedException]) — including from a
+     * fresh name, not just the original — it best-effort `rm`s the just-failed name and mints
+     * ANOTHER fresh name from the same generator before retrying, rather than ever retrying the
+     * same name twice. The sandbox's NAME across a checkpoint was always an implementation detail,
+     * never a documented contract (ports/env/memory/disk state all still carry over unchanged);
+     * this is a behavior note, not an API break — see the CHANGELOG.
      *
-     * The OLD name's ledger entry is deliberately left as-is: it is never removed here (this reboot
-     * bypasses the public [remove] the ledger's `afterSandboxRemoved` call is normally paired
-     * with), so it is picked up by the ledger's own not-found-tolerant sweep instead — attempting
-     * to reap a name that is already gone is exactly what that sweep already tolerates for a
-     * concurrently-cleaned-up sandbox. `LiveContainers`' own re-keying is `GenericContainer`'s
-     * concern, not this backend's — see `GenericContainer.checkpoint()`'s own doc.
+     * Each attempt's name is what [handle]'s own `id`/`spec` are rewritten to IN PLACE before that
+     * attempt runs (so every subsequent operation against [handle] — `GenericContainer.checkpoint()`'s
+     * own post-return `stop()`/`exec()`/`logs()`, and this reboot's own
+     * [awaitRestoreRunning]/[spawnWorkloadExecChild] steps — already target the name actually being
+     * tried, whether or not that attempt ultimately succeeds), and it is what's appended to the
+     * reaper's run ledger via [Reaper.beforeCreate] — BEFORE that attempt's own restore call, the
+     * exact same append-before-create discipline [Reaper.beforeCreate]'s own doc describes for an
+     * ordinary [SandboxBackend.create], repeated for every attempt (crash-safety: a process dying
+     * mid-attempt leaves that attempt's name findable by the ledger's own not-found-tolerant
+     * end-of-run sweep regardless of which attempt was live when it died). [startedNames] gets the
+     * WINNING name only, once [rebootCheckpointRetryingFreshName] actually returns — see that
+     * method's own doc for why a classified (retried) failure needs no [startedNames] entry of its
+     * own (its sandbox, if any, is already best-effort `rm`'d before the next attempt even starts)
+     * while an UNCLASSIFIED failure (e.g. [CheckpointMissingWorkloadCommandException] after a
+     * restore that itself succeeded) leaves its attempt's name tracked there regardless, for this
+     * backend's own shutdown-hook/[close] cleanup net to reap a genuinely live orphan.
+     *
+     * The OLD (pre-checkpoint) name's ledger entry is deliberately left as-is throughout: it is
+     * never removed here (this reboot bypasses the public [remove] the ledger's
+     * `afterSandboxRemoved` call is normally paired with), so it is picked up by the ledger's own
+     * not-found-tolerant sweep instead — attempting to reap a name that is already gone is exactly
+     * what that sweep already tolerates for a concurrently-cleaned-up sandbox. Same for every
+     * FAILED attempt's own name along the way: its best-effort `rm` above already covers the
+     * common case, and the sweep is the backstop for whatever that `rm` itself missed.
+     * `LiveContainers`' own re-keying is `GenericContainer`'s concern, not this backend's — see
+     * `GenericContainer.checkpoint()`'s own doc.
      *
      * When [handle]'s own [ContainerSpec.command] is unset (the container ran its image's
      * default entrypoint), THIS method captures a workload cmdline from the guest — via
@@ -795,43 +842,33 @@ class MsbCliBackend private constructor(
         // fresh-name reboot below no longer depends on it (see this method's own class-level doc
         // paragraph on why) — never removed, per this class's don't-remove-working-defenses posture.
         awaitNameReleased(oldName)
-        // Fresh generated name for the reboot — see this method's own doc for why never oldName.
+        // Fresh generated name for the reboot's FIRST attempt — see this method's own doc for why
+        // never oldName. Every retry beyond this first attempt mints its own fresh name too, from
+        // inside rebootCheckpointRetryingFreshName itself.
         val freshName = nextSandboxName()
         val freshSpec = handle.spec.copy(name = freshName, checkpointRef = effectiveRef)
         // Ledger append BEFORE the restore attempt, exactly like an ordinary create (see
         // Reaper.beforeCreate's own doc) — the old name's entry is deliberately left alone, for
         // the ledger's own not-found-tolerant sweep to pick up (see this method's own doc).
+        // rebootCheckpointRetryingFreshName repeats this same append for every later retry.
         Reaper.beforeCreate(this, freshSpec)
         // Rewritten in place before the reboot is even attempted, so every subsequent operation —
         // including this reboot's own awaitRestoreRunning/spawnWorkloadExecChild — already targets
-        // the fresh name, whether or not the reboot itself ultimately succeeds (see this method's
-        // own doc: a caller reading handle.id out of a caught exception still sees the name actually
-        // attempted).
+        // the name actually being tried, whether or not that attempt ultimately succeeds (see this
+        // method's own doc: a caller reading handle.id out of a caught exception still sees the
+        // name actually attempted). Rewritten again the same way for every later retry.
         handle.spec = freshSpec
-        // Tracked BEFORE the reboot is even attempted — deliberately NOT start()'s own
-        // after-success-only ordering (see this method's own doc). spawnWorkloadExecChild can
-        // throw AFTER msb restore has already brought a genuinely live sandbox up under
-        // freshName (e.g. CheckpointMissingWorkloadCommandException, or the revived command
-        // exiting almost immediately) — bootOnce never tears that sandbox down on such a
-        // failure, since its own catch only reaps a still-alive PROCESS, not a live msb
-        // sandbox, and GenericContainer.checkpoint() has no explicit stop()/remove() of its own
-        // to fall back on when createCheckpoint throws. This own-run cleanup set (the
-        // constructor's shutdown hook, and close()) is therefore the ONLY net that can still
-        // reap that orphan, so freshName must already be in it before the attempt below, not
-        // only once the attempt is known to have succeeded. A reboot that never actually
-        // creates anything under freshName (e.g. the already-exists retry budget expiring)
-        // leaves a harmless entry here — silently(freshName)'s stop+rm against a name that was
-        // never created is a no-op, the same tolerance the reaper ledger's own sweep already
-        // relies on. oldName drops out in the same breath: its sandbox was already `rm`'d above
-        // (see [invoke]'s call a few lines up), regardless of how the reboot below turns out.
+        // Tracked BEFORE the reboot is even attempted, same as the ledger append above — see this
+        // method's own doc for why an unclassified failure (e.g. spawnWorkloadExecChild throwing
+        // after a genuinely successful restore) needs this. oldName drops out in the same breath:
+        // its sandbox was already `rm`'d above (see [invoke]'s call a few lines up), regardless of
+        // how the reboot below turns out.
         startedNames -= oldName
         startedNames += freshName
         try {
-            // Defense in depth alongside the wait just above, for the same lag family — see
-            // rebootRetryingNameCollision's own doc for why this, not spawnAndAwaitRunning directly.
-            handle.attached = rebootRetryingNameCollision(handle, freshSpec)
+            handle.attached = rebootCheckpointRetryingFreshName(handle, freshSpec)
         } catch (e: Exception) {
-            error("re-booting sandbox $freshName from checkpoint $effectiveRef failed: ${e.message} — the " +
+            error("re-booting sandbox ${handle.id} from checkpoint $effectiveRef failed: ${e.message} — the " +
                 "sandbox was removed but its state is preserved in checkpoint $effectiveRef, restorable via " +
                 "GenericContainer.fromCheckpoint.")
         }
@@ -894,64 +931,78 @@ class MsbCliBackend private constructor(
     }
 
     /**
-     * Bounded-BUDGET retry of [spawnAndAwaitRunning] for [createCheckpoint]'s own re-boot ONLY,
-     * specifically for msb's "sandbox already exists" restore failure
-     * ([SandboxNameCollisionException]) — defense in depth alongside [awaitNameReleased] above,
-     * for the exact same Windows deferred-teardown lag family, in case the name frees in the gap
-     * between that poll's last check and the instant `restore` itself re-checks it.
+     * Bounded-BUDGET, FRESH-NAME-PER-ATTEMPT retry of [spawnAndAwaitRunning] for
+     * [createCheckpoint]'s own re-boot ONLY, for the two classified msb restore failures a Windows
+     * deferred-teardown lag can produce: msb's "sandbox already exists" refusal
+     * ([SandboxNameCollisionException]) and its deferred snapshot-file-release access-denied error
+     * ([RestoreAccessDeniedException]) — the latter reached with [spawnAndAwaitRunning]'s own
+     * `retryAccessDeniedInline` false, so THIS loop is what classifies and retries it, never
+     * [spawnAndAwaitRunning]'s internal same-name cascade.
      *
-     * [createCheckpoint] now reboots under a freshly generated name (see its own doc), so [spec]
-     * here almost never collides with anything — a same-name restore's near-certain collision
-     * window against its own just-removed sandbox's lingering directory doesn't exist for a fresh
-     * name at all. This retry stays live regardless, as dormant defense in depth for the residual
-     * (vanishingly unlikely) case of a fresh name colliding with some OTHER still-live sandbox —
-     * never removed, per this class's don't-remove-working-defenses posture.
+     * **Never retries the same name twice.** The CI failure this exists to fix: `msb restore
+     * <name>` validates the snapshot artifact FIRST (an integrity failure exits 1 with no sandbox
+     * record left behind at all), but a failure AFTER validation — the access-denied errno chief
+     * among them — can still leave [name] itself behind as a STOPPED sandbox record, and any retry
+     * under that SAME name then collides with its own leftover for as long as msb's teardown of it
+     * takes (msb's own existence check is "DB record present OR on-disk directory present", and the
+     * directory has been observed on Windows CI outliving the DB record by seconds under load — see
+     * [awaitNameReleased]'s own doc for the same lag family). The old same-name retry burned its
+     * whole budget colliding with exactly that leftover. So on EITHER classified failure here, the
+     * just-failed name is best-effort `msb rm`'d (result ignored — whether there was genuinely a
+     * record to remove is not this method's concern) and dropped from [startedNames] (its own
+     * cleanup already attempted), then a FRESH name is minted from the same
+     * [dev.rightsize.nextSandboxName] generator/counter ordinary boots use, tracked in the reaper
+     * ledger via [Reaper.beforeCreate] and in [startedNames] — both BEFORE that next attempt's own
+     * restore call, the same append/track-before-create discipline [createCheckpoint]'s own first
+     * attempt already used (crash-safety: a process dying mid-retry still leaves the in-flight
+     * attempt's name findable by the ledger's own not-found-tolerant end-of-run sweep) — and
+     * [handle.spec] is rewritten to it in place, exactly as [createCheckpoint] does for its own
+     * first attempt, before that next attempt runs.
      *
-     * Same wall-clock-budget shape as [spawnAndAwaitRunning]'s own install-lock retry above
+     * Same wall-clock-BUDGET shape [spawnAndAwaitRunning]'s own install-lock retry uses
      * ([INSTALL_LOCK_RETRY_BUDGET_MS]/[INSTALL_LOCK_RETRY_DELAY_MS]) — a deadline, not an attempt
-     * count — because an attempt count can't be sized against a lag with no fixed bound.
-     * [awaitNameReleased]'s own `msb ls` poll only proves the sandbox's DB RECORD is gone; msb
-     * 0.7.1's `restore` itself refuses "already exists" when EITHER that record OR the sandbox's
-     * on-disk directory still exists (`prepare_create_target` in
-     * sdk/rust/lib/backend/local/sandbox/create.rs upstream: `existing.is_some() || dir_exists`),
-     * and on Windows the directory has been observed on CI outliving the DB record — what `ls`
-     * actually proves absent — by more than 3.5s under load. The previous 3-attempt/300ms budget
-     * (well under 1s of retrying) was nowhere near that; this now spends up to
-     * [checkpointRebootAlreadyExistsBudgetMs] (production default
-     * [CHECKPOINT_REBOOT_ALREADY_EXISTS_RETRY_BUDGET_MS], ~30s — [INSTALL_LOCK_RETRY_BUDGET_MS]'s
-     * own order of magnitude), retrying every [CHECKPOINT_REBOOT_ALREADY_EXISTS_RETRY_DELAY_MS].
-     * [awaitNameReleased]'s cheap `ls` gate above stays in place as a harmless, fast first exit
-     * for the common case — but this budget, not that gate, is what actually guarantees the retry
-     * outlives the lag.
+     * count, because how many distinct names a Windows teardown lag costs can't be sized up front
+     * any more than how long it lasts can. [checkpointRebootAlreadyExistsBudgetMs] (production
+     * default [CHECKPOINT_REBOOT_ALREADY_EXISTS_RETRY_BUDGET_MS], ~30s) and
+     * [CHECKPOINT_REBOOT_ALREADY_EXISTS_RETRY_DELAY_MS] are the SAME constants the old same-name
+     * retry used, now bounding total retry time across as many distinct names as the budget allows
+     * rather than repeated attempts under one. Exhaustion re-throws the last classified exception
+     * seen, naming whichever attempt was live when the budget ran out.
      *
-     * Any OTHER exception from [spawnAndAwaitRunning] — including every failure that cascade already
-     * retries itself (install-lock, state-db, image-cache, access-denied) — propagates immediately,
-     * unretried here; this exists for exactly one known-transient signature, not as a generic reboot
-     * retry.
+     * Any OTHER exception — including [CheckpointMissingWorkloadCommandException] from
+     * [spawnWorkloadExecChild] after a restore that itself succeeded, or anything
+     * [spawnAndAwaitRunning]'s own cascade already retried and converted to a generic failure
+     * (install-lock, state-db, image-cache) — propagates immediately, unretried: that attempt's
+     * name is deliberately left in [startedNames]/the ledger, exactly as [createCheckpoint]'s own
+     * doc describes, since a live sandbox may already exist under it for this backend's own
+     * cleanup net to reap.
      *
      * Never reached by the ordinary `start()` path — a `GenericContainer.fromCheckpoint(cp).start()`
-     * restore of a fresh name goes through [spawnAndAwaitRunning] directly, whose own catch cascade
-     * has never caught [SandboxNameCollisionException] and still doesn't: an already-exists failure
-     * there (only reachable if a caller reuses a name that's still live) keeps propagating as-is,
-     * exactly as before this method existed.
+     * restore goes through [spawnAndAwaitRunning] directly (default `retryAccessDeniedInline =
+     * true`), whose own catch cascade has never caught [SandboxNameCollisionException] and still
+     * doesn't: an already-exists failure there (only reachable if a caller reuses a name that's
+     * still live) keeps propagating as-is, exactly as before this method existed.
      */
-    private fun rebootRetryingNameCollision(handle: Handle, spec: ContainerSpec): Process? {
+    private fun rebootCheckpointRetryingFreshName(handle: Handle, initialSpec: ContainerSpec): Process? {
         val deadline = System.nanoTime() + checkpointRebootAlreadyExistsBudgetMs * 1_000_000
-        var lastSeen: SandboxNameCollisionException
-        try {
-            return spawnAndAwaitRunning(handle, spec)
-        } catch (collision: SandboxNameCollisionException) {
-            lastSeen = collision
-        }
-        while (System.nanoTime() < deadline) {
-            Thread.sleep(CHECKPOINT_REBOOT_ALREADY_EXISTS_RETRY_DELAY_MS)
+        var attemptSpec = initialSpec
+        while (true) {
             try {
-                return spawnAndAwaitRunning(handle, spec)
-            } catch (again: SandboxNameCollisionException) {
-                lastSeen = again
+                return spawnAndAwaitRunning(handle, attemptSpec, retryAccessDeniedInline = false)
+            } catch (e: Exception) {
+                if (e !is SandboxNameCollisionException && e !is RestoreAccessDeniedException) throw e
+                val failedName = attemptSpec.name
+                runCatching { invoke(MsbCommands.rm(failedName), STOP_TIMEOUT_SEC) }
+                startedNames -= failedName
+                if (System.nanoTime() >= deadline) throw e
+                Thread.sleep(CHECKPOINT_REBOOT_ALREADY_EXISTS_RETRY_DELAY_MS)
+                val nextName = nextSandboxName()
+                attemptSpec = attemptSpec.copy(name = nextName)
+                Reaper.beforeCreate(this, attemptSpec)
+                handle.spec = attemptSpec
+                startedNames += nextName
             }
         }
-        throw lastSeen
     }
 
     /**
@@ -1481,14 +1532,18 @@ private const val RESTORE_ACCESS_DENIED_RETRY_DELAY_MS = 300L
 // new tuning knob the wait needs. Unix always clears this on the first poll; the budget is spent
 // only on the Windows lag it exists for.
 private const val CHECKPOINT_NAME_RELEASE_BUDGET_MS = 3_000L
-// createCheckpoint's own already-exists reboot retry (see rebootRetryingNameCollision's doc):
-// same wall-clock-budget shape as INSTALL_LOCK_RETRY_BUDGET_MS/INSTALL_LOCK_RETRY_DELAY_MS
-// above, kept as its own constants since it classifies a different msb failure than that pair
-// does. msb 0.7.1's restore refuses "already exists" while EITHER the sandbox's DB record OR its
-// on-disk directory still exists, and on Windows the directory has outlived the DB record — what
-// awaitNameReleased's `ls` poll actually proves absent — by more than 3.5s under CI load, so this
-// budget has to be an order of magnitude bigger than that lag, not a handful of attempts at a
-// few hundred milliseconds.
+// createCheckpoint's own fresh-name-per-attempt reboot retry (see
+// rebootCheckpointRetryingFreshName's doc): same wall-clock-budget shape as
+// INSTALL_LOCK_RETRY_BUDGET_MS/INSTALL_LOCK_RETRY_DELAY_MS above, kept as its own constants since
+// it classifies different msb failures than that pair does. msb 0.7.1's restore refuses "already
+// exists" while EITHER the sandbox's DB record OR its on-disk directory still exists, and on
+// Windows the directory has outlived the DB record — what awaitNameReleased's `ls` poll actually
+// proves absent — by more than 3.5s under CI load; the same Windows deferred-teardown lag can also
+// surface as a restore that fails AFTER msb validates the artifact (the access-denied errno) while
+// still leaving a sandbox record behind under the name just tried. Either way this budget bounds
+// total retry time across as many freshly minted names as it takes, not attempts under one name —
+// an order of magnitude bigger than the observed lag, not a handful of attempts at a few hundred
+// milliseconds.
 private const val CHECKPOINT_REBOOT_ALREADY_EXISTS_RETRY_BUDGET_MS = 30_000L
 private const val CHECKPOINT_REBOOT_ALREADY_EXISTS_RETRY_DELAY_MS = 2_000L
 
