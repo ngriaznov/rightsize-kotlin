@@ -5,6 +5,7 @@ import dev.rightsize.RunId
 import dev.rightsize.core.Backends
 import dev.rightsize.core.CacheDir
 import dev.rightsize.core.Checkpoint
+import dev.rightsize.core.diagnostics.LiveContainers
 import dev.rightsize.core.wait.Wait
 import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.Assumptions.assumeTrue
@@ -21,8 +22,10 @@ import java.time.Duration
  * a sandbox, write a marker file into it, checkpoint — proving both that the SAME sandbox still
  * works afterward (the stop/snapshot/start cycle brings it back up, and `checkpoint()` re-runs
  * the wait strategy since `checkpointRestartsWorkload` is true) and that the reaper ledger gains
- * EXACTLY the fresh name(s) the cycle minted — one in the happy path — never touching or reordering
- * whatever was already there (the reboot restores under a freshly generated sandbox name, not the
+ * EXACTLY the names the cycle minted — one winner, plus (on Windows, where the test JVM's job
+ * object blocks msb's own breakaway spawn) any access-denied candidates the fresh-name walk
+ * consumed along the way — never touching or reordering whatever was already there (the reboot
+ * restores under a freshly generated sandbox name, not the
  * source sandbox's own; see [MsbCliBackend.createCheckpoint]'s doc) — then restores from the
  * snapshot and proves the marker survived. Cleanup is guard-style (an outer `finally`), so a
  * mid-test assertion failure still removes both sandboxes and the snapshot.
@@ -43,7 +46,7 @@ class MsbCheckpointIT {
             if (Files.exists(it)) Files.readAllLines(it) else emptyList()
         }
 
-    @Test fun `checkpoint then restore preserves filesystem state, and the stop-snapshot-start cycle appends exactly the minted fresh name(s) to the ledger`() {
+    @Test fun `checkpoint then restore preserves filesystem state, and the stop-snapshot-start cycle appends exactly the names it minted to the ledger`() {
         val original = GenericContainer("alpine:3.19")
             .withCommand("sh", "-c", "sleep 120")
             .waitingFor(Wait.forLogMessage(".*", 0).withStartupTimeout(Duration.ofSeconds(30)))
@@ -76,18 +79,41 @@ class MsbCheckpointIT {
             // is no longer a ledger no-op the way a same-name reboot would have been. The correct
             // invariant: prior entries (including the removed source's own — left for the ledger's
             // own not-found-tolerant end-of-run sweep to pick up) are never removed or reordered,
-            // and the cycle appends EXACTLY the name(s) it minted — one in this happy path, where
-            // the first attempt succeeds outright.
+            // and the cycle appends exactly the names it minted: one winner, plus — on Windows,
+            // where the test JVM runs inside Gradle's no-breakaway job object and msb's first
+            // direct restore attempt is always refused with a classified access-denied — any
+            // candidates the fresh-name walk consumed on its way to that winner. A consumed
+            // candidate is best-effort-rm'd but deliberately stays in the ledger for the
+            // not-found-tolerant end-of-run sweep, so it still counts as "minted". Linux mints
+            // exactly one name; this pins the cross-platform invariant, not a fixed count.
             val afterLedger = ledgerLines()
             assertEquals(beforeLedger, afterLedger.take(beforeLedger.size),
                 "the stop/snapshot/start cycle must never remove or reorder the ledger's prior " +
                     "entries — including the checkpointed sandbox's own pre-checkpoint name, left for " +
                     "the not-found-tolerant sweep — only ever append the name(s) it minted: " +
                     "before=$beforeLedger after=$afterLedger")
-            assertEquals(beforeLedger.size + 1, afterLedger.size,
-                "the happy-path cycle mints exactly one fresh name (no already-exists/access-denied " +
-                    "retries here), so the ledger must gain exactly that one entry beyond its prior " +
-                    "contents: before=$beforeLedger after=$afterLedger")
+            val addedNames = afterLedger.drop(beforeLedger.size)
+            assertTrue(addedNames.isNotEmpty(),
+                "the cycle must append at least the winning fresh name to the ledger: " +
+                    "before=$beforeLedger after=$afterLedger")
+            val runPrefix = "rz-${RunId.value}-"
+            addedNames.forEach { added ->
+                assertTrue(added.startsWith(runPrefix),
+                    "every appended entry must be a fresh name minted by THIS run's walk (prefix " +
+                        "'$runPrefix'), never something else: '$added' in added=$addedNames")
+                assertFalse(beforeLedger.contains(added),
+                    "an appended entry must be genuinely new, never one already present before the " +
+                        "cycle: '$added' in before=$beforeLedger")
+            }
+            // The winner: whichever minted name the container is actually running under now.
+            // GenericContainer.checkpoint() re-keys LiveContainers to the backend's post-reboot
+            // handle.spec.name (see its own doc), so this reads the container's true current name
+            // rather than assuming which of addedNames — one, on Linux, or the last of several, on
+            // Windows — won.
+            assertTrue(LiveContainers.snapshot().any { it.handle.spec.name in addedNames },
+                "the cycle's own container must end up running under one of the names it minted — " +
+                    "the winner of the fresh-name walk — but its current live name matched none of " +
+                    "added=$addedNames")
 
             // Proves the start-back-up + post-checkpoint wait re-run: the SAME container is
             // usable again, not left stopped or in a not-yet-ready state.
