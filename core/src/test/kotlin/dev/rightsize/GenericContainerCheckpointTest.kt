@@ -75,14 +75,22 @@ private class RenamingHandle(spec: ContainerSpec) : SandboxHandle {
  * standing in for `MsbCliBackend`'s own fresh-name reboot (see its doc) — so these tests can pin
  * down what `GenericContainer.checkpoint()` ITSELF must do about a rename (re-key
  * [LiveContainers]), independent of any single backend's own bookkeeping (that part is
- * `backend-microsandbox`'s own `MsbCheckpointTest`/`MsbCheckpointNameReleaseTest` territory). */
-private class RenamingCheckpointFakeBackend(var nextName: String? = null) :
-    CheckpointFakeBackend(checkpointRestartsWorkload = true) {
+ * `backend-microsandbox`'s own `MsbCheckpointTest`/`MsbCheckpointNameReleaseTest` territory).
+ * [failAfterRename], when set, throws AFTER the rename has already taken effect — the exact
+ * ordering `MsbCliBackend.createCheckpoint` itself uses (`handle.spec` is rewritten to the fresh
+ * name before its own reboot is even attempted, so a thrown exception still leaves the rename in
+ * place — see that method's own doc and its "...when the re-boot from a successful snapshot
+ * fails" test) — so these tests can pin down the re-key on `checkpoint()`'s FAILURE path too. */
+private class RenamingCheckpointFakeBackend(
+    var nextName: String? = null,
+    var failAfterRename: Boolean = false,
+) : CheckpointFakeBackend(checkpointRestartsWorkload = true) {
     override fun create(spec: ContainerSpec): SandboxHandle = RenamingHandle(spec).also { created += spec }
     override fun createCheckpoint(handle: SandboxHandle, ref: String): String {
-        if (failCreateCheckpoint) error("simulated backend checkpoint failure")
         handle as RenamingHandle
         nextName?.let { handle.spec = handle.spec.copy(name = it) }
+        if (failAfterRename) error("simulated reboot failure after the rename already took effect")
+        if (failCreateCheckpoint) error("simulated backend checkpoint failure")
         committed += handle.id to ref
         return ref
     }
@@ -287,6 +295,37 @@ class GenericContainerCheckpointTest {
             c.stop()
             assertFalse(LiveContainers.snapshot().any { it.handle.spec.name == "renamed-fresh-name" },
                 "stop() must deregister under the CURRENT (post-rename) name")
+        }
+    }
+
+    @Test fun `checkpoint re-keys LiveContainers even when the backend renames the handle then throws`() {
+        // Review finding: MsbCliBackend.createCheckpoint rewrites handle.spec/id to the fresh
+        // name BEFORE it ever attempts its own reboot, so a re-boot that fails still leaves the
+        // handle carrying the fresh name. checkpoint()'s own re-key must therefore run on this
+        // failure path too, not only after a successful return — otherwise LiveContainers stays
+        // keyed under the stale oldName forever, mislabeling every later diagnostics read even
+        // though h.id already reports the fresh name.
+        val backend = RenamingCheckpointFakeBackend(nextName = "renamed-then-failed", failAfterRename = true)
+        val c = GenericContainer("alpine:3.19").withBackend(backend).waitingFor(CheckpointReady)
+        c.start()
+        val originalName = backend.created.single().name
+        try {
+            assertTrue(LiveContainers.snapshot().any { it.handle.spec.name == originalName },
+                "expected $originalName to be registered after a successful start")
+
+            assertThrows(IllegalStateException::class.java) { c.checkpoint() }
+
+            assertFalse(LiveContainers.snapshot().any { it.handle.spec.name == originalName },
+                "the old name's LiveContainers entry must be re-keyed away even when createCheckpoint " +
+                    "itself throws, as long as the backend already renamed the handle in place")
+            assertTrue(LiveContainers.snapshot().any { it.handle.spec.name == "renamed-then-failed" },
+                "LiveContainers must reflect the handle's new id even on a failed checkpoint")
+        } finally {
+            // stop() must still work, keyed by the CURRENT (post-rename) name, even though
+            // checkpoint() itself threw.
+            c.stop()
+            assertFalse(LiveContainers.snapshot().any { it.handle.spec.name == "renamed-then-failed" },
+                "stop() must deregister under the current (post-rename) name even after a failed checkpoint")
         }
     }
 

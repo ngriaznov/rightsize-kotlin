@@ -693,9 +693,14 @@ class MsbCliBackend private constructor(
      * name, whether or not the reboot itself ultimately succeeds), and it is what's appended to
      * the reaper's run ledger via [Reaper.beforeCreate] — BEFORE the restore attempt, the exact
      * same append-before-create discipline [Reaper.beforeCreate]'s own doc describes for an
-     * ordinary [SandboxBackend.create] — and to [startedNames] once the reboot actually succeeds
-     * (mirroring [start]'s own ordering: tracked only after a successful boot, never before). The
-     * OLD name's ledger entry is deliberately left as-is: it is never removed here (this reboot
+     * ordinary [SandboxBackend.create] — and to [startedNames], ALSO before the restore attempt,
+     * deliberately UNLIKE [start]'s own after-success-only ordering: a failure here can still
+     * leave a genuinely live sandbox behind under [freshName] (see the reboot's own try/catch
+     * below), and this backend's own shutdown-hook/[close] cleanup net is the only thing that can
+     * ever reap it, since neither `bootOnce`'s failure handling nor `GenericContainer.checkpoint()`
+     * itself does an explicit stop/remove on that path.
+     *
+     * The OLD name's ledger entry is deliberately left as-is: it is never removed here (this reboot
      * bypasses the public [remove] the ledger's `afterSandboxRemoved` call is normally paired
      * with), so it is picked up by the ledger's own not-found-tolerant sweep instead — attempting
      * to reap a name that is already gone is exactly what that sweep already tolerates for a
@@ -803,6 +808,24 @@ class MsbCliBackend private constructor(
         // own doc: a caller reading handle.id out of a caught exception still sees the name actually
         // attempted).
         handle.spec = freshSpec
+        // Tracked BEFORE the reboot is even attempted — deliberately NOT start()'s own
+        // after-success-only ordering (see this method's own doc). spawnWorkloadExecChild can
+        // throw AFTER msb restore has already brought a genuinely live sandbox up under
+        // freshName (e.g. CheckpointMissingWorkloadCommandException, or the revived command
+        // exiting almost immediately) — bootOnce never tears that sandbox down on such a
+        // failure, since its own catch only reaps a still-alive PROCESS, not a live msb
+        // sandbox, and GenericContainer.checkpoint() has no explicit stop()/remove() of its own
+        // to fall back on when createCheckpoint throws. This own-run cleanup set (the
+        // constructor's shutdown hook, and close()) is therefore the ONLY net that can still
+        // reap that orphan, so freshName must already be in it before the attempt below, not
+        // only once the attempt is known to have succeeded. A reboot that never actually
+        // creates anything under freshName (e.g. the already-exists retry budget expiring)
+        // leaves a harmless entry here — silently(freshName)'s stop+rm against a name that was
+        // never created is a no-op, the same tolerance the reaper ledger's own sweep already
+        // relies on. oldName drops out in the same breath: its sandbox was already `rm`'d above
+        // (see [invoke]'s call a few lines up), regardless of how the reboot below turns out.
+        startedNames -= oldName
+        startedNames += freshName
         try {
             // Defense in depth alongside the wait just above, for the same lag family — see
             // rebootRetryingNameCollision's own doc for why this, not spawnAndAwaitRunning directly.
@@ -812,12 +835,6 @@ class MsbCliBackend private constructor(
                 "sandbox was removed but its state is preserved in checkpoint $effectiveRef, restorable via " +
                 "GenericContainer.fromCheckpoint.")
         }
-        // Tracked only after a successful boot, mirroring start()'s own ordering — see this
-        // method's own doc. The old name was added to startedNames back when this container
-        // originally started; swapping (rather than merely adding) keeps this set from growing
-        // one stale entry per checkpoint() call on a repeatedly-checkpointed container.
-        startedNames -= oldName
-        startedNames += freshName
         return effectiveRef
     }
 

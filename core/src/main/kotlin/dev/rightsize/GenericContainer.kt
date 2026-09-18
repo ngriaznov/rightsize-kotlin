@@ -338,11 +338,16 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
      * a freshly generated name sidesteps a Windows-only directory-retention lag that a same-name
      * restore cannot). [h] itself is unaffected as an object (same identity, `stop()`/`exec()`/
      * etc. below keep working against it transparently — the backend already updated its own
-     * `id`/`spec` in place before returning), but [LiveContainers]' registry is keyed by NAME, not
-     * by handle identity, and was registered under the PRE-checkpoint name back in [start] — so a
-     * rename here is re-keyed explicitly, the only piece of bookkeeping this method (rather than
-     * the backend) owns. A backend that never renames (docker, any fake) makes [oldName] and
-     * [h]'s current name compare equal, so this is a no-op there.
+     * `id`/`spec` in place BEFORE even attempting its own reboot, not only once it succeeds — see
+     * that method's own doc), but [LiveContainers]' registry is keyed by NAME, not by handle
+     * identity, and was registered under the PRE-checkpoint name back in [start] — so a rename
+     * here is re-keyed explicitly, the only piece of bookkeeping this method (rather than the
+     * backend) owns. Because the backend's own rename can already have happened by the time
+     * [SandboxBackend.createCheckpoint] THROWS (its own reboot failing after already having
+     * rewritten `h.spec` in place), the re-key runs from a `finally` around that call, not only
+     * after it returns — otherwise a failed checkpoint would permanently mislabel [h] under
+     * [oldName] in every later diagnostics read. A backend that never renames (docker, any fake)
+     * makes [oldName] and [h]'s current name compare equal, so this is a no-op there either way.
      */
     fun checkpoint(name: String? = null): Checkpoint {
         if (name != null) validateCheckpointName(name)
@@ -364,10 +369,21 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
         // downstream use (the returned Checkpoint, the named-checkpoint registry entry) uses
         // THIS value, never refHint.
         val oldName = h.spec.name   // captured before the backend call in case it renames h in place
-        val ref = backend.createCheckpoint(h, refHint)
-        if (h.spec.name != oldName) {
-            LiveContainers.deregister(oldName)
-            LiveContainers.register(h, backend, host)
+        // The re-key runs in `finally`, not only after a successful return, because a backend
+        // that renames [h] in place (microsandbox — see MsbCliBackend.createCheckpoint's own doc)
+        // does so BEFORE it even attempts its own reboot, so h.spec/h.id already carry the fresh
+        // name even when createCheckpoint goes on to throw (pinned by that backend's own
+        // "...when the re-boot from a successful snapshot fails" test). Re-keying only on success
+        // would leave LiveContainers permanently keyed under the stale oldName — mislabeling
+        // Diagnostics.render's output for the rest of the process's life — for exactly the
+        // failure case a caller is most likely to be diagnosing.
+        val ref = try {
+            backend.createCheckpoint(h, refHint)
+        } finally {
+            if (h.spec.name != oldName) {
+                LiveContainers.deregister(oldName)
+                LiveContainers.register(h, backend, host)
+            }
         }
         if (backend.capabilities.checkpointRestartsWorkload) {
             if (startNetworkLinks.isNotEmpty()) backend.installNetworkLinks(h, startNetworkLinks)

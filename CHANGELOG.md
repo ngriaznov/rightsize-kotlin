@@ -158,6 +158,18 @@ reaches its first tagged release.
   shipped with, so the retry actually outlives the lag instead of merely hedging against it. (See
   the entry above: as of the fresh-name reboot, this wait and this retry budget are dormant
   defense in depth rather than what the common case depends on.)
+- **Two leftover-cleanup gaps in the fresh-name reboot above, closed.** The fresh name is now
+  added to this backend's own own-run cleanup set (the JVM shutdown hook, and `close()`) BEFORE
+  the reboot is even attempted, not only once it succeeds — a reboot whose `msb restore` reaches
+  Running but then fails reviving the checkpointed workload (a missing workload command, or a
+  revival command that exits almost immediately) used to leave a genuinely live sandbox under the
+  fresh name outside every own-run cleanup path this library runs; it's now covered by the same
+  net an ordinary boot always has been. Separately, `GenericContainer.checkpoint()`'s own
+  `LiveContainers` re-key (needed because the backend rewrites the live handle's name in place
+  before attempting its reboot, not only after it succeeds) now runs whether that reboot throws
+  or not, instead of only on a successful return — a failed reboot after a rename used to leave
+  `LiveContainers`, and therefore `Diagnostics.render`, permanently mislabeling the container
+  under its stale pre-checkpoint name. Neither change touches any public signature.
 
 ## [0.7.9] - 2026-09-10
 

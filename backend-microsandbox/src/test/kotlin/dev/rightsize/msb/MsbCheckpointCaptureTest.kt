@@ -215,6 +215,23 @@ class MsbCheckpointCaptureTest {
             assertEquals(1, calls.count { it.startsWith("exec rz-capmiss-test -- sh -c") },
                 "exactly one exec call (the capture probe) may happen — no revival exec, since there is " +
                     "no argv to revive with: $calls")
+
+            // Review finding: this is exactly the "restore succeeded, revival failed" shape that
+            // leaves a genuinely live msb sandbox behind under the fresh name — bootOnce never
+            // tears it down on this failure (its own catch only reaps a still-alive PROCESS, and
+            // there is none here: awaitRestoreRunning's launcher has already exited by this
+            // point), and GenericContainer.checkpoint() has no explicit stop()/remove() fallback
+            // of its own when createCheckpoint throws. The fresh name must therefore already be
+            // covered by this backend's own JVM-shutdown-hook/close() cleanup net.
+            val freshName = handle.id
+            assertNotEquals("rz-capmiss-test", freshName)
+            assertTrue(freshName in backend.runningSandboxNames(),
+                "the sandbox must genuinely be Running under the fresh name — msb's own restore " +
+                    "brings it up idle regardless of whether the revival exec ever gets to run")
+            assertTrue(freshName in backend.trackedNames(),
+                "a live orphan left behind by a reboot that fails AFTER the sandbox reached Running " +
+                    "must still be tracked by this backend's own-run cleanup net (the shutdown hook and " +
+                    "close()), or it would never be reaped")
         } finally {
             backend.stop(handle)
             backend.remove(handle)
