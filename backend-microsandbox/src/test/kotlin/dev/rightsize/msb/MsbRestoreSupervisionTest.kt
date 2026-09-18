@@ -377,20 +377,30 @@ class MsbRestoreSupervisionTest {
         }
     }
 
-    // --- (d) Windows deferred-file-release access-denied: retried once, then succeeds, with ---
-    // --- exactly 2 restore invocations (this signature never occurs on unix in practice, but ---
-    // --- the classifier/retry code is itself platform-agnostic — see isRestoreAccessDenied). ---
+    // --- (d) Windows deferred-file-release access-denied / job-object denial: ADVANCEMENT ---
+    // --- red-proof — this exact signature must never retry under the same name (the exact ---
+    // --- five-test CI failure this round's dossier describes, SandboxNameCollisionException ---
+    // --- at MsbCliBackend.classifyRestoreExit). Superseded, in place, the pre-round-11 ---
+    // --- expectation that this retried inline under the SAME name — see ---
+    // --- MsbRestoreRetryFreshNameTest for the rest of this policy's coverage (broker ---
+    // --- escalation, already-exists advancement, budget exhaustion, re-keying) driven ---
+    // --- against `start()` directly, the same entry point this test uses. (This signature ---
+    // --- never occurs on unix in practice, but the classifier/retry code is itself ---
+    // --- platform-agnostic — see isRestoreAccessDenied.) ---
 
-    @Test fun `start on a checkpointRef spec retries once on msb's Windows deferred-file-release access-denied signature, then succeeds`() {
+    @Test fun `start on a checkpointRef spec advances to a fresh name (never the same one twice) after msb's Windows deferred-file-release access-denied signature`() {
         assumeFalse(Platform.current()?.isWindows == true, "POSIX-only fake binary; see doc comment")
         val marker = Files.createTempFile("rz-restore-denied-marker-", "").also { Files.deleteIfExists(it) }
+        val callLog = Files.createTempFile("rz-restore-denied-calllog-", "")
         val counter = Files.createTempFile("rz-restore-denied-counter-", "")
         val script = Files.createTempFile("rz-fake-msb-restore-denied", "").also {
             Files.writeString(
                 it,
                 """
                 |#!/bin/sh
-                |cmd="${'$'}1"; shift
+                |cmd="${'$'}1"
+                |echo "${'$'}*" >> "$callLog"
+                |shift
                 |case "${'$'}cmd" in
                 |  restore)
                 |    n=${'$'}(cat "$counter" 2>/dev/null || echo 0)
@@ -434,18 +444,32 @@ class MsbRestoreSupervisionTest {
             it.toFile().setExecutable(true)
         }
         val backend = MsbCliBackend(script)
+        val originalName = "rz-restore-denied"
         val spec = ContainerSpec(
-            name = "rz-restore-denied", image = "irrelevant", runId = "run1", command = listOf("serve"),
+            name = originalName, image = "irrelevant", runId = "run1", command = listOf("serve"),
             checkpointRef = "/fake-store/rz-restore-denied/snap_0123456789abcdef0123456789abcdef",
         )
         val handle = backend.create(spec)
         try {
-            backend.start(handle)   // must not throw: the access-denied restore is retried once
+            backend.start(handle)   // must not throw: the access-denied restore advances to a fresh name
 
-            assertTrue("rz-restore-denied" in backend.runningSandboxNames())
+            val winningName = (handle as MsbCliBackend.Handle).id
+            assertNotEquals(originalName, winningName,
+                "must never retry under the SAME name that just hit access-denied — a same-name retry is " +
+                    "exactly what collides with the stopped record the failed attempt left behind")
             assertEquals("2", Files.readString(counter).trim(),
-                "restore must have run exactly twice: the access-denied attempt plus the one retry")
-            assertNotNull((handle as MsbCliBackend.Handle).attached,
+                "restore must have run exactly twice: the access-denied attempt plus the fresh-name retry")
+            val restoreLines = Files.readAllLines(callLog).filter { it.startsWith("restore ") }
+            val restoreNames = restoreLines.map { line ->
+                val parts = line.trim().split(" ")
+                parts[parts.indexOf("--name") + 1]
+            }
+            assertEquals(listOf(originalName, winningName), restoreNames,
+                "the first (failed) attempt must target the original name, the winning attempt a distinct one")
+            assertTrue(Files.readAllLines(callLog).any { it.startsWith("rm ") && it.contains(originalName) },
+                "expected a best-effort msb rm of the access-denied attempt's own failed (original) name")
+            assertTrue(winningName in backend.runningSandboxNames())
+            assertNotNull(handle.attached,
                 "the retried boot must still revive the workload, same as a first-try success")
         } finally {
             backend.stop(handle)

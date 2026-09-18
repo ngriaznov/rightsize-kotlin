@@ -184,9 +184,10 @@ reaches its first tagged release.
   bound on total retry time across as many names as it takes, not a name-specific attempt count).
   The Windows access-denied retry no longer runs its own same-name loop for this path at all — it
   now surfaces the raw, unretried failure so the fresh-name loop above is what classifies and
-  retries it; an ordinary `GenericContainer.fromCheckpoint(cp).start()` restore (outside
-  `checkpoint()`'s own reboot) is unaffected and keeps its original same-name access-denied retry,
-  since it has no second name of its own to advance to. Every attempted name — not just the first —
+  retries it. (An ordinary `GenericContainer.fromCheckpoint(cp).start()` restore, outside
+  `checkpoint()`'s own reboot, still kept its own separate same-name access-denied retry at this
+  point in the branch's history — see the entry further below for why that was itself a bug, fixed
+  in a later round.) Every attempted name — not just the first —
   is tracked in the reaper's run ledger before its own restore attempt, the same append-before-create
   discipline an ordinary create already gets, so a process dying mid-retry still leaves every
   attempted name discoverable by the ledger's own not-found-tolerant end-of-run sweep. No public
@@ -220,6 +221,34 @@ reaches its first tagged release.
   cleanup behavior around the retry loop is unchanged. No public signature moved; the launch
   mechanism behind a checkpoint restore was never part of this library's documented contract. A fix
   for the underlying spawn behavior is also being reported upstream to microsandbox.
+- **An ordinary `GenericContainer.fromCheckpoint(cp).start()` restore now gets the exact same
+  fresh-name-per-attempt policy and broker escalation as `createCheckpoint`'s own reboot above,
+  instead of retrying a Windows access-denied failure under the SAME sandbox name.** Live msb-
+  windows CI evidence: `MsbCliBackend.classifyRestoreExit` throwing `SandboxNameCollisionException`
+  ("sandbox '...' already exists") on the retried attempt, for restores that had already passed
+  their own `checkpoint()` call cleanly — the ordinary path's inline same-name retry was retrying
+  directly into the stopped record its own first, denied attempt had just left behind, the identical
+  mechanism the reboot's own fresh-naming fix (two entries above) already addresses, just one call
+  site lower. `start()` now routes a restore boot (`spec.checkpointRef != null`) through the SAME
+  fresh-name walk `createCheckpoint`'s reboot uses — the two now share one implementation rather
+  than each carrying its own copy — distinguished only by which name attempt 1 is made under:
+  the reboot's own fresh name (the source sandbox is already gone by then) versus, here, the
+  container's own originally minted name, already live and already tracked in the reaper's run
+  ledger before `start()` is ever called. Attempt 1 stays a direct spawn under that original name,
+  unretried inline, exactly like an ordinary boot always has; only a classified failure
+  (`RestoreAccessDeniedException` or `SandboxNameCollisionException`) advances to a freshly minted
+  name, best-effort `msb rm`-ing the failed one first — and, on Windows, once an attempt has hit the
+  access-denied signature specifically, every remaining attempt escalates through the same job-free
+  WMI broker the reboot's own escalation uses, for the identical `CREATE_BREAKAWAY_FROM_JOB`
+  job-object reason. No separate re-keying step was needed to make this safe: the winning name is
+  written straight into the live `Handle`'s own mutable spec (the same object
+  `GenericContainer.start()` already holds), so every operation against it — `exec`/`logs`/`stop`/
+  `remove`, and this backend's own own-run cleanup tracking — already resolves the winner with
+  nothing left pointing at the stale name; unlike `checkpoint()`, `GenericContainer.start()` never
+  registers `LiveContainers` under a name before this call returns, so there is nothing there to
+  fix up either. Bounded by the exact same wall-clock budget the reboot's own walk uses (not a
+  separate one). Ordinary image boots (`msb run`, no checkpoint involved) are completely
+  unaffected — this only ever engages for a restore. No public signature changed.
 
 ## [0.7.9] - 2026-09-10
 

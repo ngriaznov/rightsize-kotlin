@@ -8,7 +8,7 @@ import java.nio.file.Path
 import java.util.concurrent.CopyOnWriteArrayList
 
 /**
- * Red-proofs POLICY v2 — [MsbCliBackend.rebootCheckpointRetryingFreshName]'s escalation to
+ * Red-proofs POLICY v2 — [MsbCliBackend.restoreRetryingFreshName]'s escalation to
  * [MsbCliBackend.restoreBroker] once it has hit a Windows [RestoreAccessDeniedException] — driven
  * entirely against a local fake `msb` script plus a STUBBED [RestoreBroker] (never real
  * `powershell`/WMI, which [MsbCliBackend.windowsHost] being pinned `true` via [MsbCliBackend.forHost]

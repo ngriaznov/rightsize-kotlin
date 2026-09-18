@@ -46,12 +46,16 @@ import java.util.concurrent.atomic.AtomicBoolean
  * [forHost], same as the other two seams.
  *
  * [checkpointRebootAlreadyExistsBudgetMs] is a fourth seam, same spirit as
- * [restoreReadinessBudgetMs]: the wall-clock budget [rebootCheckpointRetryingFreshName] bounds its
- * whole fresh-name-per-attempt retry by, defaulted to the real
- * [CHECKPOINT_REBOOT_ALREADY_EXISTS_RETRY_BUDGET_MS] (~30s) so production behavior is unchanged.
- * Without it, red-proofing "the collision/access-denied never clears" would mean a unit test
- * actually blocking for that real budget; tests reach it via [forHost] to shrink it, exactly like
- * [restoreReadinessBudgetMs].
+ * [restoreReadinessBudgetMs]: the wall-clock budget [restoreRetryingFreshName] bounds its
+ * whole fresh-name-per-attempt retry by — for BOTH its callers, [createCheckpoint]'s own reboot
+ * AND [start]'s ordinary `GenericContainer.fromCheckpoint(cp).start()` restore (see that method's
+ * own doc) — defaulted to the real [CHECKPOINT_REBOOT_ALREADY_EXISTS_RETRY_BUDGET_MS] (~30s) so
+ * production behavior is unchanged. Without it, red-proofing "the collision/access-denied never
+ * clears" would mean a unit test actually blocking for that real budget; tests reach it via
+ * [forHost] to shrink it, exactly like [restoreReadinessBudgetMs]. The field keeps its
+ * checkpoint-reboot-flavored name from when it had only one caller; both callers share the same
+ * budget rather than each getting a seam of its own, since the policy — and the CI evidence
+ * behind it — is identical for either restore path.
  *
  * [createCheckpoint]'s reboot restores under a FRESHLY GENERATED sandbox name (via
  * [dev.rightsize.nextSandboxName], the same `rz-<runId>-<n>` generator/counter an ordinary boot
@@ -60,17 +64,19 @@ import java.util.concurrent.atomic.AtomicBoolean
  * outrun no matter how long it waits, but a fresh name sidesteps outright). [awaitNameReleased]
  * predates that fix and still runs, unchanged, as defense in depth against a name collision that
  * is now vanishingly unlikely (a freshly generated name colliding with something else live)
- * rather than the near-certainty a same-name restore faced. [rebootCheckpointRetryingFreshName]
- * (the renamed, restructured successor of what used to be a same-name-only retry) stays live for
- * the same residual reason, but no longer assumes the fresh name never needs replacing: a real
- * `msb restore` failure AFTER msb validates the artifact — the Windows access-denied errno chief
- * among them — can still leave the fresh name itself behind as a stopped sandbox record, so this
- * now mints ANOTHER fresh name per failed attempt rather than retrying the same one forever (see
- * that method's own doc — this is the fix for the CI collision on already-fresh names, not dead
- * code kept per the class's own don't-remove-working-defenses posture).
+ * rather than the near-certainty a same-name restore faced. [restoreRetryingFreshName]
+ * (the renamed, restructured successor of what used to be a same-name-only retry, and — as of
+ * this policy's extension to the ordinary restore path — shared by both callers rather than
+ * `createCheckpoint`'s own private helper) stays live for the same residual reason, but no
+ * longer assumes the fresh name never needs replacing: a real `msb restore` failure AFTER msb
+ * validates the artifact — the Windows access-denied errno chief among them — can still leave
+ * the fresh name itself behind as a stopped sandbox record, so this now mints ANOTHER fresh name
+ * per failed attempt rather than retrying the same one forever (see that method's own doc — this
+ * is the fix for the CI collision on already-fresh names, not dead code kept per the class's own
+ * don't-remove-working-defenses posture).
  *
  * [restoreBroker] is a fifth seam, the same injectable-with-a-production-default shape as the
- * four above but function-typed rather than a plain value: [rebootCheckpointRetryingFreshName]'s
+ * four above but function-typed rather than a plain value: [restoreRetryingFreshName]'s
  * own escalation path (POLICY v2 -- see that method's doc) launches every restore attempt from
  * the first [RestoreAccessDeniedException] onward through a WMI-based broker instead of a direct
  * spawn, and this is what a unit test replaces with a stub returning a scripted [BrokerOutcome]
@@ -83,7 +89,10 @@ import java.util.concurrent.atomic.AtomicBoolean
  * not transiently, so no amount of retrying a direct spawn ever clears it. A process created via
  * `Invoke-CimMethod -ClassName Win32_Process -MethodName Create` is parented by the WMI provider
  * host (`WmiPrvSE.exe`), outside this JVM's own job hierarchy entirely, so the identical `msb
- * restore` invocation launched that way succeeds where a direct spawn is denied.
+ * restore` invocation launched that way succeeds where a direct spawn is denied. This same
+ * escalation covers an ordinary `GenericContainer.fromCheckpoint(cp).start()` restore too, not
+ * only `createCheckpoint`'s own reboot — the job-object denial is a property of THIS JVM's own
+ * process tree, not of which caller happened to trigger the restore.
  * [defaultRestoreBroker] is the production implementation; see its own doc and [BrokerOutcome]'s
  * for the mechanics.
  */
@@ -191,7 +200,22 @@ class MsbCliBackend private constructor(
      */
     override fun start(handle: SandboxHandle) {
         handle as Handle
-        handle.attached = spawnAndAwaitRunning(handle, handle.spec)
+        // A restore boot (GenericContainer.fromCheckpoint(cp).start()) goes through the SAME
+        // fresh-name-per-attempt walk + broker escalation createCheckpoint's own reboot uses
+        // (see restoreRetryingFreshName's own doc) rather than spawnAndAwaitRunning directly —
+        // required because spawnAndAwaitRunning itself no longer retries a restore's
+        // RestoreAccessDeniedException at all (see its own doc: that retry always collided with
+        // the stopped record the failed attempt left behind). An ordinary image boot
+        // (checkpointRef == null) is completely untouched: still the exact same direct call this
+        // was before restoreRetryingFreshName existed. No re-keying step is needed here on
+        // success — unlike GenericContainer.checkpoint()'s own LiveContainers fix-up — because
+        // LiveContainers.register(h, ...)/network-linking/wait-strategy in GenericContainer.start()
+        // all run AFTER this method returns, reading straight off this SAME Handle object's
+        // current (possibly renamed) spec; there is no earlier registration under the original
+        // name for anything to fall out of sync with.
+        handle.attached =
+            if (handle.spec.checkpointRef != null) restoreRetryingFreshName(handle, handle.spec)
+            else spawnAndAwaitRunning(handle, handle.spec)
         if (!handle.spec.keepAlive) startedNames += handle.id
     }
 
@@ -232,28 +256,19 @@ class MsbCliBackend private constructor(
      * [Handle.attached], which is `null`-safe everywhere it's read ([stop]) for every OTHER
      * `null`-attached case (e.g. [findRunning]'s adopted handles).
      *
-     * [retryAccessDeniedInline] gates ONLY the [RestoreAccessDeniedException] catch below: `true`
-     * (every caller except [rebootCheckpointRetryingFreshName]) keeps retrying [bootOnce] against
-     * the SAME [spec]/name, exactly as before this parameter existed — an ordinary
-     * `GenericContainer.fromCheckpoint(cp).start()` restore has no second name to advance to, so
-     * same-name retry is the only option there and stays the whole story. `false` — used
-     * exclusively by [createCheckpoint]'s own reboot — skips that inline retry entirely and
-     * rethrows [denied] immediately, so the CALLER's own fresh-name-per-attempt loop classifies
-     * and retries it instead (see that method's doc for why: a same-name retry into msb's Windows
-     * deferred-file-release access-denied error is exactly the failure mode that leaves a stopped
-     * sandbox record behind for a same-name retry to then collide with).
-     *
-     * [useBroker] is POLICY v2's own escalation flag (see [rebootCheckpointRetryingFreshName]'s
-     * doc): `false` (every caller except that method, once it has escalated) is a direct spawn,
+     * [useBroker] is POLICY v2's own escalation flag (see [restoreRetryingFreshName]'s doc):
+     * `false` (every caller except that method, once it has escalated) is a direct spawn,
      * unchanged from before this parameter existed. `true` is threaded straight through to every
      * [bootOnce] call this method itself makes — including its own internal retries (the
-     * install-lock poll, the state-db one-shot retry) — so once a reboot has escalated, EVERY
+     * install-lock poll, the state-db one-shot retry) — so once a restore has escalated, EVERY
      * attempt launched from here, not just the fresh-name loop's own top-level one, goes through
      * the broker; see [bootOnce]'s own doc for what that actually changes.
+     *
+     * A [RestoreAccessDeniedException] is never retried HERE, by either caller — see that catch's
+     * own doc below for why this method always propagates it raw, unlike every other classified
+     * failure this method itself heals/retries inline.
      */
-    private fun spawnAndAwaitRunning(
-        handle: Handle, spec: ContainerSpec, retryAccessDeniedInline: Boolean = true, useBroker: Boolean = false,
-    ): Process? {
+    private fun spawnAndAwaitRunning(handle: Handle, spec: ContainerSpec, useBroker: Boolean = false): Process? {
         val firstOutput = try {
             return bootOnce(handle, spec, useBroker)
         } catch (locked: MsbInstallLockException) {
@@ -279,32 +294,19 @@ class MsbCliBackend private constructor(
         } catch (denied: RestoreAccessDeniedException) {
             // Windows-only in practice (see isRestoreAccessDenied's doc): msb's deferred file-handle
             // release on the just-written snapshot artifact can still be in flight the instant
-            // `restore` tries to read it, right after createCheckpoint's own teardown of the source
-            // sandbox. Bounded retry budget, same short-backoff shape as the state-db race below,
-            // just allowing more than one attempt since a release lag is less certain to have
-            // cleared within one retry's worth of wall-clock than a migration race is.
-            //
-            // See retryAccessDeniedInline's own doc: createCheckpoint's reboot opts OUT of this
-            // same-name retry entirely — a same-name retry into THIS exact error is what used to
-            // leave a stopped sandbox record behind for the very next same-name attempt to collide
-            // with (the CI failure this class's fresh-name-per-attempt fix addresses) — and instead
-            // wants the raw, unretried exception so its own loop can advance to a fresh name.
-            if (!retryAccessDeniedInline) throw denied
-            var attempts = 1
-            var last = denied
-            while (attempts < RESTORE_ACCESS_DENIED_MAX_ATTEMPTS) {
-                Thread.sleep(RESTORE_ACCESS_DENIED_RETRY_DELAY_MS)
-                try {
-                    return bootOnce(handle, spec, useBroker)
-                } catch (again: RestoreAccessDeniedException) {
-                    last = again
-                    attempts++
-                }
-            }
-            error("msb restore for sandbox ${handle.id} hit Windows' deferred snapshot-file-release " +
-                "access-denied error $attempts times in a row (msb's own docs describe deferred file " +
-                "release on Windows after a write) — this looks like more than the usual release lag, " +
-                "not a transient race.\n${last.output}")
+            // `restore` tries to read it, right after the source sandbox's own teardown — OR, a
+            // distinct root cause with the exact same wording (see restoreRetryingFreshName's own
+            // POLICY v2 paragraph): msb's detached restore spawn is denied outright by a Windows
+            // job object that grants no breakaway rights. EITHER way, retrying THIS attempt again
+            // under the SAME name/spec is never safe: a restore failure past msb's own artifact
+            // validation can leave [spec]'s name behind as a stopped sandbox record, and a same-name
+            // retry into that gap then collides with its own leftover instead of ever clearing the
+            // actual transient (the exact CI failure this class's fresh-name-per-attempt policy
+            // fixes). BOTH callers of this method — [createCheckpoint]'s own reboot and, as of this
+            // policy's extension to the ordinary path, [start] itself — now own this retry one layer
+            // up, via [restoreRetryingFreshName]'s fresh-name walk, so this always rethrows the raw,
+            // unretried exception rather than attempting anything here.
+            throw denied
         } catch (race: MsbStateDbException) {
             // Usually the startup-migration race, transient by construction (see
             // [isMsbStateDbError]): the winning msb invocation's migration commits and a
@@ -340,9 +342,9 @@ class MsbCliBackend private constructor(
      * - unset: spawns the attached `msb run` child and waits for [handle] to reach Running via
      *   [awaitRunning] — unchanged from before restore got its own supervision. Returns the
      *   still-live child. [useBroker] is meaningless for this branch — only a restore is ever
-     *   brokered (see [rebootCheckpointRetryingFreshName]'s own doc) — and is ignored here.
+     *   brokered (see [restoreRetryingFreshName]'s own doc) — and is ignored here.
      * - set, [useBroker] `false` (the default, and the only value for every caller except
-     *   [rebootCheckpointRetryingFreshName] once it has escalated — see [spawnAndAwaitRunning]'s
+     *   [restoreRetryingFreshName] once it has escalated — see [spawnAndAwaitRunning]'s
      *   own doc): spawns `msb restore ...` DIRECTLY and waits for IT (a short-lived activation
      *   launcher, not a supervising child — see [awaitRestoreRunning]'s doc) to exit, then polls
      *   [handle] to Running the same way.
@@ -383,7 +385,7 @@ class MsbCliBackend private constructor(
 
     /**
      * The brokered counterpart of [bootOnce]'s direct restore path — POLICY v2's escalation (see
-     * [rebootCheckpointRetryingFreshName]'s doc). Launches `msb restore ...` via [restoreBroker]
+     * [restoreRetryingFreshName]'s doc). Launches `msb restore ...` via [restoreBroker]
      * instead of a direct [spawnAttachedRun], then classifies/polls [handle] to Running exactly
      * like the direct path does, reusing the SAME predicates: [classifyRestoreExit] is the exact
      * classification [awaitRestoreRunning] itself runs against a direct attempt's exit code and
@@ -395,7 +397,7 @@ class MsbCliBackend private constructor(
      * classification, since no restore attempt was ever actually launched) falls back to an
      * ordinary DIRECT spawn for this one attempt — POLICY v2 §5: the broker must never become a
      * new single point of failure. This is the only place a "brokered" attempt can still end up
-     * launching directly; [rebootCheckpointRetryingFreshName]'s own `brokered` flag is untouched
+     * launching directly; [restoreRetryingFreshName]'s own `brokered` flag is untouched
      * by this fallback, so the NEXT attempt (a fresh name, if this one also fails) tries the
      * broker again rather than giving up on it permanently over one infrastructure hiccup.
      *
@@ -842,7 +844,7 @@ class MsbCliBackend private constructor(
      * collides with its own leftover exactly the way a same-name restore of the ORIGINAL name
      * used to (this was the actual CI failure the fresh-name fix above didn't yet cover: attempt 1
      * hit the access-denied error after msb had already created the record, and the old code's
-     * same-name retry then burned its whole budget colliding with it). [rebootCheckpointRetryingFreshName]
+     * same-name retry then burned its whole budget colliding with it). [restoreRetryingFreshName]
      * is what closes that gap: on EITHER msb's already-exists refusal ([SandboxNameCollisionException])
      * or the Windows access-denied signature ([RestoreAccessDeniedException]) — including from a
      * fresh name, not just the original — it best-effort `rm`s the just-failed name and mints
@@ -861,7 +863,7 @@ class MsbCliBackend private constructor(
      * ordinary [SandboxBackend.create], repeated for every attempt (crash-safety: a process dying
      * mid-attempt leaves that attempt's name findable by the ledger's own not-found-tolerant
      * end-of-run sweep regardless of which attempt was live when it died). [startedNames] gets the
-     * WINNING name only, once [rebootCheckpointRetryingFreshName] actually returns — see that
+     * WINNING name only, once [restoreRetryingFreshName] actually returns — see that
      * method's own doc for why a classified (retried) failure needs no [startedNames] entry of its
      * own (its sandbox, if any, is already best-effort `rm`'d before the next attempt even starts)
      * while an UNCLASSIFIED failure (e.g. [CheckpointMissingWorkloadCommandException] after a
@@ -968,13 +970,13 @@ class MsbCliBackend private constructor(
         awaitNameReleased(oldName)
         // Fresh generated name for the reboot's FIRST attempt — see this method's own doc for why
         // never oldName. Every retry beyond this first attempt mints its own fresh name too, from
-        // inside rebootCheckpointRetryingFreshName itself.
+        // inside restoreRetryingFreshName itself.
         val freshName = nextSandboxName()
         val freshSpec = handle.spec.copy(name = freshName, checkpointRef = effectiveRef)
         // Ledger append BEFORE the restore attempt, exactly like an ordinary create (see
         // Reaper.beforeCreate's own doc) — the old name's entry is deliberately left alone, for
         // the ledger's own not-found-tolerant sweep to pick up (see this method's own doc).
-        // rebootCheckpointRetryingFreshName repeats this same append for every later retry.
+        // restoreRetryingFreshName repeats this same append for every later retry.
         Reaper.beforeCreate(this, freshSpec)
         // Rewritten in place before the reboot is even attempted, so every subsequent operation —
         // including this reboot's own awaitRestoreRunning/spawnWorkloadExecChild — already targets
@@ -990,7 +992,7 @@ class MsbCliBackend private constructor(
         startedNames -= oldName
         startedNames += freshName
         try {
-            handle.attached = rebootCheckpointRetryingFreshName(handle, freshSpec)
+            handle.attached = restoreRetryingFreshName(handle, freshSpec)
         } catch (e: Exception) {
             error("re-booting sandbox ${handle.id} from checkpoint $effectiveRef failed: ${e.message} — the " +
                 "sandbox was removed but its state is preserved in checkpoint $effectiveRef, restorable via " +
@@ -1055,13 +1057,26 @@ class MsbCliBackend private constructor(
     }
 
     /**
-     * Bounded-BUDGET, FRESH-NAME-PER-ATTEMPT retry of [spawnAndAwaitRunning] for
-     * [createCheckpoint]'s own re-boot ONLY, for the two classified msb restore failures a Windows
-     * deferred-teardown lag can produce: msb's "sandbox already exists" refusal
+     * Bounded-BUDGET, FRESH-NAME-PER-ATTEMPT retry of [spawnAndAwaitRunning] for a `msb restore`
+     * boot, for the two classified msb restore failures a Windows deferred-teardown lag (or the
+     * POLICY v2 job-object denial below) can produce: msb's "sandbox already exists" refusal
      * ([SandboxNameCollisionException]) and its deferred snapshot-file-release access-denied error
-     * ([RestoreAccessDeniedException]) — the latter reached with [spawnAndAwaitRunning]'s own
-     * `retryAccessDeniedInline` false, so THIS loop is what classifies and retries it, never
-     * [spawnAndAwaitRunning]'s internal same-name cascade.
+     * ([RestoreAccessDeniedException]) — [spawnAndAwaitRunning] itself never retries either of
+     * these (see its own doc on the [RestoreAccessDeniedException] catch), so THIS loop is what
+     * classifies and retries them, for both this backend's restore boots:
+     *
+     * - [createCheckpoint]'s own reboot, whose [initialSpec] is ALREADY a freshly generated name
+     *   (the source sandbox is gone by then — its own stopped/removed/no-live-handle-left doc
+     *   explains why even the FIRST attempt can't reuse the pre-checkpoint name).
+     * - [start]'s ordinary `GenericContainer.fromCheckpoint(cp).start()` restore, whose
+     *   [initialSpec] is [handle]'s own ALREADY-LIVE, ALREADY-LEDGER-TRACKED original name (minted
+     *   and `Reaper.beforeCreate`-appended by `GenericContainer.createStartedContainer` before this
+     *   backend's `start()` is ever called) — this loop's first iteration attempts THAT name
+     *   directly, unretried inline, exactly like an ordinary boot always has; only a CLASSIFIED
+     *   failure on that first attempt ever mints a fresh name at all.
+     *
+     * Both callers share every mechanic below identically — the only difference between them is
+     * which name attempt 1 is made under, which is exactly [initialSpec]'s own job.
      *
      * **Never retries the same name twice.** The CI failure this exists to fix: `msb restore
      * <name>` validates the snapshot artifact FIRST (an integrity failure exits 1 with no sandbox
@@ -1071,17 +1086,29 @@ class MsbCliBackend private constructor(
      * takes (msb's own existence check is "DB record present OR on-disk directory present", and the
      * directory has been observed on Windows CI outliving the DB record by seconds under load — see
      * [awaitNameReleased]'s own doc for the same lag family). The old same-name retry burned its
-     * whole budget colliding with exactly that leftover. So on EITHER classified failure here, the
-     * just-failed name is best-effort `msb rm`'d (result ignored — whether there was genuinely a
-     * record to remove is not this method's concern) and dropped from [startedNames] (its own
-     * cleanup already attempted), then a FRESH name is minted from the same
+     * whole budget colliding with exactly that leftover — for the ordinary `start()` path, that was
+     * literally [spawnAndAwaitRunning]'s own now-removed inline cascade. So on EITHER classified
+     * failure here, the just-failed name is best-effort `msb rm`'d (result ignored — whether there
+     * was genuinely a record to remove is not this method's concern) and dropped from
+     * [startedNames] (its own cleanup already attempted; a no-op the first time through for the
+     * ordinary `start()` caller, whose attempt-1 name was never added there in the first place —
+     * see [start]'s own doc), then a FRESH name is minted from the same
      * [dev.rightsize.nextSandboxName] generator/counter ordinary boots use, tracked in the reaper
      * ledger via [Reaper.beforeCreate] and in [startedNames] — both BEFORE that next attempt's own
-     * restore call, the same append/track-before-create discipline [createCheckpoint]'s own first
-     * attempt already used (crash-safety: a process dying mid-retry still leaves the in-flight
-     * attempt's name findable by the ledger's own not-found-tolerant end-of-run sweep) — and
-     * [handle.spec] is rewritten to it in place, exactly as [createCheckpoint] does for its own
-     * first attempt, before that next attempt runs.
+     * restore call, the same append/track-before-create discipline an ordinary [create]/[start]
+     * already uses (crash-safety: a process dying mid-retry still leaves the in-flight attempt's
+     * name findable by the ledger's own not-found-tolerant end-of-run sweep) — and [handle.spec] is
+     * rewritten to it in place before that next attempt runs. This is also the ENTIRE re-keying
+     * story for a winning fresh name: [Handle.id] reads straight off this mutated [Handle.spec], so
+     * every subsequent operation against [handle] — `exec`/`logs`/`stop`/`remove`, and (for
+     * [createCheckpoint]'s own caller) `GenericContainer.checkpoint()`'s own `LiveContainers`
+     * re-key — already targets the winner with no separate registry to fix up. For the ordinary
+     * `start()` path specifically, `GenericContainer.start()` doesn't even need [checkpoint]'s own
+     * `LiveContainers` fix-up: it registers `LiveContainers`/links networks/runs the wait strategy
+     * only AFTER `backend.start(handle)` (this whole call) has already returned, reading the SAME,
+     * by-then-already-mutated [handle] object — there is no earlier registration under the original
+     * name for anything to fall out of sync with, unlike `checkpoint()`'s case where a PRIOR
+     * `start()` call already registered the pre-checkpoint name before this reboot ever ran.
      *
      * Same wall-clock-BUDGET shape [spawnAndAwaitRunning]'s own install-lock retry uses
      * ([INSTALL_LOCK_RETRY_BUDGET_MS]/[INSTALL_LOCK_RETRY_DELAY_MS]) — a deadline, not an attempt
@@ -1090,22 +1117,16 @@ class MsbCliBackend private constructor(
      * default [CHECKPOINT_REBOOT_ALREADY_EXISTS_RETRY_BUDGET_MS], ~30s) and
      * [CHECKPOINT_REBOOT_ALREADY_EXISTS_RETRY_DELAY_MS] are the SAME constants the old same-name
      * retry used, now bounding total retry time across as many distinct names as the budget allows
-     * rather than repeated attempts under one. Exhaustion re-throws the last classified exception
-     * seen, naming whichever attempt was live when the budget ran out.
+     * rather than repeated attempts under one — the SAME budget for either caller (see the class
+     * doc's own paragraph on this seam). Exhaustion re-throws the last classified exception seen,
+     * naming whichever attempt was live when the budget ran out.
      *
      * Any OTHER exception — including [CheckpointMissingWorkloadCommandException] from
      * [spawnWorkloadExecChild] after a restore that itself succeeded, or anything
      * [spawnAndAwaitRunning]'s own cascade already retried and converted to a generic failure
      * (install-lock, state-db, image-cache) — propagates immediately, unretried: that attempt's
-     * name is deliberately left in [startedNames]/the ledger, exactly as [createCheckpoint]'s own
-     * doc describes, since a live sandbox may already exist under it for this backend's own
-     * cleanup net to reap.
-     *
-     * Never reached by the ordinary `start()` path — a `GenericContainer.fromCheckpoint(cp).start()`
-     * restore goes through [spawnAndAwaitRunning] directly (default `retryAccessDeniedInline =
-     * true`), whose own catch cascade has never caught [SandboxNameCollisionException] and still
-     * doesn't: an already-exists failure there (only reachable if a caller reuses a name that's
-     * still live) keeps propagating as-is, exactly as before this method existed.
+     * name is deliberately left in [startedNames]/the ledger, since a live sandbox may already
+     * exist under it for this backend's own cleanup net to reap.
      *
      * **POLICY v2 — the job-free broker escalation.** [RestoreAccessDeniedException] has a second,
      * distinct root cause from the deferred-file-release lag its own doc describes, discovered by
@@ -1118,15 +1139,17 @@ class MsbCliBackend private constructor(
      * every stage up to `process_launch` succeeds first (the artifact resolves, the DB record is
      * inserted — hence the leftover stopped record this method's own already-exists handling
      * already covers — the disk grows), and only the spawn itself is denied; nothing is locked, no
-     * file handle is held, the denial is the job object.
+     * file handle is held, the denial is the job object. This is a property of THIS JVM's own
+     * process tree, not of which caller triggered the restore, so it applies identically whether
+     * the denied attempt came from [createCheckpoint]'s reboot or an ordinary `start()`.
      *
      * The fix does not replace the fresh-name walk above — a job-object denial and a genuine
      * deferred-release race share the exact same [RestoreAccessDeniedException] wording, and this
      * method doesn't and can't tell which one it hit — it ESCALATES the loop's own LAUNCH mechanism
-     * once that classification is seen at all: the FIRST attempt of any reboot ([brokered] starts
+     * once that classification is seen at all: the FIRST attempt of any walk ([brokered] starts
      * `false`) is always a direct spawn, zero change to a healthy (non-job-object) environment.
      * From the first attempt that throws [RestoreAccessDeniedException] on a [windowsHost] onward —
-     * [brokered] latches `true` and never resets for the rest of this reboot — every subsequent
+     * [brokered] latches `true` and never resets for the rest of this walk — every subsequent
      * attempt's [spawnAndAwaitRunning] call passes `useBroker = true`, launching its `msb restore`
      * through [restoreBroker] (see [bootOnceBrokered]) instead of a direct spawn. Non-Windows never
      * brokers regardless of what this backend's own classifier matches — [windowsHost] gates
@@ -1136,16 +1159,15 @@ class MsbCliBackend private constructor(
      * completely unchanged; POLICY v2 only ever changes HOW an attempt is launched, never the
      * retry/naming policy around it.
      */
-    private fun rebootCheckpointRetryingFreshName(handle: Handle, initialSpec: ContainerSpec): Process? {
+    private fun restoreRetryingFreshName(handle: Handle, initialSpec: ContainerSpec): Process? {
         val deadline = System.nanoTime() + checkpointRebootAlreadyExistsBudgetMs * 1_000_000
         var attemptSpec = initialSpec
-        // POLICY v2: latches true on the first Windows RestoreAccessDeniedException this reboot
+        // POLICY v2: latches true on the first Windows RestoreAccessDeniedException this walk
         // hits and never resets — see this method's own doc paragraph above.
         var brokered = false
         while (true) {
             try {
-                return spawnAndAwaitRunning(
-                    handle, attemptSpec, retryAccessDeniedInline = false, useBroker = brokered)
+                return spawnAndAwaitRunning(handle, attemptSpec, useBroker = brokered)
             } catch (e: Exception) {
                 if (e !is SandboxNameCollisionException && e !is RestoreAccessDeniedException) throw e
                 if (windowsHost && e is RestoreAccessDeniedException) brokered = true
@@ -1679,11 +1701,6 @@ private const val TAIL_LINES = 50
 // broken workload command, short enough to never look like a hang; the wait strategy that runs
 // right after is what actually judges whether the workload came up.
 private const val WORKLOAD_EXEC_EARLY_EXIT_GRACE_MS = 1_000L
-// Windows deferred-file-release access-denied retry (see isRestoreAccessDenied's doc): bounded
-// attempt count rather than a wall-clock deadline, so the retry resolves deterministically fast
-// in tests and in practice — the release lag this works around is itself sub-second.
-private const val RESTORE_ACCESS_DENIED_MAX_ATTEMPTS = 3
-private const val RESTORE_ACCESS_DENIED_RETRY_DELAY_MS = 300L
 // createCheckpoint's post-rm name-release wait (see awaitNameReleased's doc): a short wall-clock
 // budget, not an attempt count, since presence/absence in `msb ls` is a state to observe, not a
 // command to retry — READINESS_POLL_MS above is reused as the poll cadence, so this is the only
@@ -1691,7 +1708,7 @@ private const val RESTORE_ACCESS_DENIED_RETRY_DELAY_MS = 300L
 // only on the Windows lag it exists for.
 private const val CHECKPOINT_NAME_RELEASE_BUDGET_MS = 3_000L
 // createCheckpoint's own fresh-name-per-attempt reboot retry (see
-// rebootCheckpointRetryingFreshName's doc): same wall-clock-budget shape as
+// restoreRetryingFreshName's doc): same wall-clock-budget shape as
 // INSTALL_LOCK_RETRY_BUDGET_MS/INSTALL_LOCK_RETRY_DELAY_MS above, kept as its own constants since
 // it classifies different msb failures than that pair does. msb 0.7.1's restore refuses "already
 // exists" while EITHER the sandbox's DB record OR its on-disk directory still exists, and on
@@ -1704,7 +1721,7 @@ private const val CHECKPOINT_NAME_RELEASE_BUDGET_MS = 3_000L
 // milliseconds.
 private const val CHECKPOINT_REBOOT_ALREADY_EXISTS_RETRY_BUDGET_MS = 30_000L
 private const val CHECKPOINT_REBOOT_ALREADY_EXISTS_RETRY_DELAY_MS = 2_000L
-// POLICY v2's broker escalation (see rebootCheckpointRetryingFreshName's own doc and
+// POLICY v2's broker escalation (see restoreRetryingFreshName's own doc and
 // defaultRestoreBroker's): how long the broker SCRIPT itself (running on the far side of the WMI
 // call) polls for the nested restore invocation's own exit-code file before giving up and letting
 // this JVM's own subsequent msb-ls poll decide success instead (BrokerOutcome.LaunchedUnconfirmed).
@@ -1908,7 +1925,7 @@ internal sealed class BrokerOutcome {
      * No exit-code file appeared within the broker script's own bound, but WMI's `Invoke-CimMethod`
      * itself reported the process launched (`ReturnValue` 0) — `msb restore` is activation-gated
      * (see [MsbCommands.restore]'s own doc: it exits once activation succeeds, well before the
-     * sandbox itself necessarily reaches Running), so [MsbCliBackend.rebootCheckpointRetryingFreshName]'s
+     * sandbox itself necessarily reaches Running), so [MsbCliBackend.restoreRetryingFreshName]'s
      * own caller polls `msb ls` to Running afterward REGARDLESS of how the restore was launched —
      * this outcome just skips straight to that same poll rather than treating a missing exit-code
      * file as either a success or a failure on its own.
@@ -1936,7 +1953,7 @@ internal sealed class BrokerOutcome {
  * interpolates — the msb binary's own path, each argv token (including the checkpoint ref and the
  * sandbox name), and the broker's own scratch-file paths — even ones this backend itself
  * generated (sandbox names from [dev.rightsize.nextSandboxName] are already safe), per POLICY v2's
- * own "escape everything, trust nothing" posture (see [MsbCliBackend.rebootCheckpointRetryingFreshName]'s
+ * own "escape everything, trust nothing" posture (see [MsbCliBackend.restoreRetryingFreshName]'s
  * doc, POLICY v2 §4).
  */
 internal fun powerShellSingleQuoted(s: String): String = "'" + s.replace("'", "''") + "'"
@@ -1944,7 +1961,7 @@ internal fun powerShellSingleQuoted(s: String): String = "'" + s.replace("'", "'
 /**
  * Builds the PowerShell script POLICY v2's broker escalation runs via `powershell -NoProfile -File
  * <script>` (see [defaultRestoreBroker], which writes this to a unique temp file and runs it, and
- * [MsbCliBackend.rebootCheckpointRetryingFreshName]'s own doc for the policy this implements).
+ * [MsbCliBackend.restoreRetryingFreshName]'s own doc for the policy this implements).
  *
  * The script's job is exactly POLICY v2 §3: launch `<msb> <argv>` (the restore invocation this
  * backend would otherwise spawn directly) via `Invoke-CimMethod -ClassName Win32_Process
@@ -2003,7 +2020,7 @@ internal fun buildBrokerScript(msb: Path, argv: List<String>, outFile: Path, ecF
 
 /**
  * Production [RestoreBroker]: POLICY v2's job-free broker (see [MsbCliBackend]'s class doc and
- * [MsbCliBackend.rebootCheckpointRetryingFreshName]'s own doc for the mechanics and when this is
+ * [MsbCliBackend.restoreRetryingFreshName]'s own doc for the mechanics and when this is
  * invoked at all — only ever from that method's escalation, itself gated on [MsbCliBackend]'s own
  * `windowsHost`, so this never runs on a POSIX host in practice). Writes [buildBrokerScript]'s
  * output to a unique temp file — under `RUNNER_TEMP` when that env var names an existing
@@ -2023,7 +2040,7 @@ internal fun buildBrokerScript(msb: Path, argv: List<String>, outFile: Path, ecF
  *
  * Unique temp file names per call (the script itself, [outFile], [ecFile], named from [name] and
  * [System.nanoTime] together) — never reused across attempts, the same per-attempt-fresh
- * discipline [MsbCliBackend.rebootCheckpointRetryingFreshName] already applies to sandbox names
+ * discipline [MsbCliBackend.restoreRetryingFreshName] already applies to sandbox names
  * themselves. Best-effort cleanup afterward in a `finally`: a leftover scratch file is nowhere
  * near the concern a leftover SANDBOX record is (see that method's own doc), so a cleanup failure
  * here is swallowed rather than surfaced.

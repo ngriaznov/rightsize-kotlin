@@ -10,7 +10,7 @@ import java.nio.file.Path
 /**
  * Red-proofs [MsbCliBackend.createCheckpoint]'s post-`rm` name-release wait
  * ([MsbCliBackend.awaitNameReleased]) and its fresh-name-per-attempt already-exists reboot retry
- * ([MsbCliBackend.rebootCheckpointRetryingFreshName]) — both driven entirely against a local fake
+ * ([MsbCliBackend.restoreRetryingFreshName]) — both driven entirely against a local fake
  * `msb` script, same pattern as [MsbCheckpointTest]/[MsbRestoreSupervisionTest]. POSIX-only; the
  * msb-windows CI lane's own integration test is what exercises this against the real binary on
  * Windows, where the lag this covers actually occurs.
