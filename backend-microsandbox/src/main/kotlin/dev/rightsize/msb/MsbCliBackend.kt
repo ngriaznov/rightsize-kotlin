@@ -68,6 +68,24 @@ import java.util.concurrent.atomic.AtomicBoolean
  * now mints ANOTHER fresh name per failed attempt rather than retrying the same one forever (see
  * that method's own doc — this is the fix for the CI collision on already-fresh names, not dead
  * code kept per the class's own don't-remove-working-defenses posture).
+ *
+ * [restoreBroker] is a fifth seam, the same injectable-with-a-production-default shape as the
+ * four above but function-typed rather than a plain value: [rebootCheckpointRetryingFreshName]'s
+ * own escalation path (POLICY v2 -- see that method's doc) launches every restore attempt from
+ * the first [RestoreAccessDeniedException] onward through a WMI-based broker instead of a direct
+ * spawn, and this is what a unit test replaces with a stub returning a scripted [BrokerOutcome]
+ * rather than actually shelling out to `powershell.exe`/WMI -- meaningless on a POSIX test host,
+ * and exactly the kind of real-Windows-only branch [windowsHost] exists to make testable at all
+ * (see that seam's own doc). Root cause: `msb restore`'s detached spawn on Windows always passes
+ * `CREATE_BREAKAWAY_FROM_JOB` (see [createCheckpoint]'s own doc on this), and a Windows job
+ * object that denies breakaway rights -- exactly what wraps a Gradle test worker or a cargo-test
+ * binary under a CI runner -- makes that spawn fail with `ERROR_ACCESS_DENIED` deterministically,
+ * not transiently, so no amount of retrying a direct spawn ever clears it. A process created via
+ * `Invoke-CimMethod -ClassName Win32_Process -MethodName Create` is parented by the WMI provider
+ * host (`WmiPrvSE.exe`), outside this JVM's own job hierarchy entirely, so the identical `msb
+ * restore` invocation launched that way succeeds where a direct spawn is denied.
+ * [defaultRestoreBroker] is the production implementation; see its own doc and [BrokerOutcome]'s
+ * for the mechanics.
  */
 class MsbCliBackend private constructor(
     internal val msb: Path,
@@ -75,6 +93,7 @@ class MsbCliBackend private constructor(
     private val restoreReadinessBudgetMs: Long = FIRST_RUN_PULL_TIMEOUT_MS,
     private val checkpointRegistryDir: Path = CacheDir.resolve(),
     private val checkpointRebootAlreadyExistsBudgetMs: Long = CHECKPOINT_REBOOT_ALREADY_EXISTS_RETRY_BUDGET_MS,
+    private val restoreBroker: RestoreBroker = ::defaultRestoreBroker,
 ) : SandboxBackend {
     constructor(msb: Path) : this(msb, Platform.current()?.isWindows == true)
 
@@ -113,9 +132,9 @@ class MsbCliBackend private constructor(
     internal companion object {
         /**
          * Builds a backend pinned to [windowsHost] rather than to the real platform, and
-         * optionally to a shrunk [restoreReadinessBudgetMs] — the two test-only seams described
-         * on this class. `internal`, so Kotlin mangles its name in the bytecode and it never
-         * becomes a Java-callable entry point either.
+         * optionally to a shrunk [restoreReadinessBudgetMs] or a stubbed [restoreBroker] — the
+         * test-only seams described on this class. `internal`, so Kotlin mangles its name in the
+         * bytecode and it never becomes a Java-callable entry point either.
          */
         internal fun forHost(
             msb: Path,
@@ -123,9 +142,10 @@ class MsbCliBackend private constructor(
             restoreReadinessBudgetMs: Long = FIRST_RUN_PULL_TIMEOUT_MS,
             checkpointRegistryDir: Path = CacheDir.resolve(),
             checkpointRebootAlreadyExistsBudgetMs: Long = CHECKPOINT_REBOOT_ALREADY_EXISTS_RETRY_BUDGET_MS,
+            restoreBroker: RestoreBroker = ::defaultRestoreBroker,
         ) = MsbCliBackend(
             msb, windowsHost, restoreReadinessBudgetMs, checkpointRegistryDir,
-            checkpointRebootAlreadyExistsBudgetMs)
+            checkpointRebootAlreadyExistsBudgetMs, restoreBroker)
     }
 
     private val startedNames = ConcurrentHashMap.newKeySet<String>()
@@ -222,12 +242,20 @@ class MsbCliBackend private constructor(
      * and retries it instead (see that method's doc for why: a same-name retry into msb's Windows
      * deferred-file-release access-denied error is exactly the failure mode that leaves a stopped
      * sandbox record behind for a same-name retry to then collide with).
+     *
+     * [useBroker] is POLICY v2's own escalation flag (see [rebootCheckpointRetryingFreshName]'s
+     * doc): `false` (every caller except that method, once it has escalated) is a direct spawn,
+     * unchanged from before this parameter existed. `true` is threaded straight through to every
+     * [bootOnce] call this method itself makes — including its own internal retries (the
+     * install-lock poll, the state-db one-shot retry) — so once a reboot has escalated, EVERY
+     * attempt launched from here, not just the fresh-name loop's own top-level one, goes through
+     * the broker; see [bootOnce]'s own doc for what that actually changes.
      */
     private fun spawnAndAwaitRunning(
-        handle: Handle, spec: ContainerSpec, retryAccessDeniedInline: Boolean = true,
+        handle: Handle, spec: ContainerSpec, retryAccessDeniedInline: Boolean = true, useBroker: Boolean = false,
     ): Process? {
         val firstOutput = try {
-            return bootOnce(handle, spec)
+            return bootOnce(handle, spec, useBroker)
         } catch (locked: MsbInstallLockException) {
             // msb refuses `run` outright while its internal install lock is held (see
             // [isMsbInstallLockActive]). The message names a deadline ~30 minutes out, but
@@ -240,7 +268,7 @@ class MsbCliBackend private constructor(
             while (System.nanoTime() < deadline) {
                 Thread.sleep(INSTALL_LOCK_RETRY_DELAY_MS)
                 try {
-                    return bootOnce(handle, spec)
+                    return bootOnce(handle, spec, useBroker)
                 } catch (again: MsbInstallLockException) {
                     last = again
                 }
@@ -267,7 +295,7 @@ class MsbCliBackend private constructor(
             while (attempts < RESTORE_ACCESS_DENIED_MAX_ATTEMPTS) {
                 Thread.sleep(RESTORE_ACCESS_DENIED_RETRY_DELAY_MS)
                 try {
-                    return bootOnce(handle, spec)
+                    return bootOnce(handle, spec, useBroker)
                 } catch (again: RestoreAccessDeniedException) {
                     last = again
                     attempts++
@@ -284,7 +312,7 @@ class MsbCliBackend private constructor(
             // failure propagates — the same one-shot policy as the image-cache heal below.
             Thread.sleep(STATE_DB_RETRY_DELAY_MS)
             try {
-                return bootOnce(handle, spec)
+                return bootOnce(handle, spec, useBroker)
             } catch (second: MsbStateDbException) {
                 error("msb run for sandbox ${handle.id} hit msb's state-database error twice in a " +
                     "row — the usual cause (concurrent msb invocations racing startup migrations) " +
@@ -297,7 +325,7 @@ class MsbCliBackend private constructor(
         }
         val heal = runCatching { invoke(MsbCommands.imageRemove(spec.image), STOP_TIMEOUT_SEC) }
         try {
-            return bootOnce(handle, spec)
+            return bootOnce(handle, spec, useBroker)
         } catch (second: ImageCacheCorruptionException) {
             error("msb run for sandbox ${handle.id} hit its image cache error twice in a row for image " +
                 "'${spec.image}', even after removing that image's cache entry (${describeHeal(heal)}) " +
@@ -311,18 +339,33 @@ class MsbCliBackend private constructor(
      * One boot attempt, dispatched by `spec.checkpointRef`:
      * - unset: spawns the attached `msb run` child and waits for [handle] to reach Running via
      *   [awaitRunning] — unchanged from before restore got its own supervision. Returns the
-     *   still-live child.
-     * - set: spawns `msb restore ...` and waits for IT (a short-lived activation launcher, not a
-     *   supervising child — see [awaitRestoreRunning]'s doc) to exit, then polls [handle] to
-     *   Running the same way. Returns `null`: by the time [awaitRestoreRunning] returns
-     *   successfully the process has already exited, so there is nothing live to hand back.
+     *   still-live child. [useBroker] is meaningless for this branch — only a restore is ever
+     *   brokered (see [rebootCheckpointRetryingFreshName]'s own doc) — and is ignored here.
+     * - set, [useBroker] `false` (the default, and the only value for every caller except
+     *   [rebootCheckpointRetryingFreshName] once it has escalated — see [spawnAndAwaitRunning]'s
+     *   own doc): spawns `msb restore ...` DIRECTLY and waits for IT (a short-lived activation
+     *   launcher, not a supervising child — see [awaitRestoreRunning]'s doc) to exit, then polls
+     *   [handle] to Running the same way.
+     * - set, [useBroker] `true`: delegates to [bootOnceBrokered] instead — the exact same restore
+     *   invocation, launched through POLICY v2's WMI-based broker instead of a direct spawn.
      *
-     * On any failure the process is reaped here (for the classified early-exit/nonzero-exit
-     * failures it has already exited; a readiness timeout leaves it alive and it is
+     * Either restore path returns `null`... except it doesn't: by the time the restore is
+     * confirmed Running, [spawnWorkloadExecChild] spawns the `msb exec` session that actually
+     * revives the checkpointed workload (upstream's restore boots the sandbox idle — see that
+     * method's doc), and ITS process is what's returned, becoming [Handle.attached]'s new
+     * supervising child for the boot — identically for a direct or a brokered restore, since
+     * [bootOnceBrokered] ends in the exact same [spawnWorkloadExecChild] call this direct path
+     * does (see that method's own doc for why this is deliberate: the brokered sandbox itself is
+     * every bit as detached-with-no-attached-child as a direct restore already was).
+     *
+     * On any failure the DIRECT path's process is reaped here (for the classified early-exit/
+     * nonzero-exit failures it has already exited; a readiness timeout leaves it alive and it is
      * force-killed), so a failed attempt leaves no live process behind — the caller owns retry
-     * policy, never cleanup.
+     * policy, never cleanup. [bootOnceBrokered] has no such live child of its own to reap: the
+     * WMI-created process was never this JVM's child in the first place.
      */
-    private fun bootOnce(handle: Handle, spec: ContainerSpec): Process? {
+    private fun bootOnce(handle: Handle, spec: ContainerSpec, useBroker: Boolean = false): Process? {
+        if (spec.checkpointRef != null && useBroker) return bootOnceBrokered(handle, spec)
         val (proc, tail, drainer) = spawnAttachedRun(spec)   // ATTACHED run, or a detached restore launch
         try {
             return if (spec.checkpointRef != null) {
@@ -336,6 +379,59 @@ class MsbCliBackend private constructor(
             if (proc.isAlive) proc.destroyForcibly()
             throw t
         }
+    }
+
+    /**
+     * The brokered counterpart of [bootOnce]'s direct restore path — POLICY v2's escalation (see
+     * [rebootCheckpointRetryingFreshName]'s doc). Launches `msb restore ...` via [restoreBroker]
+     * instead of a direct [spawnAttachedRun], then classifies/polls [handle] to Running exactly
+     * like the direct path does, reusing the SAME predicates: [classifyRestoreExit] is the exact
+     * classification [awaitRestoreRunning] itself runs against a direct attempt's exit code and
+     * output, and [pollRestoreRunning] is the exact ls-poll loop [awaitRestoreRunning] runs once
+     * activation is known to have succeeded — a brokered restore is classified/awaited no
+     * differently than a direct one once launched, only the launch mechanism itself differs.
+     *
+     * [BrokerOutcome.BrokerFailure] (the broker INFRASTRUCTURE itself failing — never a restore
+     * classification, since no restore attempt was ever actually launched) falls back to an
+     * ordinary DIRECT spawn for this one attempt — POLICY v2 §5: the broker must never become a
+     * new single point of failure. This is the only place a "brokered" attempt can still end up
+     * launching directly; [rebootCheckpointRetryingFreshName]'s own `brokered` flag is untouched
+     * by this fallback, so the NEXT attempt (a fresh name, if this one also fails) tries the
+     * broker again rather than giving up on it permanently over one infrastructure hiccup.
+     *
+     * Ends in the exact same [spawnWorkloadExecChild] call [bootOnce]'s direct path ends in — see
+     * that method's own doc: this is what gives the brokered path the identical
+     * handle/attached-state shape the direct restore path produces, never a bespoke shape of its
+     * own. The brokered sandbox is DETACHED with no attached child in THIS JVM for the restore
+     * itself, exactly like a direct restore already was ([awaitRestoreRunning]'s own doc: `msb
+     * restore` is detached-by-design) — [spawnWorkloadExecChild]'s `msb exec` session is what
+     * fills [Handle.attached] either way.
+     */
+    private fun bootOnceBrokered(handle: Handle, spec: ContainerSpec): Process? {
+        when (val outcome = restoreBroker(msb, MsbCommands.restore(spec), spec.name)) {
+            is BrokerOutcome.BrokerFailure -> {
+                val (proc, tail, drainer) = spawnAttachedRun(spec)
+                try {
+                    awaitRestoreRunning(handle, proc, tail, drainer)
+                } catch (t: Throwable) {
+                    if (proc.isAlive) proc.destroyForcibly()
+                    throw t
+                }
+            }
+            is BrokerOutcome.Completed -> {
+                val deadline = System.currentTimeMillis() + restoreReadinessBudgetMs
+                classifyRestoreExit(handle, outcome.exitCode, outcome.output)
+                pollRestoreRunning(handle, deadline)
+            }
+            BrokerOutcome.LaunchedUnconfirmed -> {
+                // No exit-code file appeared within the broker script's own bound, but CIM
+                // reported the process launched — restore is activation-gated regardless of how
+                // it was launched, so this skips straight to the same ls-poll a direct exit-0
+                // restore goes through, rather than treating the missing file as failure.
+                pollRestoreRunning(handle, System.currentTimeMillis() + restoreReadinessBudgetMs)
+            }
+        }
+        return spawnWorkloadExecChild(handle, spec)
     }
 
     /** Renders a heal attempt's outcome for the second-failure message — the heal's own
@@ -458,23 +554,51 @@ class MsbCliBackend private constructor(
         runCatching { drainer.join(5_000) }
         val output = tail.joinToString("\n")
         val exitCode = proc.exitValue()
-        if (exitCode != 0) {
-            if (isImageCacheCorruption(output)) throw ImageCacheCorruptionException(output)
-            if (isMsbStateDbError(output)) throw MsbStateDbException(output)
-            if (isMsbInstallLockActive(output)) throw MsbInstallLockException(output)
-            if (isRestoreAccessDenied(output)) throw RestoreAccessDeniedException(output)
-            if (isPortBindConflict(output)) {
-                throw PortBindConflictException(
-                    "msb restore for sandbox ${handle.id} could not bind a host port: $output")
-            }
-            if (isNameCollision(output)) {
-                throw SandboxNameCollisionException(
-                    "sandbox named ${handle.id} already exists: $output")
-            }
-            error("msb restore for sandbox ${handle.id} failed (exit $exitCode): $output")
+        classifyRestoreExit(handle, exitCode, output)
+        pollRestoreRunning(handle, deadline)
+    }
+
+    /**
+     * The exit-code/output classification half of [awaitRestoreRunning], factored out so
+     * [bootOnceBrokered] can apply the EXACT same predicates to a brokered restore's own
+     * exit-code/output pair (see [BrokerOutcome.Completed]) — a restore invocation is classified
+     * identically regardless of whether it was launched by a direct spawn or POLICY v2's broker;
+     * only the launch mechanism differs. A zero [exitCode] is not itself classified as anything —
+     * it just returns, exactly as [awaitRestoreRunning]'s own `if (exitCode != 0)` guard did
+     * before this was extracted.
+     */
+    private fun classifyRestoreExit(handle: Handle, exitCode: Int, output: String) {
+        if (exitCode == 0) return
+        if (isImageCacheCorruption(output)) throw ImageCacheCorruptionException(output)
+        if (isMsbStateDbError(output)) throw MsbStateDbException(output)
+        if (isMsbInstallLockActive(output)) throw MsbInstallLockException(output)
+        if (isRestoreAccessDenied(output)) throw RestoreAccessDeniedException(output)
+        if (isPortBindConflict(output)) {
+            throw PortBindConflictException(
+                "msb restore for sandbox ${handle.id} could not bind a host port: $output")
         }
+        if (isNameCollision(output)) {
+            throw SandboxNameCollisionException(
+                "sandbox named ${handle.id} already exists: $output")
+        }
+        error("msb restore for sandbox ${handle.id} failed (exit $exitCode): $output")
+    }
+
+    /**
+     * The ls-poll half of [awaitRestoreRunning], factored out so [bootOnceBrokered] can run the
+     * EXACT same poll once a brokered restore's own activation is known to have succeeded (a
+     * [BrokerOutcome.Completed] exit 0, or a [BrokerOutcome.LaunchedUnconfirmed] outcome — see
+     * that sealed class's own doc) — bounded by [deadlineMs], an absolute
+     * `System.currentTimeMillis()` value the caller computes from [restoreReadinessBudgetMs]
+     * itself (this method takes no opinion on how much of that budget the launch step already
+     * spent, matching [awaitRestoreRunning]'s own original shared-deadline math for the direct
+     * path, and giving the brokered path a full budget of its own for the phase THIS method
+     * covers, since the broker's own bounded exit-code wait is a separate concern already spent
+     * before this is ever called).
+     */
+    private fun pollRestoreRunning(handle: Handle, deadlineMs: Long) {
         var seen = false
-        while (System.currentTimeMillis() < deadline) {
+        while (System.currentTimeMillis() < deadlineMs) {
             val status = MsbLsJson.statusOf(invoke(MsbCommands.ls(), LOGS_TIMEOUT_SEC).stdout, handle.id)
             if (status == "Running") return
             if (status == "Stopped" || (seen && status == null)) {
@@ -982,15 +1106,49 @@ class MsbCliBackend private constructor(
      * true`), whose own catch cascade has never caught [SandboxNameCollisionException] and still
      * doesn't: an already-exists failure there (only reachable if a caller reuses a name that's
      * still live) keeps propagating as-is, exactly as before this method existed.
+     *
+     * **POLICY v2 — the job-free broker escalation.** [RestoreAccessDeniedException] has a second,
+     * distinct root cause from the deferred-file-release lag its own doc describes, discovered by
+     * a live diagnostic campaign against msb-windows CI: msb's detached spawn on Windows always
+     * passes `CREATE_BREAKAWAY_FROM_JOB` (see [createCheckpoint]'s own doc), and when THIS JVM
+     * itself sits inside a Windows job object that does not grant breakaway rights — exactly what
+     * wraps a Gradle test worker or a cargo-test binary under a CI runner's own job — that spawn is
+     * denied `ERROR_ACCESS_DENIED` deterministically, not transiently, so no retry BUDGET, only a
+     * different LAUNCH MECHANISM, ever clears it. `msb restore`'s own `--trace` output confirms
+     * every stage up to `process_launch` succeeds first (the artifact resolves, the DB record is
+     * inserted — hence the leftover stopped record this method's own already-exists handling
+     * already covers — the disk grows), and only the spawn itself is denied; nothing is locked, no
+     * file handle is held, the denial is the job object.
+     *
+     * The fix does not replace the fresh-name walk above — a job-object denial and a genuine
+     * deferred-release race share the exact same [RestoreAccessDeniedException] wording, and this
+     * method doesn't and can't tell which one it hit — it ESCALATES the loop's own LAUNCH mechanism
+     * once that classification is seen at all: the FIRST attempt of any reboot ([brokered] starts
+     * `false`) is always a direct spawn, zero change to a healthy (non-job-object) environment.
+     * From the first attempt that throws [RestoreAccessDeniedException] on a [windowsHost] onward —
+     * [brokered] latches `true` and never resets for the rest of this reboot — every subsequent
+     * attempt's [spawnAndAwaitRunning] call passes `useBroker = true`, launching its `msb restore`
+     * through [restoreBroker] (see [bootOnceBrokered]) instead of a direct spawn. Non-Windows never
+     * brokers regardless of what this backend's own classifier matches — [windowsHost] gates
+     * escalation exactly like every other Windows-only branch this class has (see the class doc).
+     * Everything else about this loop — the fresh name per attempt, the best-effort `rm` of the
+     * just-failed name, the shared wall-clock budget, the ledger/[startedNames] bookkeeping — is
+     * completely unchanged; POLICY v2 only ever changes HOW an attempt is launched, never the
+     * retry/naming policy around it.
      */
     private fun rebootCheckpointRetryingFreshName(handle: Handle, initialSpec: ContainerSpec): Process? {
         val deadline = System.nanoTime() + checkpointRebootAlreadyExistsBudgetMs * 1_000_000
         var attemptSpec = initialSpec
+        // POLICY v2: latches true on the first Windows RestoreAccessDeniedException this reboot
+        // hits and never resets — see this method's own doc paragraph above.
+        var brokered = false
         while (true) {
             try {
-                return spawnAndAwaitRunning(handle, attemptSpec, retryAccessDeniedInline = false)
+                return spawnAndAwaitRunning(
+                    handle, attemptSpec, retryAccessDeniedInline = false, useBroker = brokered)
             } catch (e: Exception) {
                 if (e !is SandboxNameCollisionException && e !is RestoreAccessDeniedException) throw e
+                if (windowsHost && e is RestoreAccessDeniedException) brokered = true
                 val failedName = attemptSpec.name
                 runCatching { invoke(MsbCommands.rm(failedName), STOP_TIMEOUT_SEC) }
                 startedNames -= failedName
@@ -1546,6 +1704,17 @@ private const val CHECKPOINT_NAME_RELEASE_BUDGET_MS = 3_000L
 // milliseconds.
 private const val CHECKPOINT_REBOOT_ALREADY_EXISTS_RETRY_BUDGET_MS = 30_000L
 private const val CHECKPOINT_REBOOT_ALREADY_EXISTS_RETRY_DELAY_MS = 2_000L
+// POLICY v2's broker escalation (see rebootCheckpointRetryingFreshName's own doc and
+// defaultRestoreBroker's): how long the broker SCRIPT itself (running on the far side of the WMI
+// call) polls for the nested restore invocation's own exit-code file before giving up and letting
+// this JVM's own subsequent msb-ls poll decide success instead (BrokerOutcome.LaunchedUnconfirmed).
+private const val BROKER_EC_WAIT_BUDGET_SEC = 30
+// How long THIS JVM waits for the broker script process itself (`powershell -NoProfile -File
+// <script>`) to exit — comfortably above BROKER_EC_WAIT_BUDGET_SEC, since that's a bound the
+// script polls INSIDE its own run, plus margin for powershell's own startup and the WMI round
+// trip; a timeout here is broker INFRASTRUCTURE trouble (BrokerOutcome.BrokerFailure), not a
+// restore classification.
+private const val BROKER_PROCESS_TIMEOUT_SEC = 45L
 
 /** The one boot failure [MsbCliBackend] heals and retries — carries the `msb run` child's
  * combined output for the second-failure diagnostic. Internal to the boot path: never
@@ -1709,6 +1878,202 @@ internal class RestoreAccessDeniedException(val output: String) :
  */
 internal fun isRestoreAccessDenied(output: String): Boolean =
     "Access is denied" in output && ("io error" in output || "(os error 5)" in output)
+
+/**
+ * POLICY v2's own broker seam ([MsbCliBackend.restoreBroker]) — launches `msb restore <argv>`
+ * for a sandbox named [name] via [defaultRestoreBroker] in production, or a test's own stub. See
+ * [MsbCliBackend]'s class doc (the `restoreBroker` paragraph) for why this exists at all, and
+ * [BrokerOutcome] for what it returns. [argv] is the restore invocation's OWN argv (as
+ * [MsbCommands.restore] builds it — `["restore", ref, "--name", name, ...]`), never including
+ * [msb] itself; [msb] is passed separately since the broker script's own `&`-invocation needs it
+ * quoted independently of the rest of [argv].
+ */
+internal typealias RestoreBroker = (msb: Path, argv: List<String>, name: String) -> BrokerOutcome
+
+/**
+ * Outcome of one [RestoreBroker] invocation. [MsbCliBackend.bootOnceBrokered] handles all three
+ * variants; see its own doc for exactly how.
+ */
+internal sealed class BrokerOutcome {
+    /**
+     * The broker captured a definitive exit code and the restore invocation's own redirected
+     * combined output (stdout+stderr) — classified by [MsbCliBackend.classifyRestoreExit] exactly
+     * like a direct attempt's own exit/output would be, then (on a classified success) the same
+     * `msb ls` poll to Running any exit-0 restore goes through
+     * ([MsbCliBackend.pollRestoreRunning]).
+     */
+    data class Completed(val exitCode: Int, val output: String) : BrokerOutcome()
+
+    /**
+     * No exit-code file appeared within the broker script's own bound, but WMI's `Invoke-CimMethod`
+     * itself reported the process launched (`ReturnValue` 0) — `msb restore` is activation-gated
+     * (see [MsbCommands.restore]'s own doc: it exits once activation succeeds, well before the
+     * sandbox itself necessarily reaches Running), so [MsbCliBackend.rebootCheckpointRetryingFreshName]'s
+     * own caller polls `msb ls` to Running afterward REGARDLESS of how the restore was launched —
+     * this outcome just skips straight to that same poll rather than treating a missing exit-code
+     * file as either a success or a failure on its own.
+     */
+    object LaunchedUnconfirmed : BrokerOutcome()
+
+    /**
+     * The broker INFRASTRUCTURE itself failed — `powershell.exe` missing or unreachable, the
+     * script/temp-file write itself throwing, or WMI's own `Invoke-CimMethod` refusing to create
+     * anything at all (a non-zero `ReturnValue`) — never a restore-attempt classification, since no
+     * restore attempt was ever actually launched for this to classify. [reason] is diagnostic only,
+     * never parsed. [MsbCliBackend.bootOnceBrokered] falls back to an ordinary DIRECT spawn for
+     * this one attempt on this outcome (POLICY v2 §5: the broker must never become a new single
+     * point of failure), without un-escalating the reboot's own `brokered` flag for later attempts.
+     */
+    data class BrokerFailure(val reason: String) : BrokerOutcome()
+}
+
+/**
+ * Escapes [s] for embedding inside a PowerShell SINGLE-quoted string literal (`'...'`): doubling
+ * an embedded single quote is PowerShell's own, only escape mechanism in that context (see
+ * `about_Quoting_Rules`) — nothing else (backtick, `$`, double quotes) is special inside single
+ * quotes, which is exactly why every interpolated token [buildBrokerScript] embeds is wrapped this
+ * way rather than in a double-quoted literal. Used for every path/token POLICY v2's broker script
+ * interpolates — the msb binary's own path, each argv token (including the checkpoint ref and the
+ * sandbox name), and the broker's own scratch-file paths — even ones this backend itself
+ * generated (sandbox names from [dev.rightsize.nextSandboxName] are already safe), per POLICY v2's
+ * own "escape everything, trust nothing" posture (see [MsbCliBackend.rebootCheckpointRetryingFreshName]'s
+ * doc, POLICY v2 §4).
+ */
+internal fun powerShellSingleQuoted(s: String): String = "'" + s.replace("'", "''") + "'"
+
+/**
+ * Builds the PowerShell script POLICY v2's broker escalation runs via `powershell -NoProfile -File
+ * <script>` (see [defaultRestoreBroker], which writes this to a unique temp file and runs it, and
+ * [MsbCliBackend.rebootCheckpointRetryingFreshName]'s own doc for the policy this implements).
+ *
+ * The script's job is exactly POLICY v2 §3: launch `<msb> <argv>` (the restore invocation this
+ * backend would otherwise spawn directly) via `Invoke-CimMethod -ClassName Win32_Process
+ * -MethodName Create` — WMI's own process-creation method, whose created child is parented by the
+ * WMI provider host (`WmiPrvSE.exe`) rather than this JVM, so it escapes this JVM's own Windows job
+ * object entirely, breakaway rights or not — then report back what happened:
+ *
+ * 1. The `CommandLine` WMI creates is itself a NESTED `powershell.exe -NoProfile -Command
+ *    "& <quotedMsb> <quotedArgv> *> <quotedOutFile>; \`$LASTEXITCODE | Out-File ... <quotedEcFile>"`
+ *    invocation — WMI's created process is what escapes the job, and this inner hop is what lets
+ *    THAT process redirect msb's own combined output to [outFile] and report its own exit code to
+ *    [ecFile], since `Invoke-CimMethod` itself neither waits for the child nor captures anything
+ *    from it. Every interpolated token — [msb]'s path, each of [argv], [outFile], [ecFile] — is
+ *    independently wrapped via [powerShellSingleQuoted]; the backtick before `$LASTEXITCODE` is
+ *    what keeps THIS outer script's own double-quoted `CommandLine` literal from prematurely
+ *    interpolating it before WMI ever sees the value (the nested `powershell -Command` is what's
+ *    meant to evaluate it, once msb itself has actually exited).
+ * 2. Prints the CIM call's own `ReturnValue`/`ProcessId` — [defaultRestoreBroker] parses
+ *    `ReturnValue` as the broker-infrastructure signal (POLICY v2 §3b): non-zero means WMI itself
+ *    refused to create anything, a [BrokerOutcome.BrokerFailure], never a restore classification.
+ * 3. Polls (bounded, [BROKER_EC_WAIT_BUDGET_SEC]) for [ecFile] to appear, then prints both
+ *    [ecFile]'s and [outFile]'s content between markers [defaultRestoreBroker] parses (POLICY v2
+ *    §3c) — an [ecFile] that never appears within the bound is not itself a failure: the caller's
+ *    OWN subsequent `msb ls` poll is what decides success from there (see
+ *    [BrokerOutcome.LaunchedUnconfirmed]'s own doc).
+ */
+internal fun buildBrokerScript(msb: Path, argv: List<String>, outFile: Path, ecFile: Path): String {
+    val quotedMsb = powerShellSingleQuoted(msb.toString())
+    val quotedArgv = argv.joinToString(" ") { powerShellSingleQuoted(it) }
+    val quotedOut = powerShellSingleQuoted(outFile.toString())
+    val quotedEc = powerShellSingleQuoted(ecFile.toString())
+    val innerCommand = "& $quotedMsb $quotedArgv *> $quotedOut"
+    return """
+        |${'$'}cimArgs = @{ CommandLine = "powershell.exe -NoProfile -Command `"$innerCommand; `${'$'}LASTEXITCODE | Out-File -FilePath $quotedEc -Encoding ascii -NoNewline`"" }
+        |${'$'}result = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments ${'$'}cimArgs
+        |Write-Output "CIM_RETURN=${'$'}(${'$'}result.ReturnValue)"
+        |Write-Output "CIM_PID=${'$'}(${'$'}result.ProcessId)"
+        |${'$'}deadline = (Get-Date).AddSeconds($BROKER_EC_WAIT_BUDGET_SEC)
+        |while ((Get-Date) -lt ${'$'}deadline -and -not (Test-Path $quotedEc)) {
+        |  Start-Sleep -Milliseconds 300
+        |}
+        |if (Test-Path $quotedEc) {
+        |  Write-Output "EC_FILE_START"
+        |  Get-Content -Path $quotedEc -Raw
+        |  Write-Output "EC_FILE_END"
+        |} else {
+        |  Write-Output "EC_FILE_MISSING"
+        |}
+        |if (Test-Path $quotedOut) {
+        |  Write-Output "OUT_FILE_START"
+        |  Get-Content -Path $quotedOut -Raw
+        |  Write-Output "OUT_FILE_END"
+        |}
+        |""".trimMargin()
+}
+
+/**
+ * Production [RestoreBroker]: POLICY v2's job-free broker (see [MsbCliBackend]'s class doc and
+ * [MsbCliBackend.rebootCheckpointRetryingFreshName]'s own doc for the mechanics and when this is
+ * invoked at all — only ever from that method's escalation, itself gated on [MsbCliBackend]'s own
+ * `windowsHost`, so this never runs on a POSIX host in practice). Writes [buildBrokerScript]'s
+ * output to a unique temp file — under `RUNNER_TEMP` when that env var names an existing
+ * directory (keeps the broker's own scratch files inside whatever cleanup a CI runner already
+ * gives its own temp dir; never required for correctness), `java.io.tmpdir` otherwise — runs it
+ * via `powershell -NoProfile -File <script>`, and classifies the result:
+ *
+ * - the script itself failing to write, or `powershell` itself failing to start or exiting past
+ *   [BROKER_PROCESS_TIMEOUT_SEC], is [BrokerOutcome.BrokerFailure] — broker infrastructure never
+ *   got as far as attempting a restore at all.
+ * - a parsed `CIM_RETURN` other than `0` (including unparseable) is also
+ *   [BrokerOutcome.BrokerFailure]: WMI itself refused to create the process.
+ * - an `ecFile` that appeared within the script's own [BROKER_EC_WAIT_BUDGET_SEC] bound is
+ *   [BrokerOutcome.Completed], the parsed exit code paired with the `outFile` content as the
+ *   restore's own combined output.
+ * - `CIM_RETURN=0` but no parseable `ecFile` content is [BrokerOutcome.LaunchedUnconfirmed].
+ *
+ * Unique temp file names per call (the script itself, [outFile], [ecFile], named from [name] and
+ * [System.nanoTime] together) — never reused across attempts, the same per-attempt-fresh
+ * discipline [MsbCliBackend.rebootCheckpointRetryingFreshName] already applies to sandbox names
+ * themselves. Best-effort cleanup afterward in a `finally`: a leftover scratch file is nowhere
+ * near the concern a leftover SANDBOX record is (see that method's own doc), so a cleanup failure
+ * here is swallowed rather than surfaced.
+ */
+private fun defaultRestoreBroker(msb: Path, argv: List<String>, name: String): BrokerOutcome {
+    val tmpDir = System.getenv("RUNNER_TEMP")
+        ?.let { runCatching { Path.of(it) }.getOrNull() }
+        ?.takeIf { runCatching { Files.isDirectory(it) }.getOrDefault(false) }
+        ?: Path.of(System.getProperty("java.io.tmpdir"))
+    val unique = "rz-broker-$name-${System.nanoTime()}"
+    val script = tmpDir.resolve("$unique.ps1")
+    val outFile = tmpDir.resolve("$unique.out.txt")
+    val ecFile = tmpDir.resolve("$unique.ec.txt")
+    try {
+        try {
+            Files.writeString(script, buildBrokerScript(msb, argv, outFile, ecFile))
+        } catch (e: Exception) {
+            return BrokerOutcome.BrokerFailure("failed to write the broker script: ${e.message}")
+        }
+        val output = try {
+            val proc = ProcessBuilder("powershell", "-NoProfile", "-File", script.toString())
+                .redirectErrorStream(true).start()
+            runCatching { proc.outputStream.close() }
+            val exited = proc.waitFor(BROKER_PROCESS_TIMEOUT_SEC, TimeUnit.SECONDS)
+            if (!exited) {
+                proc.destroyForcibly()
+                return BrokerOutcome.BrokerFailure(
+                    "the broker script did not exit within ${BROKER_PROCESS_TIMEOUT_SEC}s")
+            }
+            proc.inputStream.bufferedReader().readText()
+        } catch (e: Exception) {
+            return BrokerOutcome.BrokerFailure("failed to launch the broker script: ${e.message}")
+        }
+        val cimReturn = Regex("CIM_RETURN=(-?\\d+)").find(output)?.groupValues?.get(1)?.toIntOrNull()
+        if (cimReturn != 0) {
+            return BrokerOutcome.BrokerFailure(
+                "WMI Win32_Process.Create did not report success (CIM_RETURN=$cimReturn): $output")
+        }
+        val ecContent = Regex("EC_FILE_START\\r?\\n(.*?)\\r?\\nEC_FILE_END", RegexOption.DOT_MATCHES_ALL)
+            .find(output)?.groupValues?.get(1)?.trim()
+        val outContent = Regex("OUT_FILE_START\\r?\\n(.*?)\\r?\\nOUT_FILE_END", RegexOption.DOT_MATCHES_ALL)
+            .find(output)?.groupValues?.get(1) ?: ""
+        val exitCode = ecContent?.toIntOrNull()
+        return if (exitCode != null) BrokerOutcome.Completed(exitCode, outContent) else BrokerOutcome.LaunchedUnconfirmed
+    } finally {
+        runCatching { Files.deleteIfExists(script) }
+        runCatching { Files.deleteIfExists(outFile) }
+        runCatching { Files.deleteIfExists(ecFile) }
+    }
+}
 
 /**
  * A small busybox-compatible POSIX `sh` script ([MsbCliBackend.captureWorkloadCmdline] execs it

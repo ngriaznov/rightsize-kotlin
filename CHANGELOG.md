@@ -195,6 +195,31 @@ reaches its first tagged release.
   asserted to be untouched by the checkpoint/restore cycle (that was only ever true back when the
   reboot reused the source sandbox's own name) — it now gains exactly the fresh name(s) the cycle
   actually minted, one in the happy path, with every prior entry preserved unchanged.
+- **`createCheckpoint`'s reboot now escalates to a job-free WMI broker after a Windows
+  access-denied restore failure, instead of retrying direct spawns that can never succeed.**
+  A live diagnostic campaign against msb-windows CI traced `RestoreAccessDeniedException` to a
+  second, distinct cause beyond the deferred-file-release lag documented above: `msb restore` is
+  detached-by-design, so it always spawns a fresh `msb.exe` as the VM supervisor, and on Windows
+  that detached spawn always passes `CREATE_BREAKAWAY_FROM_JOB`. When the JVM running this library
+  itself sits inside a Windows job object that does not grant breakaway rights — precisely how a
+  Gradle test worker or a cargo-test binary is confined under a CI runner's own job — that spawn is
+  denied `ERROR_ACCESS_DENIED` deterministically, not transiently: no retry budget, at any name,
+  ever clears it, only a different launch mechanism does. `msb restore --trace` output confirms
+  every earlier stage (artifact resolution, the sandbox-record insert, the writable-disk grow)
+  succeeds first, and only the process launch itself is refused — nothing is locked, no file handle
+  is held. The reboot's fresh-name walk now treats this the same way it already treats an
+  already-exists refusal, but adds one more step: the FIRST attempt of a reboot is still always a
+  direct spawn (zero change on a healthy host), but from the first attempt that hits this specific
+  Windows access-denied classification onward, every remaining attempt launches `msb restore`
+  through `Invoke-CimMethod -ClassName Win32_Process -MethodName Create` instead — WMI's created
+  process is parented by the WMI provider host, outside this JVM's own job hierarchy entirely, so
+  the identical restore invocation that a direct spawn cannot make succeeds this way. This never
+  engages on non-Windows hosts, and a broker-infrastructure hiccup (`powershell.exe` missing, WMI
+  itself refusing to create anything) simply falls back to a direct spawn for that one attempt
+  rather than becoming a new point of failure of its own — every existing budget, fresh-name, and
+  cleanup behavior around the retry loop is unchanged. No public signature moved; the launch
+  mechanism behind a checkpoint restore was never part of this library's documented contract. A fix
+  for the underlying spawn behavior is also being reported upstream to microsandbox.
 
 ## [0.7.9] - 2026-09-10
 
