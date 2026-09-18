@@ -164,7 +164,10 @@ class MsbCheckpointCaptureTest {
                 CheckpointRegistry(tmp).readCapturedCommand(effectiveRef),
                 "the captured cmdline must be persisted against the EFFECTIVE ref",
             )
-            assertTrue("rz-cap-test" in backend.runningSandboxNames(),
+            // The reboot mints a fresh name (see MsbCliBackend.createCheckpoint's own doc) — the
+            // sandbox is Running again under handle.id (rewritten in place), not under the
+            // original "rz-cap-test".
+            assertTrue(handle.id in backend.runningSandboxNames(),
                 "the checkpoint's own re-boot must have revived the workload with the just-captured argv")
         } finally {
             backend.stop(handle)

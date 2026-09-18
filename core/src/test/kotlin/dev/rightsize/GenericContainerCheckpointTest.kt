@@ -10,6 +10,7 @@ import dev.rightsize.core.ContainerSpec
 import dev.rightsize.core.SandboxHandle
 import dev.rightsize.core.checkpoint.CheckpointRegistry
 import dev.rightsize.core.checkpoint.InvalidCheckpointNameException
+import dev.rightsize.core.diagnostics.LiveContainers
 import dev.rightsize.core.wait.WaitStrategy
 import dev.rightsize.core.wait.WaitTarget
 import org.junit.jupiter.api.Assertions.*
@@ -59,6 +60,32 @@ private open class CheckpointFakeBackend(
         return ref
     }
     override fun removeCheckpoint(ref: String) { removedRefs += ref }
+}
+
+/** A [SandboxHandle] whose `spec` (and therefore `id`) is mutable — mimicking
+ * `MsbCliBackend.Handle`'s own shape (see its doc: `id` is a computed property reading straight
+ * off a `var spec`), which every other fake `SandboxHandle` in this test suite deliberately is
+ * NOT, since nothing else needs a backend that renames a handle mid-checkpoint. */
+private class RenamingHandle(spec: ContainerSpec) : SandboxHandle {
+    override var spec: ContainerSpec = spec
+    override val id: String get() = spec.name
+}
+
+/** A [CheckpointFakeBackend] that renames the handle in place during [createCheckpoint] —
+ * standing in for `MsbCliBackend`'s own fresh-name reboot (see its doc) — so these tests can pin
+ * down what `GenericContainer.checkpoint()` ITSELF must do about a rename (re-key
+ * [LiveContainers]), independent of any single backend's own bookkeeping (that part is
+ * `backend-microsandbox`'s own `MsbCheckpointTest`/`MsbCheckpointNameReleaseTest` territory). */
+private class RenamingCheckpointFakeBackend(var nextName: String? = null) :
+    CheckpointFakeBackend(checkpointRestartsWorkload = true) {
+    override fun create(spec: ContainerSpec): SandboxHandle = RenamingHandle(spec).also { created += spec }
+    override fun createCheckpoint(handle: SandboxHandle, ref: String): String {
+        if (failCreateCheckpoint) error("simulated backend checkpoint failure")
+        handle as RenamingHandle
+        nextName?.let { handle.spec = handle.spec.copy(name = it) }
+        committed += handle.id to ref
+        return ref
+    }
 }
 
 class GenericContainerCheckpointTest {
@@ -237,6 +264,45 @@ class GenericContainerCheckpointTest {
             assertEquals(1, backend.installedLinks.size,
                 "installNetworkLinks must not be called again when checkpointRestartsWorkload is false")
         } finally { app.stop(); stub.stop() }
+    }
+
+    // --- a renaming backend's LiveContainers entry must be re-keyed ---
+
+    @Test fun `checkpoint re-keys LiveContainers when the backend renames the handle mid-checkpoint`() {
+        val backend = RenamingCheckpointFakeBackend(nextName = "renamed-fresh-name")
+        val c = GenericContainer("alpine:3.19").withBackend(backend).waitingFor(CheckpointReady)
+        c.start()
+        val originalName = backend.created.single().name
+        try {
+            assertTrue(LiveContainers.snapshot().any { it.handle.spec.name == originalName },
+                "expected $originalName to be registered after a successful start")
+
+            c.checkpoint()
+
+            assertFalse(LiveContainers.snapshot().any { it.handle.spec.name == originalName },
+                "the old name's LiveContainers entry must be re-keyed away once the backend renames the handle")
+            assertTrue(LiveContainers.snapshot().any { it.handle.spec.name == "renamed-fresh-name" },
+                "LiveContainers must reflect the handle's new id after a renaming checkpoint")
+        } finally {
+            c.stop()
+            assertFalse(LiveContainers.snapshot().any { it.handle.spec.name == "renamed-fresh-name" },
+                "stop() must deregister under the CURRENT (post-rename) name")
+        }
+    }
+
+    @Test fun `checkpoint never touches LiveContainers when the backend does not rename the handle`() {
+        // The common case (docker, and every OTHER fake in this suite): oldName == the post-call
+        // name, so the re-key branch must be a no-op — proven by an entry-count check rather than
+        // by name, since the name itself never changes.
+        val backend = CheckpointFakeBackend()
+        val c = GenericContainer("alpine:3.19").withBackend(backend).waitingFor(CheckpointReady)
+        c.start()
+        try {
+            val before = LiveContainers.snapshot().size
+            c.checkpoint()
+            assertEquals(before, LiveContainers.snapshot().size,
+                "a non-renaming backend's checkpoint must not add or remove any LiveContainers entry")
+        } finally { c.stop() }
     }
 
     // --- fromCheckpoint ---

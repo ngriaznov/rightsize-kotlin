@@ -189,9 +189,10 @@ class MsbCheckpointNameReleaseTest {
             Files.writeString(rmLingerCounter, "2")   // armed only now — see the field's own comment above
 
             val effectiveRef = backend.createCheckpoint(handle, "rz-ckpt-0123456789ab")
+            val freshName = handle.id   // rewritten in place by the reboot — never sandboxName
 
-            assertTrue(sandboxName in backend.runningSandboxNames(),
-                "the sandbox must be Running again once createCheckpoint returns")
+            assertTrue(freshName in backend.runningSandboxNames(),
+                "the sandbox must be Running again, under the fresh name, once createCheckpoint returns")
             assertTrue(effectiveRef.endsWith("snap_0123456789abcdef0123456789abcdef"))
 
             val between = callsBetweenRmAndRestore(callLog, sandboxName)
@@ -276,14 +277,56 @@ class MsbCheckpointNameReleaseTest {
             Files.writeString(callLog, "")
 
             val effectiveRef = backend.createCheckpoint(handle, "rz-ckpt-0123456789ab")
+            val freshName = handle.id   // rewritten in place by the reboot — never sandboxName
 
-            assertTrue(sandboxName in backend.runningSandboxNames(),
-                "the sandbox must be Running again once createCheckpoint returns")
+            assertTrue(freshName in backend.runningSandboxNames(),
+                "the sandbox must be Running again, under the fresh name, once createCheckpoint returns")
             assertTrue(effectiveRef.endsWith("snap_0123456789abcdef0123456789abcdef"))
 
-            val restoreCalls = Files.readAllLines(callLog).count { it.startsWith("restore ") }
-            assertEquals(6, restoreCalls,
+            val restoreCalls = Files.readAllLines(callLog).filter { it.startsWith("restore ") }
+            assertEquals(6, restoreCalls.size,
                 "restore must have run exactly 6 times: 5 already-exists failures plus the succeeding retry")
+            assertTrue(restoreCalls.all { "--name $freshName" in it },
+                "every retry must keep targeting the SAME fresh name: $restoreCalls")
+        } finally {
+            backend.stop(handle)
+            backend.remove(handle)
+        }
+    }
+
+    @Test fun `createCheckpoint retries once on a single already-exists refusal against the fresh name, then succeeds`() {
+        // Red-proof (c): the already-exists retry machinery still fires against the FRESH name
+        // (not the original) — a single forced refusal, the minimal case, distinct from the
+        // 5-failures test above which exists to pin the wall-clock-budget shape itself.
+        assumeFalse(Platform.current()?.isWindows == true, "POSIX-only fake binary; see doc comment")
+        val marker = Files.createTempFile("rz-marker-", "").also { Files.deleteIfExists(it) }
+        val callLog = Files.createTempFile("rz-calllog-", "")
+        val sandboxName = "rz-ckpt-alreadyexists-once-test"
+        val rmLingerCounter = unsetFlag("rz-linger-once-")   // name frees immediately — isolates this retry
+        val restoreFailCounter = Files.createTempFile("rz-restorefail-once-", "")
+            .also { Files.writeString(it, "1") }   // the next restore invocation fails, the 2nd succeeds
+        val lsGlitchCounter = unsetFlag("rz-lsglitch-once-")
+        val backend = MsbCliBackend(
+            fakeMsbNameReleaseLifecycle(
+                marker, callLog, sandboxName, rmLingerCounter, restoreFailCounter, lsGlitchCounter))
+        val spec = ContainerSpec(name = sandboxName, image = "irrelevant", runId = "run1", command = listOf("serve"))
+        val handle = backend.create(spec)
+        try {
+            backend.start(handle)
+            Files.writeString(callLog, "")
+
+            backend.createCheckpoint(handle, "rz-ckpt-0123456789ab")
+            val freshName = handle.id
+
+            assertNotEquals(sandboxName, freshName)
+            assertTrue(freshName in backend.runningSandboxNames(),
+                "the sandbox must be Running again, under the fresh name, once createCheckpoint returns")
+            val restoreCalls = Files.readAllLines(callLog).filter { it.startsWith("restore ") }
+            assertEquals(2, restoreCalls.size,
+                "restore must have run exactly twice: the fresh name's own already-exists refusal, " +
+                    "plus the succeeding retry")
+            assertTrue(restoreCalls.all { "--name $freshName" in it },
+                "every retry must keep targeting the SAME fresh name, never falling back to the original: $restoreCalls")
         } finally {
             backend.stop(handle)
             backend.remove(handle)
@@ -332,8 +375,12 @@ class MsbCheckpointNameReleaseTest {
                 backend.createCheckpoint(handle, "rz-ckpt-0123456789ab")
             }
             val elapsedMs = (System.nanoTime() - started) / 1_000_000
+            // handle.spec/id is rewritten to the fresh name BEFORE the reboot is attempted (see
+            // createCheckpoint's own doc), so this still reflects the name actually retried against,
+            // never sandboxName (the original, never passed to restore at all).
+            val freshName = handle.id
 
-            assertTrue(e.message!!.contains(sandboxName), "message must name the sandbox: ${e.message}")
+            assertTrue(e.message!!.contains(freshName), "message must name the sandbox actually retried against: ${e.message}")
             assertTrue(e.message!!.contains("already exists"), "message must carry msb's own refusal: ${e.message}")
             assertTrue(e.message!!.contains("restorable via GenericContainer.fromCheckpoint"),
                 "message must point at the preserved checkpoint: ${e.message}")
@@ -375,9 +422,10 @@ class MsbCheckpointNameReleaseTest {
             Files.writeString(lsGlitchCounter, "2")   // armed only now — the first 2 `ls` calls fail outright
 
             val effectiveRef = backend.createCheckpoint(handle, "rz-ckpt-0123456789ab")
+            val freshName = handle.id   // rewritten in place by the reboot — never sandboxName
 
-            assertTrue(sandboxName in backend.runningSandboxNames(),
-                "the sandbox must be Running again once createCheckpoint returns")
+            assertTrue(freshName in backend.runningSandboxNames(),
+                "the sandbox must be Running again, under the fresh name, once createCheckpoint returns")
             assertTrue(effectiveRef.endsWith("snap_0123456789abcdef0123456789abcdef"))
 
             val between = callsBetweenRmAndRestore(callLog, sandboxName)

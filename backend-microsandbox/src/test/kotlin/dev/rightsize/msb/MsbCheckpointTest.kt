@@ -1,5 +1,7 @@
 package dev.rightsize.msb
 
+import dev.rightsize.RunId
+import dev.rightsize.core.CacheDir
 import dev.rightsize.core.ContainerSpec
 import dev.rightsize.core.PortBinding
 import dev.rightsize.core.TmpfsRootCheckpointException
@@ -153,7 +155,7 @@ class MsbCheckpointTest {
 
     private fun unsetFlag(prefix: String): Path = Files.createTempFile(prefix, "").also { Files.deleteIfExists(it) }
 
-    @Test fun `createCheckpoint drives exactly stop, snapshot create, rm, then an msb restore re-boot keeping ports but dropping env`() {
+    @Test fun `createCheckpoint drives exactly stop, snapshot create, rm, then an msb restore re-boot under a fresh name keeping ports but dropping env`() {
         assumeFalse(Platform.current()?.isWindows == true, "POSIX-only fake binary; see doc comment")
         val marker = Files.createTempFile("rz-marker-", "").also { Files.deleteIfExists(it) }
         val callLog = Files.createTempFile("rz-calllog-", "")
@@ -174,11 +176,18 @@ class MsbCheckpointTest {
             Files.writeString(callLog, "")   // only createCheckpoint's own calls matter below
 
             val effectiveRef = backend.createCheckpoint(handle, "rz-ckpt-0123456789ab")
+            val freshName = handle.id   // rewritten in place by createCheckpoint's own reboot
 
             assertEquals(fakeEffectiveRef("rz-ckpt-test"), effectiveRef,
                 "createCheckpoint must return the artifact path captured from snapshot create's stdout, not the input ref")
-            assertTrue("rz-ckpt-test" in backend.runningSandboxNames(),
-                "the sandbox must be Running again once createCheckpoint returns")
+            assertNotEquals("rz-ckpt-test", freshName,
+                "the reboot must mint a FRESH sandbox name, never reuse the original (see docs/checkpoints.md)")
+            assertTrue(freshName.startsWith("rz-${RunId.value}-"),
+                "the fresh name must come from the ordinary rz-<runid>-<n> generator, not a second naming scheme: $freshName")
+            assertTrue(freshName in backend.runningSandboxNames(),
+                "the sandbox must be Running again, under the fresh name, once createCheckpoint returns")
+            assertFalse("rz-ckpt-test" in backend.runningSandboxNames(),
+                "the original name must no longer be live once the reboot has happened under a fresh one")
 
             val calls = nonPollingCalls(callLog)
             assertEquals(listOf(
@@ -189,7 +198,7 @@ class MsbCheckpointTest {
             assertEquals(5, calls.size,
                 "no extra commands beyond stop/snapshot-create/rm/restore/exec-revival: $calls")
             val reboot = calls[3]
-            assertTrue(reboot.startsWith("restore $effectiveRef --name rz-ckpt-test"),
+            assertTrue(reboot.startsWith("restore $effectiveRef --name $freshName"),
                 "unexpected re-boot argv: $reboot")
             assertFalse("--disk-only" in reboot,
                 "msb 0.7.1 rejects --disk-only for a disk-scope snapshot — restore must never emit it: $reboot")
@@ -199,11 +208,144 @@ class MsbCheckpointTest {
             assertFalse("irrelevant" in reboot, "the ordinary image arg must not appear on a restore: $reboot")
 
             // The workload-revival exec: upstream's restore boots the sandbox idle, so this is
-            // what actually re-runs the checkpointed workload — WITH the env restore itself drops.
+            // what actually re-runs the checkpointed workload — WITH the env restore itself drops,
+            // and targeting the FRESH name (handle.id was rewritten before this exec was spawned).
             val revival = calls[4]
-            assertEquals("exec -e FOO=bar rz-ckpt-test -- serve", revival,
+            assertEquals("exec -e FOO=bar $freshName -- serve", revival,
                 "the revival exec must carry the checkpoint's own env (which restore itself never " +
-                    "gets to pass) and the spec's explicit command: $revival")
+                    "gets to pass) and the spec's explicit command, against the fresh name: $revival")
+        } finally {
+            backend.stop(handle)
+            backend.remove(handle)
+        }
+    }
+
+    @Test fun `checkpoint reboots under a fresh name different from the original, and a subsequent stop targets the new name`() {
+        // Red-proof (a): the restore argv never names the original sandbox, and every operation
+        // against the handle afterward — here, stop() — keeps working transparently against
+        // whatever name the reboot actually used.
+        assumeFalse(Platform.current()?.isWindows == true, "POSIX-only fake binary; see doc comment")
+        val marker = Files.createTempFile("rz-marker-", "").also { Files.deleteIfExists(it) }
+        val callLog = Files.createTempFile("rz-calllog-", "")
+        val snapshotFailFlag = unsetFlag("rz-snapfail-")
+        val rebootFailFlag = unsetFlag("rz-rebootfail-")
+        val malformedFlag = unsetFlag("rz-malformed-")
+        val backend = MsbCliBackend(fakeMsbCheckpointLifecycle(marker, callLog, snapshotFailFlag, rebootFailFlag, malformedFlag))
+        val originalName = "rz-ckpt-freshname-test"
+        val spec = ContainerSpec(name = originalName, image = "irrelevant", runId = "run1", command = listOf("serve"))
+        val handle = backend.create(spec)
+        backend.start(handle)
+        try {
+            backend.createCheckpoint(handle, "rz-ckpt-0123456789ab")
+            val freshName = handle.id
+
+            assertNotEquals(originalName, freshName)
+            val reboot = nonPollingCalls(callLog).first { it.startsWith("restore ") }
+            assertTrue("--name $freshName" in reboot, "restore argv must target the fresh name: $reboot")
+            assertFalse("--name $originalName" in reboot, "restore argv must never target the original name: $reboot")
+
+            Files.writeString(callLog, "")
+            backend.stop(handle)
+            assertEquals(listOf("stop $freshName"), nonPollingCalls(callLog),
+                "a subsequent stop() must target the fresh name the reboot actually used, not the original")
+        } finally {
+            backend.remove(handle)
+        }
+    }
+
+    @Test fun `createCheckpoint appends the fresh name to the reaper's run ledger before ever invoking restore`(
+        @TempDir tmp: Path,
+    ) {
+        // Red-proof (b): the ledger append (Reaper.beforeCreate -> RunLedger.beforeSandboxCreate)
+        // must land on disk BEFORE the restore subprocess is even spawned — the same
+        // append-before-create discipline an ordinary GenericContainer.start() gets — not merely
+        // by the time createCheckpoint() returns. The fake's own `restore)` case snapshots the
+        // real ledger sandboxes file (RIGHTSIZE_CACHE_DIR/RIGHTSIZE_REAPER are pinned for this
+        // module's test task — see build.gradle.kts) the instant it is invoked, which is the
+        // ledger test seam this proves the ordering through.
+        assumeFalse(Platform.current()?.isWindows == true, "POSIX-only fake binary; see doc comment")
+        val marker = Files.createTempFile("rz-marker-", "").also { Files.deleteIfExists(it) }
+        val callLog = Files.createTempFile("rz-calllog-", "")
+        val ledgerAtRestoreFile = tmp.resolve("ledger-at-restore.txt")
+        val sandboxesFile = CacheDir.resolve().resolve("runs").resolve("${RunId.value}.sandboxes")
+        val script = Files.createTempFile("rz-fake-msb-ledger", "")
+        Files.writeString(
+            script,
+            """
+            |#!/bin/sh
+            |cmd="${'$'}1"
+            |echo "${'$'}*" >> "$callLog"
+            |shift
+            |case "${'$'}cmd" in
+            |  run)
+            |    name=""
+            |    while [ "${'$'}#" -gt 0 ]; do
+            |      case "${'$'}1" in --name) name="${'$'}2"; shift 2 ;; *) shift ;; esac
+            |    done
+            |    echo "${'$'}name" > "$marker"
+            |    while [ -f "$marker" ]; do sleep 0.05; done
+            |    exit 0
+            |    ;;
+            |  restore)
+            |    snapshot="${'$'}1"; shift
+            |    name=""
+            |    while [ "${'$'}#" -gt 0 ]; do
+            |      case "${'$'}1" in --name) name="${'$'}2"; shift 2 ;; *) shift ;; esac
+            |    done
+            |    cat "$sandboxesFile" > "$ledgerAtRestoreFile" 2>/dev/null || : > "$ledgerAtRestoreFile"
+            |    echo "${'$'}name" > "$marker"
+            |    exit 0
+            |    ;;
+            |  exec)
+            |    while [ "${'$'}#" -gt 0 ]; do case "${'$'}1" in --) shift; break ;; *) shift ;; esac; done
+            |    while [ -f "$marker" ]; do sleep 0.05; done
+            |    exit 0
+            |    ;;
+            |  ls)
+            |    if [ -f "$marker" ]; then
+            |      n=${'$'}(cat "$marker")
+            |      echo "[{\"name\":\"${'$'}n\",\"status\":\"Running\"}]"
+            |    else
+            |      echo "[]"
+            |    fi
+            |    ;;
+            |  stop) rm -f "$marker"; exit 0 ;;
+            |  rm) exit 0 ;;
+            |  snapshot)
+            |    if [ "${'$'}1" = "create" ]; then
+            |      shift 2; sandbox="${'$'}1"; shift; shift
+            |      destdir="/fake-msb-store"
+            |      while [ "${'$'}#" -gt 0 ]; do
+            |        case "${'$'}1" in --dest-dir) destdir="${'$'}2"; shift 2 ;; *) shift ;; esac
+            |      done
+            |      echo "Snapshot ID: fake0000-0000-0000-0000-000000000000"
+            |      echo "${'$'}destdir/${'$'}sandbox/snap_0123456789abcdef0123456789abcdef"
+            |      exit 0
+            |    fi
+            |    exit 0
+            |    ;;
+            |  *) exit 0 ;;
+            |esac
+            |""".trimMargin(),
+        )
+        script.toFile().setExecutable(true)
+
+        val backend = MsbCliBackend(script)
+        val spec = ContainerSpec(name = "rz-ckpt-ledger-test", image = "irrelevant", runId = "run1", command = listOf("serve"))
+        val handle = backend.create(spec)
+        try {
+            backend.start(handle)
+
+            backend.createCheckpoint(handle, "rz-ckpt-0123456789ab")
+            val freshName = handle.id
+
+            assertTrue(Files.exists(ledgerAtRestoreFile),
+                "the restore call must have run (and snapshotted the ledger) for this file to exist")
+            val ledgerAtRestoreTime = Files.readAllLines(ledgerAtRestoreFile)
+            assertTrue(freshName in ledgerAtRestoreTime,
+                "the fresh name must already be in the reaper ledger's sandboxes file by the moment restore " +
+                    "is invoked — append-before-create, the same discipline an ordinary create uses: " +
+                    ledgerAtRestoreTime)
         } finally {
             backend.stop(handle)
             backend.remove(handle)
@@ -298,6 +440,11 @@ class MsbCheckpointTest {
             val e = assertThrows(IllegalStateException::class.java) {
                 backend.createCheckpoint(handle, "rz-ckpt-0123456789ab")
             }
+            // handle.spec/id is rewritten to the fresh name BEFORE the reboot is even attempted
+            // (see createCheckpoint's own doc), so this still reflects it even though the reboot failed.
+            val freshName = handle.id
+            assertNotEquals("rz-ckpt-reboot-fail-test", freshName,
+                "the fresh name must have been minted and applied even though the reboot itself failed")
             assertTrue(e.message!!.contains(effectiveRef),
                 "message must name the EFFECTIVE ref, not the input hint: ${e.message}")
             assertTrue(e.message!!.contains("fromCheckpoint"), "message must name the recovery path: ${e.message}")
@@ -306,13 +453,15 @@ class MsbCheckpointTest {
 
             assertFalse("rz-ckpt-reboot-fail-test" in backend.runningSandboxNames(),
                 "a failed re-boot must not be misreported as the sandbox running again")
+            assertFalse(freshName in backend.runningSandboxNames(),
+                "the fresh name must not be misreported as running either, when the reboot itself failed")
             val calls = nonPollingCalls(callLog)
             assertEquals(listOf(
                 "stop rz-ckpt-reboot-fail-test",
                 "snapshot create --from-sandbox rz-ckpt-reboot-fail-test rz-ckpt-0123456789ab",
                 "rm rz-ckpt-reboot-fail-test",
             ), calls.take(3), "the re-boot attempt must follow a successful snapshot and rm: $calls")
-            assertTrue(calls[3].startsWith("restore $effectiveRef --name rz-ckpt-reboot-fail-test"),
+            assertTrue(calls[3].startsWith("restore $effectiveRef --name $freshName"),
                 "unexpected re-boot argv: ${calls[3]}")
         } finally {
             backend.stop(handle)
@@ -389,6 +538,7 @@ class MsbCheckpointTest {
             Files.writeString(callLog, "")
 
             val effectiveRef = backend.createCheckpoint(handle, refHint)
+            val freshName = handle.id
 
             assertTrue(Files.isDirectory(destDir), "createCheckpoint must create the ref hint's parent dir")
             val expectedRef = fakeEffectiveRef("rz-ckpt-path-test", destDir.toString())
@@ -400,8 +550,9 @@ class MsbCheckpointTest {
                 "snapshot create --from-sandbox rz-ckpt-path-test rz-ckpt-0123456789ab --dest-dir $destDir",
                 calls[1],
             )
-            assertTrue(calls[3].startsWith("restore $expectedRef --name rz-ckpt-path-test"),
-                "re-boot must use the CAPTURED artifact path, not the original --dest-dir ref hint, as restore's positional: ${calls[3]}")
+            assertTrue(calls[3].startsWith("restore $expectedRef --name $freshName"),
+                "re-boot must use the CAPTURED artifact path, not the original --dest-dir ref hint, as restore's " +
+                    "positional, and the fresh name (not the original) as --name: ${calls[3]}")
         } finally {
             backend.stop(handle)
             backend.remove(handle)

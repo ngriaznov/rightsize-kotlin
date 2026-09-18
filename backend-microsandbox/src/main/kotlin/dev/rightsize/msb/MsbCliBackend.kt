@@ -3,7 +3,9 @@ package dev.rightsize.msb
 import dev.rightsize.RunId
 import dev.rightsize.core.*
 import dev.rightsize.core.checkpoint.CheckpointRegistry
+import dev.rightsize.core.reaper.Reaper
 import dev.rightsize.core.reuse.SandboxNameCollisionException
+import dev.rightsize.nextSandboxName
 import java.io.InputStream
 import java.nio.file.Files
 import java.nio.file.Path
@@ -49,6 +51,16 @@ import java.util.concurrent.atomic.AtomicBoolean
  * (~30s) so production behavior is unchanged. Without it, red-proofing "the collision never
  * clears" would mean a unit test actually blocking for that real budget; tests reach it via
  * [forHost] to shrink it, exactly like [restoreReadinessBudgetMs].
+ *
+ * [createCheckpoint]'s reboot restores under a FRESHLY GENERATED sandbox name (via
+ * [dev.rightsize.nextSandboxName], the same `rz-<runId>-<n>` generator/counter an ordinary boot
+ * uses), never the checkpointed container's own pre-checkpoint name — see that method's doc for
+ * why (msb's Windows-only sandbox-directory-retention lag, which a same-name restore cannot
+ * outrun no matter how long it waits, but a fresh name sidesteps outright). [awaitNameReleased]
+ * and [rebootRetryingNameCollision] both predate that fix and still run, unchanged, as defense in
+ * depth against a name collision that is now vanishingly unlikely (a freshly generated name
+ * colliding with something else live) rather than the near-certainty a same-name restore faced —
+ * kept live deliberately, per the class's own don't-remove-working-defenses posture, not dead code.
  */
 class MsbCliBackend private constructor(
     internal val msb: Path,
@@ -71,8 +83,17 @@ class MsbCliBackend private constructor(
         hardwareIsolated = true, checkpoint = true, checkpointRestartsWorkload = true,
         checkpointRestoreOverridable = false)
 
-    internal class Handle(override val spec: ContainerSpec) : SandboxHandle {
-        override val id = spec.name
+    /**
+     * [spec] is `var` (not the `val` every other [SandboxHandle] implementation in this codebase
+     * uses) so [createCheckpoint]'s fresh-name reboot can rewrite it in place — [id] is a computed
+     * property reading straight off the current [spec], so mutating [spec] alone keeps the
+     * `Handle.id == spec.name` invariant every downstream caller (exec/logs/stop/rm/state — see
+     * [findRunning]'s own doc) already relies on, with no second field to fall out of sync.
+     * `@Volatile` matches [attached]'s own annotation: cheap visibility for a field a
+     * `checkpoint()` call can rewrite on one thread while another reads it (`logs`/`exec`/...).
+     */
+    internal class Handle(@Volatile override var spec: ContainerSpec) : SandboxHandle {
+        override val id: String get() = spec.name
         @Volatile var attached: Process? = null
         val resources = CopyOnWriteArrayList<AutoCloseable>()  // tunnels etc.
     }
@@ -625,7 +646,8 @@ class MsbCliBackend private constructor(
      * [stop] itself (the same backend-internal stop this SPI method's own caller would otherwise
      * reach — it closes exec tunnels and reaps the supervising attached process, and touches
      * neither `startedNames` nor the reaper ledger, both of which only [remove] and
-     * `GenericContainer`'s own bookkeeping touch) rather than duplicating its cleanup.
+     * `GenericContainer`'s own bookkeeping touch) rather than duplicating its cleanup. This
+     * method's OWN reboot step below is a different matter — see the fresh-name paragraph.
      *
      * Restoring is NOT `msb start`. Upstream, `msb start` is `Sandbox::start_detached`, and on
      * Windows the detached spawn passes `CREATE_BREAKAWAY_FROM_JOB` — a flag that fails with
@@ -635,17 +657,50 @@ class MsbCliBackend private constructor(
      * retry ever clears it. `msb restore` (unlike `msb start`) passes no creation flags and
      * works everywhere, so the resume step here is instead: remove the stopped sandbox (its
      * disk state now lives entirely in the snapshot) and boot a fresh sandbox from that
-     * snapshot under the SAME name/ports/memory limit (NOT env — see [MsbCommands.restore]'s
-     * doc), via [spawnAndAwaitRunning] — the exact boot path [start] itself uses, just fed
-     * [handle]'s own spec with `checkpointRef` set to the EFFECTIVE ref (`spawnAttachedRun`
-     * then routes to `MsbCommands.restore`, emitting `restore <ref> --name <name>` in place of
-     * an ordinary `run <image>` boot — never `--disk-only`, which msb 0.7.1 rejects for a
-     * disk-scope snapshot; see that method's doc). [Handle.attached] ends up holding the
-     * revived workload's `msb exec` child once this returns successfully (see
-     * [spawnWorkloadExecChild]'s doc) — a plain `msb restore` boot is childless by design (see
-     * [awaitRestoreRunning]'s doc), but this backend no longer leaves it that way: upstream's
-     * restore brings the sandbox up idle, so [spawnAndAwaitRunning] itself starts the workload
-     * before returning. `id`/`spec` — the ledger-relevant identity — are untouched.
+     * snapshot under a FRESH generated name, keeping the same ports/memory limit (NOT env —
+     * see [MsbCommands.restore]'s doc), via [spawnAndAwaitRunning] — the exact boot path [start]
+     * itself uses, just fed a COPY of [handle]'s own spec with `name` rewritten and
+     * `checkpointRef` set to the EFFECTIVE ref (`spawnAttachedRun` then routes to
+     * `MsbCommands.restore`, emitting `restore <ref> --name <freshName>` in place of an ordinary
+     * `run <image>` boot — never `--disk-only`, which msb 0.7.1 rejects for a disk-scope
+     * snapshot; see that method's doc). [Handle.attached] ends up holding the revived workload's
+     * `msb exec` child once this returns successfully (see [spawnWorkloadExecChild]'s doc) — a
+     * plain `msb restore` boot is childless by design (see [awaitRestoreRunning]'s doc), but this
+     * backend no longer leaves it that way: upstream's restore brings the sandbox up idle, so
+     * [spawnAndAwaitRunning] itself starts the workload before returning.
+     *
+     * **Fresh name, not the original.** msb's own existence check for a restore target is
+     * "DB record present OR on-disk directory present", and on Windows the just-`rm`'d sandbox's
+     * directory has been observed on CI outliving its DB record by seconds under load — a lag
+     * [awaitNameReleased] (which only proves the DB record gone) and [rebootRetryingNameCollision]
+     * (a bounded already-exists retry) were both added to wait out, but a same-name restore issued
+     * into that gap can still refuse "already exists" for as long as the directory lingers, which
+     * is not a fixed bound. A restore under a FRESHLY GENERATED name — minted via
+     * [dev.rightsize.nextSandboxName], the exact `rz-<runId>-<n>` generator/counter an ordinary
+     * boot already uses, never a second naming scheme — never collides with the just-removed
+     * sandbox's own lingering directory at all, sidestepping the lag entirely rather than racing
+     * it. The sandbox's NAME across a checkpoint was always an implementation detail, never a
+     * documented contract (ports/env/memory/disk state all still carry over unchanged); this is
+     * a behavior note, not an API break — see the CHANGELOG. [awaitNameReleased] and
+     * [rebootRetryingNameCollision] both stay exactly as they were: harmless, dormant defense
+     * in depth (a freshly generated name colliding with something else live is now
+     * vanishingly unlikely, not the near-certainty a same-name restore risked), never removed.
+     *
+     * The fresh name is what [handle]'s own `id`/`spec` are rewritten to IN PLACE before the
+     * reboot is attempted (so every subsequent operation against [handle] —
+     * `GenericContainer.checkpoint()`'s own post-return `stop()`/`exec()`/`logs()`, and this
+     * reboot's own [awaitRestoreRunning]/[spawnWorkloadExecChild] steps — already target the new
+     * name, whether or not the reboot itself ultimately succeeds), and it is what's appended to
+     * the reaper's run ledger via [Reaper.beforeCreate] — BEFORE the restore attempt, the exact
+     * same append-before-create discipline [Reaper.beforeCreate]'s own doc describes for an
+     * ordinary [SandboxBackend.create] — and to [startedNames] once the reboot actually succeeds
+     * (mirroring [start]'s own ordering: tracked only after a successful boot, never before). The
+     * OLD name's ledger entry is deliberately left as-is: it is never removed here (this reboot
+     * bypasses the public [remove] the ledger's `afterSandboxRemoved` call is normally paired
+     * with), so it is picked up by the ledger's own not-found-tolerant sweep instead — attempting
+     * to reap a name that is already gone is exactly what that sweep already tolerates for a
+     * concurrently-cleaned-up sandbox. `LiveContainers`' own re-keying is `GenericContainer`'s
+     * concern, not this backend's — see `GenericContainer.checkpoint()`'s own doc.
      *
      * When [handle]'s own [ContainerSpec.command] is unset (the container ran its image's
      * default entrypoint), THIS method captures a workload cmdline from the guest — via
@@ -703,21 +758,22 @@ class MsbCliBackend private constructor(
         // error here: it just means nothing gets persisted below, and a later restore of this
         // ref surfaces CheckpointMissingWorkloadCommandException instead of booting idle.
         val capturedCommand = if (handle.spec.command == null) captureWorkloadCmdline(handle) else null
+        val oldName = handle.id   // captured before stop/rm/rename below ever touch it
         stop(handle)
         val refPath = Path.of(ref)
         val destDir = if (refPath.isAbsolute) refPath.parent else null
         val snapshotName = if (refPath.isAbsolute) refPath.fileName.toString() else ref
         destDir?.let { Files.createDirectories(it) }
-        val snap = invoke(MsbCommands.snapshotCreate(handle.id, snapshotName, destDir), SNAPSHOT_TIMEOUT_SEC)
+        val snap = invoke(MsbCommands.snapshotCreate(oldName, snapshotName, destDir), SNAPSHOT_TIMEOUT_SEC)
         if (snap.exitCode != 0) {
-            error("msb snapshot create --from-sandbox ${handle.id} $snapshotName failed (exit ${snap.exitCode}): " +
-                "${snap.stderr.trim().ifEmpty { snap.stdout.trim() }} — sandbox ${handle.id} is left " +
-                "stopped; resume it by hand with `msb start ${handle.id}`.")
+            error("msb snapshot create --from-sandbox $oldName $snapshotName failed (exit ${snap.exitCode}): " +
+                "${snap.stderr.trim().ifEmpty { snap.stdout.trim() }} — sandbox $oldName is left " +
+                "stopped; resume it by hand with `msb start $oldName`.")
         }
         val effectiveRef = parseSnapshotCreateArtifactPath(snap.stdout)
-            ?: error("msb snapshot create --from-sandbox ${handle.id} $snapshotName succeeded but its " +
+            ?: error("msb snapshot create --from-sandbox $oldName $snapshotName succeeded but its " +
                 "output did not end with an absolute artifact path: '${snap.stdout.trim()}' — sandbox " +
-                "${handle.id} is left stopped; resume it by hand with `msb start ${handle.id}`.")
+                "$oldName is left stopped; resume it by hand with `msb start $oldName`.")
         // Persisted against the EFFECTIVE ref (not the input hint) — the exact ref a later
         // restore's spec.checkpointRef carries, whether this checkpoint is ever given a name or
         // not (CheckpointRegistry.writeCapturedCommand is keyed by ref alone; see its own doc).
@@ -727,21 +783,41 @@ class MsbCliBackend private constructor(
         if (capturedCommand != null) {
             runCatching { CheckpointRegistry(checkpointRegistryDir).writeCapturedCommand(effectiveRef, capturedCommand) }
         }
-        invoke(MsbCommands.rm(handle.id), STOP_TIMEOUT_SEC)
+        invoke(MsbCommands.rm(oldName), STOP_TIMEOUT_SEC)
         // Windows-only in practice (same deferred-teardown lag family as RestoreAccessDeniedException's
         // file-handle release, see awaitNameReleased's own doc): `rm` above can return before the
-        // sandbox record/name is actually released, and a restore issued into that gap fails outright
-        // with msb's own "already exists" error instead of ever reaching the sandbox it's recreating.
-        awaitNameReleased(handle.id)
+        // sandbox record/name is actually released. Kept as dormant defense in depth even though the
+        // fresh-name reboot below no longer depends on it (see this method's own class-level doc
+        // paragraph on why) — never removed, per this class's don't-remove-working-defenses posture.
+        awaitNameReleased(oldName)
+        // Fresh generated name for the reboot — see this method's own doc for why never oldName.
+        val freshName = nextSandboxName()
+        val freshSpec = handle.spec.copy(name = freshName, checkpointRef = effectiveRef)
+        // Ledger append BEFORE the restore attempt, exactly like an ordinary create (see
+        // Reaper.beforeCreate's own doc) — the old name's entry is deliberately left alone, for
+        // the ledger's own not-found-tolerant sweep to pick up (see this method's own doc).
+        Reaper.beforeCreate(this, freshSpec)
+        // Rewritten in place before the reboot is even attempted, so every subsequent operation —
+        // including this reboot's own awaitRestoreRunning/spawnWorkloadExecChild — already targets
+        // the fresh name, whether or not the reboot itself ultimately succeeds (see this method's
+        // own doc: a caller reading handle.id out of a caught exception still sees the name actually
+        // attempted).
+        handle.spec = freshSpec
         try {
             // Defense in depth alongside the wait just above, for the same lag family — see
             // rebootRetryingNameCollision's own doc for why this, not spawnAndAwaitRunning directly.
-            handle.attached = rebootRetryingNameCollision(handle, handle.spec.copy(checkpointRef = effectiveRef))
+            handle.attached = rebootRetryingNameCollision(handle, freshSpec)
         } catch (e: Exception) {
-            error("re-booting sandbox ${handle.id} from checkpoint $effectiveRef failed: ${e.message} — the " +
+            error("re-booting sandbox $freshName from checkpoint $effectiveRef failed: ${e.message} — the " +
                 "sandbox was removed but its state is preserved in checkpoint $effectiveRef, restorable via " +
                 "GenericContainer.fromCheckpoint.")
         }
+        // Tracked only after a successful boot, mirroring start()'s own ordering — see this
+        // method's own doc. The old name was added to startedNames back when this container
+        // originally started; swapping (rather than merely adding) keeps this set from growing
+        // one stale entry per checkpoint() call on a repeatedly-checkpointed container.
+        startedNames -= oldName
+        startedNames += freshName
         return effectiveRef
     }
 
@@ -774,6 +850,13 @@ class MsbCliBackend private constructor(
      * teardown is still in flight — polls again instead of reading as the name being free. Only an
      * exit-0, successfully-parsed listing that omits [name] is a confirmed release; anything else
      * (a nonzero exit, unparseable stdout, or the name still present) keeps polling.
+     *
+     * [createCheckpoint] now reboots under a freshly generated name rather than [name] itself, so
+     * this wait no longer gates that reboot's own success the way it did when the restore target
+     * WAS [name] — a fresh name can never collide with [name]'s own lingering directory. Kept
+     * running regardless, as dormant defense in depth (see [createCheckpoint]'s own doc): still a
+     * meaningful signal in its own right (whether msb's teardown of the source sandbox actually
+     * completed), and removing it would be removing working code for no behavioral gain.
      */
     private fun awaitNameReleased(name: String) {
         val deadline = System.currentTimeMillis() + CHECKPOINT_NAME_RELEASE_BUDGET_MS
@@ -799,6 +882,13 @@ class MsbCliBackend private constructor(
      * ([SandboxNameCollisionException]) — defense in depth alongside [awaitNameReleased] above,
      * for the exact same Windows deferred-teardown lag family, in case the name frees in the gap
      * between that poll's last check and the instant `restore` itself re-checks it.
+     *
+     * [createCheckpoint] now reboots under a freshly generated name (see its own doc), so [spec]
+     * here almost never collides with anything — a same-name restore's near-certain collision
+     * window against its own just-removed sandbox's lingering directory doesn't exist for a fresh
+     * name at all. This retry stays live regardless, as dormant defense in depth for the residual
+     * (vanishingly unlikely) case of a fresh name colliding with some OTHER still-live sandbox —
+     * never removed, per this class's don't-remove-working-defenses posture.
      *
      * Same wall-clock-budget shape as [spawnAndAwaitRunning]'s own install-lock retry above
      * ([INSTALL_LOCK_RETRY_BUDGET_MS]/[INSTALL_LOCK_RETRY_DELAY_MS]) — a deadline, not an attempt

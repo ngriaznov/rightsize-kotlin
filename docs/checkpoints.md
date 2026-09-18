@@ -33,7 +33,7 @@ Both backends support checkpoint/restore today, via different mechanisms:
 
 | | Docker | microsandbox |
 |---|---|---|
-| Mechanism | Commit the running container to a new image | Stop the sandbox, snapshot its disk, and boot it back from that snapshot under the same name and ports |
+| Mechanism | Commit the running container to a new image | Stop the sandbox, snapshot its disk, and boot it back from that snapshot under a freshly generated sandbox name, keeping the same ports |
 | Source container afterward | Undisturbed — never stopped | Briefly stopped, then running again |
 | Workload | Never restarts | Restarts (the VM reboots) |
 | `capabilities.checkpointRestartsWorkload` | `false` | `true` |
@@ -41,9 +41,29 @@ Both backends support checkpoint/restore today, via different mechanisms:
 
 microsandbox's `msb snapshot create` requires the sandbox stopped, so `checkpoint()` there runs
 `msb stop` → `msb snapshot create --from-sandbox <sandbox> <name> --dest-dir <cache-dir>/checkpoints`
-→ `msb rm <sandbox>` → `msb restore <ref> --name <sandbox>` under the same name and ports — the
-sandbox ends up running again under the same name, but its workload command re-ran from scratch
-to get there. As of msb 0.7.1, `--from-sandbox` always writes a DISK-scope snapshot, and restoring
+→ `msb rm <sandbox>` → `msb restore <ref> --name <freshName>` — a FRESHLY GENERATED sandbox name
+(`rz-<runId>-<n>`, the exact same generator/counter an ordinary boot already uses, not a second
+naming scheme), never the original sandbox's own name. Ports/memory limit carry over unchanged;
+the workload command re-ran from scratch to get there either way. The live handle's `id`/`spec`
+are rewritten to the fresh name in place before the reboot is attempted, so every subsequent call
+against it — `exec`/`logs`/`stop`/`removeCheckpoint`'s later use — keeps working transparently
+without the caller ever seeing or needing to know the new name.
+
+**Why not the same name.** `msb rm` on Windows can return before the sandbox's on-disk directory
+is actually released — msb's own existence check for a restore target is "DB record present OR
+directory present", and the directory has been observed on Windows CI outliving the DB record by
+multiple seconds under load. A same-name restore issued into that gap fails outright with msb's
+own "already exists" error, for as long as the directory lingers — not a fixed bound, so no retry
+budget can be sized to reliably outlast it. A restore under a freshly generated name never
+collides with the just-removed sandbox's own lingering directory at all, sidestepping the whole
+lag rather than racing it. The sandbox's name across a checkpoint was always an implementation
+detail, never a documented contract — nothing in this library's public API names it. (The
+already-exists retry budget and the post-`rm` `msb ls` name-release wait below both predate this
+fix and still run, as harmless, now largely dormant defense in depth — a freshly generated name
+colliding with some other still-live sandbox is vanishingly unlikely, unlike the near-certainty a
+same-name restore risked on a loaded Windows host.)
+
+As of msb 0.7.1, `--from-sandbox` always writes a DISK-scope snapshot, and restoring
 one is inherently a cold boot of the captured disk alone (no resumed RAM/processes, matching this
 library's filesystem-only checkpoint semantics) — with **no** `--disk-only` flag: msb 0.7.1
 REJECTS that flag outright for a disk-scope source (`invalid config: disk_only requires a full
@@ -52,6 +72,11 @@ command are never re-passed either way (`msb restore` has no `-e`/`--env` flag a
 trailing-command flag at all, unlike `msb run`) — restore replays the sandbox's own captured
 configuration instead, which for this same-container reboot is exactly what was already running a
 moment earlier.
+
+The reaper's run ledger (see [reaping.md](reaping.md)) tracks the fresh name the same way it
+tracks an ordinary create — appended before the restore is attempted — and simply leaves the old
+name's own entry for its existing not-found-tolerant sweep to pick up, since the sandbox under
+that name is already gone by then.
 
 `msb restore` is **not** supervised the way `msb run` is. Per upstream's own doc, `restore` boots
 a new *detached* sandbox: the `restore` process activates it and exits — typically within seconds,

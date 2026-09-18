@@ -26,6 +26,19 @@ object RunId { val value: String = toHexString(System.nanoTime()).takeLast(8) }
 private val counter = AtomicInteger()
 
 /**
+ * Mints the next sequential sandbox name for this run: `rz-<RunId.value>-<n>` — the ONE naming
+ * scheme/counter every fresh sandbox this process creates shares, whether that's
+ * [createStartedContainer]'s own ordinary boot or `MsbCliBackend.createCheckpoint`'s fresh-name
+ * reboot (see docs/checkpoints.md: msb never fully releases a just-removed sandbox's on-disk
+ * directory on Windows, so restoring under the checkpoint's OLD name can refuse "already exists"
+ * long after `msb rm` returns — restoring under a newly minted name sidesteps that lag entirely
+ * instead of racing it). Public, not `internal` — Kotlin scopes `internal` per Gradle module, and
+ * `backend-microsandbox` is a separate module from this one; a second, private counter over there
+ * would be a second naming scheme, not a shared one.
+ */
+fun nextSandboxName(): String = "rz-${RunId.value}-${counter.incrementAndGet()}"
+
+/**
  * A single sandboxed container, built with a Testcontainers-shaped fluent API and run by
  * whichever [dev.rightsize.core.SandboxBackend] is active (Docker or microsandbox). Configure it
  * with the `withX` builders, call [start] to boot it, and use [getMappedPort]/[host]/[logs]/
@@ -319,6 +332,17 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
      * links same as it kills the workload, and a bare return would also hand back a false-ready
      * container (e.g. msb's loopback forwarder accepts TCP before the guest listens). Docker's
      * checkpoint leaves the container undisturbed, so neither re-install nor re-wait happens there.
+     *
+     * A backend MAY reboot [h] under a different sandbox name than it had before this call —
+     * microsandbox does exactly that (see `MsbCliBackend.createCheckpoint`'s doc: restoring under
+     * a freshly generated name sidesteps a Windows-only directory-retention lag that a same-name
+     * restore cannot). [h] itself is unaffected as an object (same identity, `stop()`/`exec()`/
+     * etc. below keep working against it transparently — the backend already updated its own
+     * `id`/`spec` in place before returning), but [LiveContainers]' registry is keyed by NAME, not
+     * by handle identity, and was registered under the PRE-checkpoint name back in [start] — so a
+     * rename here is re-keyed explicitly, the only piece of bookkeeping this method (rather than
+     * the backend) owns. A backend that never renames (docker, any fake) makes [oldName] and
+     * [h]'s current name compare equal, so this is a no-op there.
      */
     fun checkpoint(name: String? = null): Checkpoint {
         if (name != null) validateCheckpointName(name)
@@ -339,7 +363,12 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
         // directory (see SandboxBackend.createCheckpoint's doc and MsbCliBackend's own). Every
         // downstream use (the returned Checkpoint, the named-checkpoint registry entry) uses
         // THIS value, never refHint.
+        val oldName = h.spec.name   // captured before the backend call in case it renames h in place
         val ref = backend.createCheckpoint(h, refHint)
+        if (h.spec.name != oldName) {
+            LiveContainers.deregister(oldName)
+            LiveContainers.register(h, backend, host)
+        }
         if (backend.capabilities.checkpointRestartsWorkload) {
             if (startNetworkLinks.isNotEmpty()) backend.installNetworkLinks(h, startNetworkLinks)
             waitStrategy.waitUntilReady(waitTarget())
@@ -550,7 +579,7 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
         repeat(PORT_BIND_ATTEMPTS) {
             allocatePorts()
             var spec = ContainerSpec(
-                name = "rz-${RunId.value}-${counter.incrementAndGet()}",
+                name = nextSandboxName(),
                 image = image,
                 env = env.toMap(),
                 command = command,

@@ -9,9 +9,15 @@ dependencies {
 }
 
 // MsbCliBackend.importCheckpoint resolves CacheDir.resolve() to derive the checkpoints
-// directory `msb snapshot load --dest` writes under. Pin it to a build-local dir here, the
-// same rationale (and the same env var) core/build.gradle.kts already pins its own `test` task
-// to, so a fake-msb-binary unit test never touches the developer's real `~/.cache/rightsize`.
+// directory `msb snapshot load --dest` writes under, and MsbCliBackend.createCheckpoint's
+// fresh-name reboot now calls the real Reaper singleton directly (see its own doc) to append the
+// fresh name to the run ledger before the restore attempt. Pin both env vars to build-local/inert
+// values here, the same rationale core/build.gradle.kts already pins its own `test` task with:
+// RIGHTSIZE_CACHE_DIR keeps a fake-msb-binary unit test off the developer's real
+// `~/.cache/rightsize`, and RIGHTSIZE_REAPER=sweep keeps the ledger writes (needed to red-proof
+// the append-before-restore ordering) while skipping ON's detached watchdog-process spawn, which
+// a unit test must never trigger.
 tasks.named<Test>("test") {
     environment("RIGHTSIZE_CACHE_DIR", layout.buildDirectory.dir("test-cache/rightsize").get().asFile.absolutePath)
+    environment("RIGHTSIZE_REAPER", "sweep")
 }

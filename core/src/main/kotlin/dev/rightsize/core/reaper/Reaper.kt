@@ -10,7 +10,12 @@ import dev.rightsize.core.SandboxBackend
  * logic lives in [ReaperEngine], unit-tested directly against temp directories and fake
  * backends; this object exists only so [dev.rightsize.core.Backends] and
  * [dev.rightsize.GenericContainer]/[dev.rightsize.Network] have one process-wide instance to
- * call into. See docs/reaping.md for the mechanism.
+ * call into. `dev.rightsize.msb.MsbCliBackend.createCheckpoint` is the one backend-module caller
+ * of [beforeCreate]: its fresh-name reboot mints a new sandbox name mid-checkpoint (see that
+ * method's own doc) and must append it to the ledger before attempting the restore, the same
+ * timing an ordinary [dev.rightsize.GenericContainer.start] gets — no core-module call site can
+ * straddle that boundary, since the backend's own SPI call is what actually issues the restore.
+ * See docs/reaping.md for the mechanism.
  */
 object Reaper {
     private val engine = ReaperEngine(

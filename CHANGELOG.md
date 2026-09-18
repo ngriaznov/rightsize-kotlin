@@ -127,15 +127,37 @@ reaches its first tagged release.
   misclassified — is now treated as a transient boot failure and retried, bounded, with a short
   backoff, the same shape this library's other classified boot-transient retries already use.
   The classifier itself is platform-agnostic code; the signature simply never occurs on Unix.
-- **`createCheckpoint` now waits out msb's asynchronous sandbox-name release on Windows before
-  rebooting from the snapshot**, polling `msb ls` (bounded, briefly) after `rm` so the reboot no
-  longer races a lingering name into msb's own "already exists" refusal. `msb ls` only proves the
-  sandbox's database record is gone, though — msb 0.7.1's `restore` itself also refuses
-  "already exists" while the sandbox's on-disk directory still exists, and that directory has
-  been observed on Windows CI outliving the database record by more than 3.5 seconds under load.
-  The reboot itself now retries on that refusal with a genuine ~30-second budget (2-second
+- **`createCheckpoint`'s reboot now restores under a freshly generated sandbox name, not the
+  checkpointed container's own original name.** msb's own existence check for a restore target
+  is "DB record present OR on-disk directory present", and on Windows the just-`rm`'d sandbox's
+  directory has been observed on CI outliving its DB record by multiple seconds under load — so a
+  same-name restore issued into that gap can refuse "already exists" for as long as the directory
+  lingers, which is not a fixed bound no retry budget can reliably outlast. Restoring under a
+  freshly generated name instead (`rz-<runId>-<n>`, the exact same generator/counter an ordinary
+  boot already uses) never collides with the just-removed sandbox's own lingering directory at
+  all, sidestepping the whole lag rather than racing it. Ports, env, memory limit, and captured
+  disk state all still carry over unchanged; only the sandbox's own name does not — that name was
+  always an implementation detail of the reboot, never a documented contract, so this is a
+  behavior note, not an API change (no public signature moved). The live container handle's
+  identity is rewritten in place before the reboot is attempted, so `exec`/`logs`/`stop`/a later
+  `removeCheckpoint` all keep working transparently against it with no caller-visible change, and
+  the reaper's run ledger tracks the fresh name the same append-before-create way it tracks an
+  ordinary boot, leaving the old name's entry for its own not-found-tolerant sweep. This refines
+  the entry immediately below (the post-`rm` `msb ls` name-release wait, and the reboot's own
+  already-exists retry budget): both are KEPT, unchanged, as dormant defense in depth — a freshly
+  generated name colliding with something else live is now vanishingly unlikely, never removed —
+  but neither one gates the common case anymore, since a fresh name has nothing of its own to
+  race in the first place.
+- **`createCheckpoint` waits out msb's asynchronous sandbox-name release on Windows before
+  rebooting from the snapshot**, polling `msb ls` (bounded, briefly) after `rm`. `msb ls` only
+  proves the sandbox's database record is gone, though — msb 0.7.1's `restore` itself also
+  refuses "already exists" while the sandbox's on-disk directory still exists, and that directory
+  has been observed on Windows CI outliving the database record by more than 3.5 seconds under
+  load. The reboot itself retries on that refusal with a genuine ~30-second budget (2-second
   intervals) instead of the handful of retries at a few hundred milliseconds this previously
-  shipped with, so the retry actually outlives the lag instead of merely hedging against it.
+  shipped with, so the retry actually outlives the lag instead of merely hedging against it. (See
+  the entry above: as of the fresh-name reboot, this wait and this retry budget are dormant
+  defense in depth rather than what the common case depends on.)
 
 ## [0.7.9] - 2026-09-10
 
