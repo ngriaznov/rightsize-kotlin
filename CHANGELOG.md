@@ -7,6 +7,10 @@ reaches its first tagged release.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.7.10] - 2026-09-18
+
 ### Changed
 
 - **The pinned microsandbox release is now 0.7.1** (from 0.6.18). Upstream's 0.7.0/0.7.1
@@ -921,7 +925,8 @@ Initial public release.
   exactly once; any other failure, or a second failure after the heal,
   propagates unchanged.
 
-[Unreleased]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.9...HEAD
+[Unreleased]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.10...HEAD
+[0.7.10]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.9...v0.7.10
 [0.7.9]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.8...v0.7.9
 [0.7.8]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.7...v0.7.8
 [0.7.7]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.6...v0.7.7
