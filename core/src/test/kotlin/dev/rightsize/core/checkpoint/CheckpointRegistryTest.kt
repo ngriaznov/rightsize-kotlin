@@ -430,6 +430,44 @@ class CheckpointRegistryTest {
         assertEquals(listOf("new-command"), registry.readCapturedCommand(ref))
     }
 
+    // --- exposedUdpPorts (UDP Phase 1): round-trips, and backward compat for a record written
+    // before this field existed ---
+
+    @Test fun `write then read round-trips exposedUdpPorts alongside exposedPorts`(@TempDir tmp: Path) {
+        val registry = CheckpointRegistry(tmp)
+        val r = CheckpointRecord(
+            name = "udp-case", ref = "rightsize/checkpoint:0123456789ab", backend = "docker",
+            createdIso = "2026-09-19T12:00:00Z",
+            spec = CheckpointSpec(
+                env = emptyMap(), command = null, exposedPorts = listOf(53), memoryLimitMb = null,
+                exposedUdpPorts = listOf(53, 5353),
+            ),
+        )
+        registry.write("udp-case", r)
+        val read = registry.read("udp-case")
+        assertEquals(r, read)
+        assertEquals(listOf(53, 5353), read!!.spec.exposedUdpPorts)
+    }
+
+    @Test fun `a record with no exposedUdpPorts key at all - written before UDP support existed - still parses, defaulting to empty`(@TempDir tmp: Path) {
+        val registry = CheckpointRegistry(tmp)
+        Files.createDirectories(tmp.resolve("checkpoints"))
+        // Byte-for-byte the shape toJson() produced before exposedUdpPorts existed: no such key
+        // anywhere in the spec object.
+        val preUdpJson = """
+            {"name":"pre-udp","ref":"rightsize/checkpoint:0123456789ab","backend":"docker",
+            "createdIso":"2026-01-01T00:00:00Z","spec":{"env":{},"command":null,
+            "exposedPorts":[8080],"memoryLimitMb":null}}
+        """.trimIndent().replace("\n", "")
+        Files.writeString(registry.file("pre-udp"), preUdpJson)
+
+        val read = registry.read("pre-udp")
+        assertNotNull(read, "a pre-UDP record must still parse")
+        assertEquals(listOf(8080), read!!.spec.exposedPorts)
+        assertEquals(emptyList<Int>(), read.spec.exposedUdpPorts,
+            "a record predating exposedUdpPorts must read it back as empty, not fail to parse")
+    }
+
     @Test fun `readCapturedCommand returns null for a corrupt capture file rather than throwing`(@TempDir tmp: Path) {
         val registry = CheckpointRegistry(tmp)
         val ref = "/snapshots/some-sandbox/snap_abc"

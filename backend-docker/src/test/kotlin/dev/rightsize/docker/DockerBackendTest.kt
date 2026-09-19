@@ -5,6 +5,7 @@ import com.github.dockerjava.api.exception.NotFoundException
 import dev.rightsize.core.ContainerSpec
 import dev.rightsize.core.FileMount
 import dev.rightsize.core.PortBinding
+import dev.rightsize.core.PortProtocol
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.Assertions.*
 import java.nio.file.Path
@@ -90,6 +91,35 @@ class DockerBackendTest {
     // networkDisabled-reacts-via-ports regression would actually fail this test instead of
     // comparing two configs that were empty on every field but memory to begin with.
     private fun withoutArrayIdentityHashes(s: String) = s.replace(Regex("@[0-9a-fA-F]+"), "")
+
+    // --- UDP Phase 1: create-body port keys become "<guest>/tcp" or "<guest>/udp" ---
+
+    @Test fun `hostConfigFor emits a udp port-binding key for a udp PortBinding, tcp keys unchanged`() {
+        val spec = ContainerSpec(
+            name = "rz-abcd1234-1", image = "alpine", runId = "abcd1234",
+            ports = listOf(
+                PortBinding(hostPort = 23456, guestPort = 80),
+                PortBinding(hostPort = 23457, guestPort = 53, protocol = PortProtocol.UDP),
+            ),
+        )
+        val keys = DockerBackend().hostConfigFor(spec).portBindings.bindings.keys.map { it.toString() }.toSet()
+        assertEquals(setOf("80/tcp", "53/udp"), keys)
+    }
+
+    // Same-port-53-on-both-protocols mapping integrity, at the docker create-body level: DNS-style
+    // dual exposure of the SAME guest port number must produce two distinct, non-colliding keys.
+    @Test fun `hostConfigFor emits distinct keys for the same guest port exposed on both protocols`() {
+        val spec = ContainerSpec(
+            name = "rz-abcd1234-1", image = "alpine", runId = "abcd1234",
+            ports = listOf(
+                PortBinding(hostPort = 11153, guestPort = 53),
+                PortBinding(hostPort = 11154, guestPort = 53, protocol = PortProtocol.UDP),
+            ),
+        )
+        val bindings = DockerBackend().hostConfigFor(spec).portBindings.bindings
+        assertEquals(2, bindings.size, "tcp:53 and udp:53 must be two distinct map entries: ${bindings.keys}")
+        assertEquals(setOf("53/tcp", "53/udp"), bindings.keys.map { it.toString() }.toSet())
+    }
 
     @Test fun `hostConfigFor ignores diskLimitMb, tmpfsRootMb, and networkDisabled`() {
         val base = ContainerSpec(

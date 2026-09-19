@@ -7,7 +7,41 @@ reaches its first tagged release.
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- **UDP port exposure (Phase 1).** `PortBinding` gains a `protocol` field (`PortProtocol.TCP` |
+  `PortProtocol.UDP`, defaulting to `TCP`) — every existing spec/producer still means TCP, and a
+  checkpoint-registry entry written before this field existed reads it back as `TCP`. A new
+  builder, `GenericContainer.withExposedUdpPorts(vararg ports: Int)`, backed by a field entirely
+  separate from `withExposedPorts`, declares guest ports to publish over UDP; a new, distinct
+  accessor, `getMappedUdpPort(guestPort: Int): Int` (never an overload of `getMappedPort`),
+  resolves the assigned host port. A container may expose the SAME guest port number on both
+  protocols at once (e.g. DNS's 53) — the two protocols' mapped ports never collide. UDP host
+  ports are allocated by probing a UDP socket, not a TCP one (a TCP bind proves nothing about an
+  independent UDP port table). Docker publishes each UDP port with a native `<port>/udp` binding;
+  the microsandbox backend publishes it with `-p host:guest/udp` on both `msb run` and `msb
+  restore` (a checkpoint reboot, or an ordinary `fromCheckpoint(...).start()` restore, re-publishes
+  a UDP mapping exactly like the original boot). `CheckpointSpec` gains `exposedUdpPorts`, carried
+  through `checkpoint()`/`fromCheckpoint` the same way `exposedPorts` always has, and reads back as
+  empty for a pre-UDP registry entry. `ReuseIdentitySpec` gains `exposedUdpPorts` (folded into the
+  reuse identity hash the same omit-when-empty way `diskLimitMb`/`tmpfsRootMb`/`networkDisabled`
+  are, so the pinned cross-language hash vector stays pinned) — a container exposing a port over
+  TCP and one exposing the same numeric port over UDP are never interchangeable for reuse.
+  `NetworkLink` gains the same trailing `protocol` field; `Network` carries a UDP-exposed member's
+  mapped port through as a UDP-tagged link. **Wait-strategy caveat:** a UDP-exposed port is
+  invisible to `Wait.forListeningPort()` by construction — the default wait only ever enumerates
+  `withExposedPorts`-declared ports — so a container exposing only UDP ports is vacuously ready
+  under the default wait; use `Wait.forLogMessage(...)` (or a custom `AbstractWaitStrategy`) for a
+  UDP-only service instead. **microsandbox network limitation:** msb has no direct guest-to-guest
+  networking at all — `Network`'s emulation there is a TCP exec-tunnel relay with no UDP
+  equivalent — so joining an msb `Network` where any member's link would be UDP now fails
+  `start()` fast with a typed `UnsupportedByBackendException` (before any tunnel/hosts work),
+  naming the guest port/alias and pointing at two remedies: the docker backend for real
+  container-to-container UDP, or publishing the UDP service on a host port
+  (`withExposedUdpPorts` + `getMappedUdpPort`) instead of a network alias. Container-to-container
+  UDP over a `Network` remains Docker-only in this phase; see
+  [Networking](docs/concepts/networking.md#udp) for the full picture. Existing public signatures
+  and behavior are unchanged — everything here is additive.
 
 ## [0.7.10] - 2026-09-18
 

@@ -1,6 +1,7 @@
 package dev.rightsize.msb
 
 import dev.rightsize.core.ContainerSpec
+import dev.rightsize.core.PortProtocol
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import java.nio.file.Path
@@ -24,7 +25,7 @@ object MsbCommands {
         // `--net private` keeps published ports and private-range network links working while
         // blocking public-internet egress — `--net none` was tried and breaks port forwarding.
         if (spec.networkDisabled) { add("--net"); add("private") }
-        spec.ports.forEach { add("-p"); add("${it.hostPort}:${it.guestPort}") }
+        spec.ports.forEach { add("-p"); add(portArg(it)) }
         spec.env.forEach { (k, v) -> add("-e"); add("$k=$v") }
         // The option block is always spelled out, never left to msb's defaults, for two
         // reasons on top of each other. The access token (`ro`/`rw`) carries
@@ -116,8 +117,15 @@ object MsbCommands {
         add("restore"); add(ref)
         add("--name"); add(spec.name)
         spec.memoryLimitMb?.let { add("-m"); add("${it}M") }
-        spec.ports.forEach { add("-p"); add("${it.hostPort}:${it.guestPort}") }
+        spec.ports.forEach { add("-p"); add(portArg(it)) }
     }
+
+    /** `<host>:<guest>`, with a trailing `/udp` for a UDP [dev.rightsize.core.PortBinding] — the
+     * one place both [run] and [restore] decide a `-p` argument's shape, so a checkpoint reboot
+     * or an ordinary `fromCheckpoint(...).start()` restore re-publishes a UDP mapping exactly like
+     * the original `run` did, never silently dropping back to TCP. */
+    private fun portArg(binding: dev.rightsize.core.PortBinding): String =
+        "${binding.hostPort}:${binding.guestPort}" + if (binding.protocol == PortProtocol.UDP) "/udp" else ""
 
     fun exec(name: String, cmd: List<String>) = listOf("exec", name, "--") + cmd
     fun execStream(name: String, cmd: List<String>) = listOf("exec", "--stream", name, "--") + cmd

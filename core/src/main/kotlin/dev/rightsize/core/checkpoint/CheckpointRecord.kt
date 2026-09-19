@@ -9,7 +9,9 @@ import dev.rightsize.core.CheckpointSpec
  * after the backend checkpoint itself succeeds (see `GenericContainer.checkpoint(name)`). Field
  * names and nesting are pinned identically across the three rightsize libraries
  * (parity-testable): `name`, `ref`, `backend`, `createdIso`, and a nested `spec` object mirroring
- * [CheckpointSpec] itself (`env`, `command`, `exposedPorts`, `memoryLimitMb`). Hand-rolled JSON
+ * [CheckpointSpec] itself (`env`, `command`, `exposedPorts`, `memoryLimitMb`, `exposedUdpPorts`).
+ * `exposedUdpPorts` reads back as `emptyList()` when a record predates it entirely (see [parse]'s
+ * own comment) — every checkpoint recorded before UDP exposure existed still parses. Hand-rolled JSON
  * for the same reason [dev.rightsize.core.reaper.RunRecord]/[dev.rightsize.core.reuse.ReuseRecord]
  * are: no JSON library dependency in `core`, and the shape is simple enough that a tiny tolerant
  * reader/writer is cheaper than adding one just for this.
@@ -45,7 +47,9 @@ data class CheckpointRecord(
         append(",\"exposedPorts\":[")
         spec.exposedPorts.forEachIndexed { i, p -> if (i > 0) append(','); append(p) }
         append("],\"memoryLimitMb\":").append(spec.memoryLimitMb?.toString() ?: "null")
-        append("}}")
+        append(",\"exposedUdpPorts\":[")
+        spec.exposedUdpPorts.forEachIndexed { i, p -> if (i > 0) append(','); append(p) }
+        append("]}}")
     }
 
     companion object {
@@ -62,9 +66,17 @@ data class CheckpointRecord(
             val (_, command) = extractCommand(specText) ?: return null
             val exposedPorts = extractExposedPorts(specText) ?: return null
             val (_, memoryLimitMb) = extractNullableLong(specText, "memoryLimitMb") ?: return null
+            // Absent entirely (backward compat: every record written before UDP exposure
+            // existed) reads as empty, exactly the "not captured" default CheckpointSpec.exposedUdpPorts
+            // itself defaults to — present-but-malformed is still a hard parse failure, same as
+            // every other field here.
+            val exposedUdpPorts = extractExposedPorts(specText, "exposedUdpPorts", missingIsEmpty = true) ?: return null
             return CheckpointRecord(
                 name, ref, backend, createdIso,
-                CheckpointSpec(env = env, command = command, exposedPorts = exposedPorts, memoryLimitMb = memoryLimitMb),
+                CheckpointSpec(
+                    env = env, command = command, exposedPorts = exposedPorts, memoryLimitMb = memoryLimitMb,
+                    exposedUdpPorts = exposedUdpPorts,
+                ),
             )
         }
 
@@ -136,8 +148,16 @@ data class CheckpointRecord(
             return STRING_PAIR.findAll(body).associate { m -> unescape(m.groupValues[1]) to unescape(m.groupValues[2]) }
         }
 
-        private fun extractExposedPorts(specText: String): List<Int>? {
-            val arr = extractArray(specText, "exposedPorts") ?: return null
+        /**
+         * [key] defaults to `"exposedPorts"`, the field every valid record has always carried.
+         * [missingIsEmpty] (used only for `"exposedUdpPorts"`, see [parse]'s own comment) makes
+         * the key's total ABSENCE from [specText] resolve to `emptyList()` instead of a parse
+         * failure — the backward-compat case for a record written before UDP exposure existed —
+         * while a key that IS present but malformed (not an array, or an unparseable element)
+         * still resolves to `null`, a hard failure, exactly as for every other field here.
+         */
+        private fun extractExposedPorts(specText: String, key: String = "exposedPorts", missingIsEmpty: Boolean = false): List<Int>? {
+            val arr = extractArray(specText, key) ?: return if (missingIsEmpty) emptyList() else null
             val body = arr.substring(1, arr.length - 1)   // strip the outer '['/']'
             if (body.isBlank()) return emptyList()
             return body.split(',').map { it.trim().toIntOrNull() ?: return null }

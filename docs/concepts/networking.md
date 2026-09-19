@@ -102,6 +102,48 @@ such constraints. If your test genuinely needs sustained bidirectional
 container-to-container traffic, running it under `RIGHTSIZE_BACKEND=docker` is the
 straightforward answer — see [Backends](../backends.md) for how to force a backend.
 
+## UDP
+
+`withExposedUdpPorts(vararg ports: Int)` is the UDP sibling of `withExposedPorts` — a
+separate builder, backed by a separate field, publishing to a separate host port map read
+back with `getMappedUdpPort(guestPort)` (never an overload of `getMappedPort`, since a
+container can expose the SAME guest port number on both protocols at once — DNS's 53 is the
+usual example — and the two protocols' mapped host ports must never be ambiguous):
+
+```kotlin
+val dns = GenericContainer("your-dns-image:tag")
+    .withExposedUdpPorts(53)
+    .waitingFor(Wait.forLogMessage(".*ready.*"))   // see the wait-strategy caveat below
+dns.start()
+val hostPort = dns.getMappedUdpPort(53)   // reachable via a plain DatagramSocket
+```
+
+Both backends publish it: Docker via a native `<port>/udp` binding, microsandbox via
+`-p host:guest/udp` on both `msb run` and a checkpoint restore (`msb restore`) — a UDP
+mapping survives a checkpoint/restore cycle exactly like a TCP one does.
+
+**Wait-strategy caveat.** `withExposedUdpPorts` is invisible to
+[`Wait.forListeningPort()`](wait-strategies.md) by construction — the default wait only ever
+enumerates ports declared via `withExposedPorts`. A container that exposes **only** UDP ports
+is therefore vacuously ready under the default wait, the same as a container that exposes
+nothing at all. Give a UDP-only container an explicit `Wait.forLogMessage(...)` (or a custom
+`AbstractWaitStrategy` that actually probes the UDP service) rather than relying on the
+default — see [Wait Strategies](wait-strategies.md).
+
+**Container-to-container UDP over a `Network` is Docker-only in this phase.** Docker's native
+networking carries UDP the same as TCP, no different from anything else described above. On
+microsandbox, `Network` is emulated with a TCP exec-tunnel relay (see
+[What's actually happening underneath](#whats-actually-happening-underneath)) — there is no
+UDP equivalent, because microsandbox has no direct guest-to-guest networking at all to build
+one over. Joining an msb `Network` where any member's link would be UDP fails `start()` fast
+with a typed `UnsupportedByBackendException` naming the guest port and alias, before any
+tunnel/hosts work — the error's own remedy names both escape hatches:
+
+- run with `RIGHTSIZE_BACKEND=docker` for real container-to-container UDP, or
+- stay on microsandbox and publish the UDP service on a **host** port instead
+  (`withExposedUdpPorts` + `getMappedUdpPort`), having the consumer dial that host port rather
+  than a network alias — this is the msb-compatible pattern for UDP services in Phase 1.
+
 ## Cleanup
 
 `Network` implements `AutoCloseable` — `use { }` (as in the example above) or an

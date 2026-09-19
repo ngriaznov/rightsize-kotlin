@@ -24,6 +24,7 @@ import dev.rightsize.core.ContainerCopyException
 import dev.rightsize.core.ContainerSpec
 import dev.rightsize.core.ExecResult
 import dev.rightsize.core.PortBindConflictException
+import dev.rightsize.core.PortProtocol
 import dev.rightsize.core.SandboxBackend
 import dev.rightsize.core.SandboxHandle
 import dev.rightsize.core.WatchdogCommands
@@ -103,12 +104,13 @@ class DockerBackend : SandboxBackend {
     }
 
     /** The [HostConfig] [create] hands to the daemon — pulled out, same as [labelsFor], so a
-     * unit test can pin it without a daemon. */
+     * unit test can pin it without a daemon. UDP entries otherwise flow exactly like TCP ones —
+     * same loopback host binding — only [exposedPortFor] picks a different [ExposedPort]. */
     internal fun hostConfigFor(spec: ContainerSpec): HostConfig {
         val ports = spec.ports.map {
             PortBinding(
                 Ports.Binding.bindIpAndPort("127.0.0.1", it.hostPort),
-                ExposedPort.tcp(it.guestPort),
+                exposedPortFor(it),
             )
         }
         val binds = spec.mounts.map {
@@ -119,6 +121,13 @@ class DockerBackend : SandboxBackend {
         spec.memoryLimitMb?.let { host.withMemory(it * 1024 * 1024) }
         return host
     }
+
+    /** `<guest>/tcp` or `<guest>/udp`, per [dev.rightsize.core.PortBinding.protocol] — the one
+     * place both [hostConfigFor] (the port-bindings map) and [create] (`ExposedPorts`) decide the
+     * create-body key for a port, so the two can never drift apart on which protocol a binding
+     * actually publishes. */
+    private fun exposedPortFor(binding: dev.rightsize.core.PortBinding): ExposedPort =
+        if (binding.protocol == PortProtocol.UDP) ExposedPort.udp(binding.guestPort) else ExposedPort.tcp(binding.guestPort)
 
     /**
      * [ContainerSpec.diskLimitMb]/[ContainerSpec.tmpfsRootMb]/[ContainerSpec.networkDisabled] are
@@ -132,7 +141,7 @@ class DockerBackend : SandboxBackend {
         val cmd = client.createContainerCmd(spec.image)
             .withName(spec.name)
             .withEnv(spec.env.map { (k, v) -> "$k=$v" })
-            .withExposedPorts(spec.ports.map { ExposedPort.tcp(it.guestPort) })
+            .withExposedPorts(spec.ports.map { exposedPortFor(it) })
             .withHostConfig(host)
             .withLabels(labelsFor(spec))
         spec.command?.let { cmd.withCmd(it) }

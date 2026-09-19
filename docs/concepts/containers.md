@@ -10,6 +10,7 @@ rightsize doesn't ship a preconfigured module for.
 val container = GenericContainer("your-image:tag")
     .withEnv("KEY", "value")              // repeatable — call once per var
     .withExposedPorts(8080, 9090)         // guest ports to publish
+    .withExposedUdpPorts(53)               // guest ports to publish over UDP; see Networking#udp
     .withCommand("your-entrypoint", "arg") // overrides the image's default CMD
     .withNetwork(net)                      // joins a Network (see Networking)
     .withNetworkAliases("my-service")      // name siblings resolve this container as
@@ -29,6 +30,7 @@ just let the JUnit extension do it) to tear it down.
 | `isRunning: Boolean` | `true` from a successful `start()` until `stop()` |
 | `host: String` | Always `"127.0.0.1"` — both backends publish to loopback |
 | `getMappedPort(guestPort: Int): Int` | The host port a declared guest port landed on |
+| `getMappedUdpPort(guestPort: Int): Int` | The UDP sibling of `getMappedPort`, for a port declared via `withExposedUdpPorts` — a distinct accessor, never an overload, since the same guest port number can be exposed on both protocols at once. See [Networking](networking.md#udp). |
 | `logs: String` | Full captured logs so far |
 | `followOutput(consumer: (String) -> Unit): AutoCloseable` | Streams new log lines as they arrive; close the returned handle to stop delivery |
 | `execInContainer(vararg cmd: String): ExecResult` | Runs a command inside the running container; returns `exitCode`/`stdout`/`stderr` as **properties**, not Java-style getters |

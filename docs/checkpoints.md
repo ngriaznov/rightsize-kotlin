@@ -351,7 +351,8 @@ rightsize libraries — is:
     "env": {},
     "command": null,
     "exposedPorts": [5432],
-    "memoryLimitMb": null
+    "memoryLimitMb": null,
+    "exposedUdpPorts": []
   }
 }
 ```
@@ -359,6 +360,12 @@ rightsize libraries — is:
 `Checkpoint.find(name)`, `Checkpoint.list()`, and `Checkpoint.remove(name)` are the only supported
 way to read or write this file — treat it as an implementation detail, not a stable format to
 hand-edit.
+
+`exposedUdpPorts` (the container's `withExposedUdpPorts`-declared guest ports, kept apart from
+`exposedPorts` — see [Networking](concepts/networking.md#udp)) reads back as `[]` for a registry
+entry written before UDP exposure existed: an old file with no such key at all still parses.
+`GenericContainer.fromCheckpoint` re-seeds it into `withExposedUdpPorts(...)`, mirroring how
+`exposedPorts` feeds `withExposedPorts(...)`.
 
 ### find / list / remove
 

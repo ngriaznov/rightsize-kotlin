@@ -113,6 +113,32 @@ class ReuseIdentityTest {
         assertTrue(ReuseIdentity.canonicalJson(withControlByte).contains("\\u0001"))
     }
 
+    // --- exposedUdpPorts (UDP Phase 1) ---
+
+    // Same omit-when-default contract as diskLimitMb/tmpfsRootMb/networkDisabled: a spec that
+    // never touches UDP exposure must keep hashing identically to before this field existed —
+    // the whole point of the pinned vector staying pinned.
+    @Test fun `exposedUdpPorts at its default (empty) does not affect the hash`() {
+        assertEquals(pinnedHash, ReuseIdentity.hash(pinnedSpec))
+        assertFalse(ReuseIdentity.canonicalJson(pinnedSpec).contains("exposedUdpPorts"))
+    }
+
+    @Test fun `a non-empty exposedUdpPorts is part of the hash, sorted ascending`() {
+        val withUdp = pinnedSpec.copy(exposedUdpPorts = listOf(5353, 53))
+        assertNotEquals(ReuseIdentity.hash(pinnedSpec), ReuseIdentity.hash(withUdp))
+        assertTrue(ReuseIdentity.canonicalJson(withUdp).contains("\"exposedUdpPorts\":[53,5353]"))
+    }
+
+    // The requirement this whole field exists for: a container exposing port 53 over TCP and one
+    // exposing the SAME numeric port over UDP are not interchangeable for reuse and must never
+    // collide on identity.
+    @Test fun `a tcp-exposed port and the same numeric port exposed over udp never collide on hash`() {
+        val tcpOnly = pinnedSpec.copy(exposedPorts = listOf(53), exposedUdpPorts = emptyList())
+        val udpOnly = pinnedSpec.copy(exposedPorts = emptyList(), exposedUdpPorts = listOf(53))
+        assertNotEquals(ReuseIdentity.hash(tcpOnly), ReuseIdentity.hash(udpOnly),
+            "a tcp:53-exposed spec and a udp:53-exposed spec must hash differently")
+    }
+
     @Test fun `copies are order-independent, sorted by guestPath`() {
         val fileA = Files.createTempFile("rz-reuse-copy-", ".txt").also { Files.writeString(it, "a") }
         val fileB = Files.createTempFile("rz-reuse-copy-", ".txt").also { Files.writeString(it, "b") }

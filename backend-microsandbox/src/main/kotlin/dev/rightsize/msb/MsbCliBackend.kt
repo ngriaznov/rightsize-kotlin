@@ -1569,17 +1569,41 @@ class MsbCliBackend private constructor(
      * add `127.0.0.1 <alias>` to /etc/hosts, then spawn an [ExecTunnel] that repeatedly serves the
      * in-guest `nc -l -p <guestPort>` listener and pumps bytes to `127.0.0.1:<targetHostPort>`.
      *
-     * Four concerns, each its own step: reject duplicate guest ports, probe for `nc`, install the
-     * `/etc/hosts` aliases, then spawn one tunnel per link.
+     * Five concerns, each its own step: reject any UDP link outright, reject duplicate guest
+     * ports, probe for `nc`, install the `/etc/hosts` aliases, then spawn one tunnel per link.
      */
     override fun installNetworkLinks(handle: SandboxHandle, links: List<NetworkLink>) {
         if (links.isEmpty()) return
         handle as Handle
+        requireNoUdpLinks(links)
         requireNoDuplicateGuestPorts(links)
         requireAliasesAreValid(links)
         requireNcAvailable(handle)
         installHostsAliases(handle, links)
         links.forEach { handle.resources += ExecTunnel(msb, handle.id, it) }
+    }
+
+    /**
+     * msb has no direct guest-to-guest networking at all — this backend's `Network` emulation is
+     * a TCP exec-tunnel relay (see [ExecTunnel]), which has no UDP equivalent, so a UDP-tagged
+     * link is rejected outright, before the duplicate-port/alias/`nc` checks below even run (a
+     * UDP link can't be "fixed" by clearing any of those) — same
+     * unsupported-with-remedy [UnsupportedByBackendException] shape as [requireNcAvailable]'s own
+     * gap-naming guard. The remedy names both msb-compatible escape hatches: switch to the docker
+     * backend for real container-to-container UDP, or — staying on msb — publish the UDP service
+     * on a host port (`withExposedUdpPorts` + `getMappedUdpPort`) and have the consumer dial that
+     * instead of a network alias. See docs/concepts/networking.md's UDP section.
+     */
+    private fun requireNoUdpLinks(links: List<NetworkLink>) {
+        val udpLink = links.firstOrNull { it.protocol == PortProtocol.UDP } ?: return
+        throw UnsupportedByBackendException(
+            "container-to-container UDP network links (guest port ${udpLink.guestPort} on alias " +
+                "'${udpLink.alias}') — microsandbox has no guest-to-guest networking to emulate this over",
+            name,
+            remedy = "run this test with RIGHTSIZE_BACKEND=docker for real container-to-container UDP, " +
+                "or publish the UDP service on a host port with withExposedUdpPorts(...) + " +
+                "getMappedUdpPort(...) and have the consumer dial that instead of a network alias",
+        )
     }
 
     private fun requireNoDuplicateGuestPorts(links: List<NetworkLink>) {

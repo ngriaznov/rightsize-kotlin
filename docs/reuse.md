@@ -34,7 +34,7 @@ reuse-relevant subset of their configuration:
 ```text
 {image, env (sorted by key), command, exposedPorts (sorted), memoryLimitMb,
  copies: [{guestPath, sha256(content)}] sorted by guestPath,
- diskLimitMb, tmpfsRootMb, networkDisabled}
+ diskLimitMb, tmpfsRootMb, networkDisabled, exposedUdpPorts (sorted)}
 ```
 
 - `env` and `copies` are order-independent (sorted before hashing); `command` is not — argv
@@ -47,6 +47,10 @@ reuse-relevant subset of their configuration:
   and one without, are not interchangeable for reuse. Unlike `memoryLimitMb`, though, these three
   are omitted entirely (not rendered as `null`/`false`) when left at their default, so a spec that
   never touches them hashes identically to how it did before these fields existed.
+- `exposedUdpPorts` (the `withExposedUdpPorts` builder — see [Networking](concepts/networking.md#udp))
+  folds in the same omit-when-empty way: a container exposing port 53 over TCP and one exposing
+  the same numeric port over UDP are not interchangeable for reuse and never collide on identity,
+  but a spec that never touches UDP exposure hashes identically to before this field existed.
 - Host ports, the container name, and the network are **not** part of identity — a reuse
   container's host ports are whatever the first boot allocated (or whatever adoption finds),
   not something a caller chooses.

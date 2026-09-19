@@ -90,6 +90,111 @@ class GenericContainerTest {
         c.stop()
     }
 
+    // --- UDP Phase 1: withExposedUdpPorts / getMappedUdpPort (see docs/concepts/networking.md) ---
+
+    @Test fun `withExposedUdpPorts is plumbed as a separate PortBinding with protocol udp, resolved via getMappedUdpPort`() {
+        val backend = FakeBackend()
+        val c = container(backend).withExposedUdpPorts(53)
+        c.start()
+        try {
+            val binding = backend.created.single().ports.single()
+            assertEquals(53, binding.guestPort)
+            assertEquals(PortProtocol.UDP, binding.protocol)
+            assertTrue(binding.hostPort > 0)
+            assertEquals(binding.hostPort, c.getMappedUdpPort(53))
+        } finally { c.stop() }
+    }
+
+    // The requirement UDP host-port allocation exists for: the existing allocator proves a TCP
+    // port free by binding a ServerSocket, which proves nothing about UDP's independent OS port
+    // table. This doesn't re-implement that proof (FreePortsTest does), it just proves
+    // GenericContainer actually routes UDP exposure through FreePorts.allocateUdp — the
+    // resulting host port really is bindable as UDP.
+    @Test fun `an allocated udp mapped port is genuinely bindable as UDP on the host`() {
+        val backend = FakeBackend()
+        val c = container(backend).withExposedUdpPorts(53)
+        c.start()
+        try {
+            val hostPort = c.getMappedUdpPort(53)
+            java.net.DatagramSocket(hostPort, java.net.InetAddress.getByName("127.0.0.1")).use {
+                assertEquals(hostPort, it.localPort)
+            }
+        } finally { c.stop() }
+    }
+
+    // Same-port-53-on-both-protocols mapping integrity: a container may expose the SAME guest
+    // port number over both TCP and UDP (e.g. DNS), and the two protocols' mapped host ports
+    // must never collide or be confused with one another.
+    @Test fun `exposing guest port 53 on both tcp and udp yields two independent PortBindings and mapped host ports`() {
+        val backend = FakeBackend()
+        val c = container(backend).withExposedPorts(53).withExposedUdpPorts(53)
+        c.start()
+        try {
+            val spec = backend.created.single()
+            assertEquals(2, spec.ports.size, "tcp:53 and udp:53 must both appear, as two entries: ${spec.ports}")
+            val tcp = spec.ports.single { it.protocol == PortProtocol.TCP }
+            val udp = spec.ports.single { it.protocol == PortProtocol.UDP }
+            assertEquals(53, tcp.guestPort); assertEquals(53, udp.guestPort)
+            assertNotEquals(tcp.hostPort, udp.hostPort, "tcp:53 and udp:53 must never share a host port")
+            assertEquals(tcp.hostPort, c.getMappedPort(53))
+            assertEquals(udp.hostPort, c.getMappedUdpPort(53))
+            // Cross-accessor confusion check: fetching the TCP mapping never silently returns the
+            // UDP one or vice versa.
+            assertNotEquals(c.getMappedPort(53), c.getMappedUdpPort(53))
+        } finally { c.stop() }
+    }
+
+    @Test fun `getMappedUdpPort reports not-exposed for a port never declared via withExposedUdpPorts`() {
+        val backend = FakeBackend()
+        val c = container(backend).withExposedUdpPorts(53)
+        c.start()
+        try {
+            val e = assertThrows(IllegalStateException::class.java) { c.getMappedUdpPort(9999) }
+            assertTrue(e.message!!.contains("not exposed"), "should report the not-exposed error: ${e.message}")
+            assertTrue(e.message!!.contains("withExposedUdpPorts"), "should name the right builder: ${e.message}")
+        } finally { c.stop() }
+    }
+
+    @Test fun `getMappedUdpPort reports not-running before start`() {
+        val c = container(FakeBackend()).withExposedUdpPorts(53)
+        val e = assertThrows(IllegalStateException::class.java) { c.getMappedUdpPort(53) }
+        assertTrue(e.message!!.contains("not running"), "should report the not-running error: ${e.message}")
+    }
+
+    @Test fun `stop releases mapped udp ports back to FreePorts, same as tcp ports`() {
+        val backend = FakeBackend()
+        val c = container(backend).withExposedUdpPorts(53)
+        c.start()
+        val mappedUdp = c.getMappedUdpPort(53)
+        assertTrue(mappedUdp in FreePorts.issuedView())
+        c.stop()
+        assertFalse(mappedUdp in FreePorts.issuedView(),
+            "a udp mapped port must be released on stop, exactly like a tcp one")
+    }
+
+    // Wait-exclusion: a container exposing ONLY UDP ports is vacuously ready under the DEFAULT
+    // wait strategy (Wait.forListeningPort()), and its waitTarget never enumerates the UDP port —
+    // by construction, since withExposedUdpPorts is backed by a field entirely separate from
+    // withExposedPorts. Deliberately exercises the real default (no .waitingFor override) with a
+    // short startup timeout: if UDP exposure ever leaked into the TCP wait's exposedGuestPorts,
+    // this would time out trying (and failing) to open a real TCP connection to a UDP-only port,
+    // rather than returning immediately.
+    @Test fun `a udp-only container is vacuously ready under the default wait, and never appears in the TCP wait's exposed ports`() {
+        val backend = FakeBackend()
+        val c = GenericContainer("redis:8.6-alpine").withBackend(backend)
+            .withExposedUdpPorts(53)
+            .waitingFor(dev.rightsize.core.wait.Wait.forListeningPort()
+                .withStartupTimeout(java.time.Duration.ofSeconds(2)))
+        c.start()   // must return promptly: exposedGuestPorts is empty, so isReady is vacuously true
+        try {
+            assertTrue(c.isRunning)
+            // Fetching the udp-exposed port through the TCP accessor must fail as "not exposed" —
+            // proof the TCP-facing wait/port surface never saw guest port 53 at all.
+            val e = assertThrows(IllegalStateException::class.java) { c.getMappedPort(53) }
+            assertTrue(e.message!!.contains("not exposed"))
+        } finally { c.stop() }
+    }
+
     @Test fun `starting on a network installs links to running siblings`() {
         val backend = FakeBackend()
         val net = Network.newNetwork()
@@ -102,6 +207,27 @@ class GenericContainerTest {
         assertEquals(listOf(NetworkLink("configuration-stub", 8888, stub.getMappedPort(8888))), links)
         assertEquals("configuration-stub:8888", net.resolve("configuration-stub", 8888))
         assertThrows(IllegalStateException::class.java) { net.resolve("nope", 1) }
+    }
+
+    // UDP Phase 1: Network carries a UDP-exposed sibling's mapped port through as a
+    // UDP-tagged NetworkLink, alongside any TCP one — link construction is protocol-aware even
+    // though FakeBackend (unlike MsbCliBackend) never rejects it itself.
+    @Test fun `a sibling's udp-exposed port produces a udp-tagged NetworkLink alongside its tcp one`() {
+        val backend = FakeBackend()
+        val net = Network.newNetwork()
+        val stub = container(backend).withExposedPorts(8888).withExposedUdpPorts(53)
+            .withNetwork(net).withNetworkAliases("configuration-stub")
+        stub.start()
+        val app = container(backend).withExposedPorts(8080).withNetwork(net)
+        app.start()
+        val (_, links) = backend.installedLinks.single()
+        assertEquals(
+            setOf(
+                NetworkLink("configuration-stub", 8888, stub.getMappedPort(8888)),
+                NetworkLink("configuration-stub", 53, stub.getMappedUdpPort(53), PortProtocol.UDP),
+            ),
+            links.toSet(),
+        )
     }
 
     @Test fun `single container on a network installs no links but is still registered as a member`() {

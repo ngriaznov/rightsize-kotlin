@@ -17,6 +17,14 @@ need a smarter check — but read
 [Readiness caveats](#readiness-probe-caveats) below before leaning on it for a server
 that logs nothing informative on startup.
 
+**UDP caveat:** a port declared with `withExposedUdpPorts(...)` (see
+[Networking](networking.md#udp)) is invisible to this check by construction — only guest
+ports declared with `withExposedPorts(...)` are ever probed. A container that exposes
+**only** UDP ports is therefore vacuously ready under this default: there's nothing to
+connect to, so nothing blocks `start()`. Give a UDP-only container an explicit
+`Wait.forLogMessage(...)` below, or a custom `AbstractWaitStrategy` that actually speaks the
+UDP protocol, rather than relying on the default.
+
 ```kotlin
 GenericContainer("redis:8.6-alpine")
     .withExposedPorts(6379)

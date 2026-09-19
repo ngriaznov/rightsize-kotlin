@@ -5,8 +5,20 @@ import dev.rightsize.core.checkpoint.CheckpointRegistry
 import dev.rightsize.core.checkpoint.validateCheckpointName
 import java.nio.file.Path
 
-/** A host↔guest port map entry: the runtime binds [hostPort] on loopback, forwards to [guestPort]. */
-data class PortBinding(val hostPort: Int, val guestPort: Int)
+/** The transport a [PortBinding] (or a [dev.rightsize.core.NetworkLink]) is published/routed
+ * over. Every producer that predates UDP support emits [TCP] — the enum's ordinal-independent
+ * default everywhere it appears — so a pre-UDP caller or a checkpoint-registry entry written
+ * before this existed reads back exactly as it always has. See docs/concepts/networking.md's
+ * UDP section. */
+enum class PortProtocol { TCP, UDP }
+
+/** A host↔guest port map entry: the runtime binds [hostPort] on loopback, forwards to
+ * [guestPort] over [protocol]. [protocol] is a trailing, defaulted field so every call site
+ * that predates UDP support keeps compiling and keeps meaning "TCP", byte-for-byte. A
+ * container may expose the SAME [guestPort] number on both protocols (e.g. DNS's 53) — two
+ * [PortBinding]s that differ only in [protocol] are never equal, so they coexist in one
+ * [ContainerSpec.ports] list without colliding. */
+data class PortBinding(val hostPort: Int, val guestPort: Int, val protocol: PortProtocol = PortProtocol.TCP)
 
 /**
  * A host file exposed inside the guest at [guestPath].
@@ -174,6 +186,16 @@ data class CheckpointSpec(
     val command: List<String>? = null,
     val exposedPorts: List<Int> = emptyList(),
     val memoryLimitMb: Long? = null,
+    /**
+     * The source container's UDP-exposed guest ports (`GenericContainer.withExposedUdpPorts`),
+     * kept apart from [exposedPorts] the same way the two live in separate builder fields/mapped
+     * ports maps on `GenericContainer` itself — see [dev.rightsize.core.PortBinding]'s doc for
+     * why a bare port number alone can't tell the two apart. `GenericContainer.fromCheckpoint`
+     * splits this back out into `withExposedUdpPorts(...)`, mirroring how [exposedPorts] feeds
+     * `withExposedPorts(...)`. Defaults to empty so a checkpoint captured before UDP exposure
+     * existed restores with no UDP ports re-seeded, exactly as it always has.
+     */
+    val exposedUdpPorts: List<Int> = emptyList(),
 )
 
 /**

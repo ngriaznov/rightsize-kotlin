@@ -1,5 +1,7 @@
 package dev.rightsize.core
 
+import java.net.DatagramSocket
+import java.net.InetAddress
 import java.net.ServerSocket
 import java.util.concurrent.ConcurrentHashMap
 
@@ -17,6 +19,23 @@ internal object FreePorts {
             if (issued.add(port)) return port
         }
         error("Could not allocate a free TCP port after 100 attempts")
+    }
+
+    /**
+     * The UDP counterpart of [allocate]: binding a TCP [ServerSocket] proves nothing about
+     * whether a UDP port is free — the two protocols keep entirely independent OS port tables —
+     * so a UDP host port must be probed with a UDP socket of its own. Same shape as [allocate]:
+     * bind `127.0.0.1:0`, read back the OS-assigned port, release the socket immediately, retry
+     * on an [issued] collision (shared with [allocate] — a port this process already handed out
+     * for TCP is skipped for UDP too, purely to keep one process's own bookkeeping simple; the
+     * OS itself would happily give out the same number on both protocols).
+     */
+    fun allocateUdp(): Int {
+        repeat(100) {
+            val port = DatagramSocket(0, InetAddress.getByName("127.0.0.1")).use { it.localPort }
+            if (issued.add(port)) return port
+        }
+        error("Could not allocate a free UDP port after 100 attempts")
     }
 
     fun release(port: Int) { issued.remove(port) }

@@ -2,6 +2,7 @@ package dev.rightsize.contract
 
 import dev.rightsize.GenericContainer
 import dev.rightsize.MountableFile
+import dev.rightsize.Network
 import dev.rightsize.RunId
 import dev.rightsize.core.Backends
 import dev.rightsize.core.CacheDir
@@ -775,5 +776,82 @@ abstract class BackendContractTest {
             backend.removeCheckpoint(cp.ref)
             assertFalse(Files.exists(refPath), "removeCheckpoint must clean up the artifact directory")
         } finally { c.stop() }
+    }
+
+    // --- UDP exposure (Phase 1; see docs/concepts/networking.md's UDP section) ---
+
+    /**
+     * Host->guest datagram delivery via the mapped UDP port — runs on BOTH backends (docker's
+     * native UDP port publishing, msb's `-p host:guest/udp`). The guest listens once
+     * (`nc -u -l -p <port> > /srv/got.txt`, exiting after the first datagram it receives, same as
+     * `busybox nc`'s ordinary UDP-listen behavior) and this sends from a plain
+     * [java.net.DatagramSocket] in a short bounded resend loop — UDP is inherently best-effort, and
+     * a single lost datagram (an msb loopback-forwarder timing window, or the guest listener not
+     * fully up yet) must not flake this test.
+     */
+    @Test fun `a host UDP datagram reaches the guest via the mapped UDP port`() {
+        val marker = "rz-udp-payload-${System.nanoTime()}"
+        val c = GenericContainer("alpine:3.19")
+            .withExposedUdpPorts(9999)
+            .withCommand("sh", "-c", "nc -u -l -p 9999 > /srv/got.txt")
+            .waitingFor(Wait.forLogMessage(".*", 0).withStartupTimeout(Duration.ofSeconds(30)))
+        c.start()
+        try {
+            val hostPort = c.getMappedUdpPort(9999)
+            val addr = java.net.InetAddress.getByName("127.0.0.1")
+            val payload = marker.toByteArray(Charsets.UTF_8)
+            var receivedStdout = ""
+            val deadline = System.currentTimeMillis() + 20_000
+            java.net.DatagramSocket().use { socket ->
+                while (System.currentTimeMillis() < deadline && marker !in receivedStdout) {
+                    runCatching { socket.send(java.net.DatagramPacket(payload, payload.size, addr, hostPort)) }
+                    Thread.sleep(500)
+                    val read = c.execInContainer("cat", "/srv/got.txt")
+                    if (read.exitCode == 0) receivedStdout = read.stdout
+                }
+            }
+            assertTrue(marker in receivedStdout,
+                "the guest never received the UDP datagram via the mapped port; last read: $receivedStdout")
+        } finally { c.stop() }
+    }
+
+    /**
+     * Container-to-container UDP on a shared network — docker-only in Phase 1: msb has no direct
+     * guest-to-guest networking (its `Network` emulation is a TCP exec-tunnel relay with no UDP
+     * equivalent — see `MsbCliBackend.installNetworkLinks`'s pre-flight fail-fast), so this is
+     * gated to the docker backend via [Assumptions] rather than exercised generically here.
+     */
+    @Test fun `docker network members exchange UDP datagrams natively, container to container`() {
+        val backend = Backends.active()
+        Assumptions.assumeTrue(backend.name.equals("docker", ignoreCase = true),
+            "container-to-container UDP over a Network is docker-only in Phase 1 — msb has no direct " +
+                "guest-to-guest networking to route it over")
+        Network.newNetwork().use { net ->
+            val marker = "rz-udp-echo-${System.nanoTime()}"
+            val server = GenericContainer("alpine:3.19")
+                .withExposedUdpPorts(9999)
+                .withNetwork(net).withNetworkAliases("udp-server")
+                .withCommand("sh", "-c", "nc -u -l -p 9999 > /srv/got.txt")
+                .waitingFor(Wait.forLogMessage(".*", 0).withStartupTimeout(Duration.ofSeconds(30)))
+            server.start()
+            val client = GenericContainer("alpine:3.19")
+                .withNetwork(net)
+                .withCommand("sleep", "120")
+                .waitingFor(Wait.forLogMessage(".*", 0).withStartupTimeout(Duration.ofSeconds(30)))
+            client.start()
+            try {
+                var receivedStdout = ""
+                val deadline = System.currentTimeMillis() + 20_000
+                while (System.currentTimeMillis() < deadline && marker !in receivedStdout) {
+                    client.execInContainer("sh", "-c", "echo -n '$marker' | nc -u -w1 udp-server 9999")
+                    Thread.sleep(500)
+                    val read = server.execInContainer("cat", "/srv/got.txt")
+                    if (read.exitCode == 0) receivedStdout = read.stdout
+                }
+                assertTrue(marker in receivedStdout,
+                    "udp-server never received the client's UDP datagram over the shared network; " +
+                        "last read: $receivedStdout")
+            } finally { client.stop(); server.stop() }
+        }
     }
 }

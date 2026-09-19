@@ -1,6 +1,7 @@
 package dev.rightsize
 
 import dev.rightsize.core.NetworkLink
+import dev.rightsize.core.PortProtocol
 import dev.rightsize.core.SandboxBackend
 import dev.rightsize.core.reaper.Reaper
 import java.util.UUID
@@ -21,10 +22,17 @@ class Network private constructor(val id: String) : AutoCloseable {
         synchronized(members) { members += Member(container, aliases); backendUsed = backend }
     }
 
-    /** One link per (alias, exposed guest port) of a single already-running sibling. */
+    /** One link per (alias, exposed guest port) of a single already-running sibling — both
+     * protocols: a TCP link per [dev.rightsize.GenericContainer.mappedPortsView] entry, plus a
+     * UDP-tagged one per [dev.rightsize.GenericContainer.mappedUdpPortsView] entry. Docker's
+     * native networks carry either transport with no change of behavior; msb's exec-tunnel
+     * emulation rejects any UDP-tagged link up front (see `MsbCliBackend.installNetworkLinks`),
+     * so a UDP one reaching a starting member there fails that member's own `start()` fast. */
     private fun linksFor(member: Member): List<NetworkLink> =
         member.aliases.flatMap { alias ->
-            member.container.mappedPortsView().map { (guest, host) -> NetworkLink(alias, guest, host) }
+            member.container.mappedPortsView().map { (guest, host) -> NetworkLink(alias, guest, host) } +
+                member.container.mappedUdpPortsView()
+                    .map { (guest, host) -> NetworkLink(alias, guest, host, PortProtocol.UDP) }
         }
 
     /**

@@ -146,6 +146,50 @@ class MsbCommandsTest {
             "redis:8.6-alpine", "--", "redis-server", "--port", "6379"), cmd)
     }
 
+    // --- UDP Phase 1: -p host:guest gains a trailing /udp for a UDP PortBinding ---
+
+    @Test fun `run command appends -udp suffix for a udp port binding, tcp emission is unaffected`() {
+        val cmd = MsbCommands.run(spec.copy(ports = listOf(
+            PortBinding(hostPort = 12345, guestPort = 6379),
+            PortBinding(hostPort = 22345, guestPort = 53, protocol = PortProtocol.UDP),
+        )))
+        assertTrue(cmd.contains("12345:6379"), "tcp binding must be byte-identical to before: $cmd")
+        assertTrue(cmd.contains("22345:53/udp"), "udp binding must carry the /udp suffix: $cmd")
+        assertFalse(cmd.contains("12345:6379/udp"), "the tcp binding must never carry /udp: $cmd")
+    }
+
+    @Test fun `run command emits every -p flag for a mix of tcp and udp bindings, in ports order`() {
+        val cmd = MsbCommands.run(spec.copy(ports = listOf(
+            PortBinding(hostPort = 1, guestPort = 53, protocol = PortProtocol.UDP),
+            PortBinding(hostPort = 2, guestPort = 53),
+        )))
+        val pIndices = cmd.withIndex().filter { it.value == "-p" }.map { it.index }
+        assertEquals(2, pIndices.size)
+        assertEquals("1:53/udp", cmd[pIndices[0] + 1])
+        assertEquals("2:53", cmd[pIndices[1] + 1])
+    }
+
+    @Test fun `restore command appends -udp suffix for a udp port binding, tcp emission is unaffected`() {
+        val cmd = MsbCommands.restore(spec.copy(
+            checkpointRef = "rz-ckpt-0123456789ab",
+            ports = listOf(
+                PortBinding(hostPort = 12345, guestPort = 6379),
+                PortBinding(hostPort = 22345, guestPort = 53, protocol = PortProtocol.UDP),
+            ),
+        ))
+        assertEquals(listOf("restore", "rz-ckpt-0123456789ab", "--name", "rz-abc-1",
+            "-p", "12345:6379", "-p", "22345:53/udp"), cmd)
+    }
+
+    // A checkpoint reboot / an ordinary fromCheckpoint(...).start() restore must re-publish a UDP
+    // mapping exactly like the original run did — never silently drop back to TCP.
+    @Test fun `restore command re-publishes a udp-only port binding with -udp, never silently as tcp`() {
+        val cmd = MsbCommands.restore(spec.copy(
+            checkpointRef = "rz-ckpt-0123456789ab", ports = listOf(PortBinding(hostPort = 40000, guestPort = 53, protocol = PortProtocol.UDP)),
+        ))
+        assertEquals(listOf("restore", "rz-ckpt-0123456789ab", "--name", "rz-abc-1", "-p", "40000:53/udp"), cmd)
+    }
+
     @Test fun `exec logs stop rm ls`() {
         assertEquals(listOf("exec", "rz-abc-1", "--", "redis-cli", "ping"),
             MsbCommands.exec("rz-abc-1", listOf("redis-cli", "ping")))

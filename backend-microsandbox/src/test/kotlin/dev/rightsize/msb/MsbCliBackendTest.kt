@@ -1,6 +1,9 @@
 package dev.rightsize.msb
 
 import dev.rightsize.core.ContainerSpec
+import dev.rightsize.core.NetworkLink
+import dev.rightsize.core.PortProtocol
+import dev.rightsize.core.UnsupportedByBackendException
 import org.junit.jupiter.api.Assumptions.assumeFalse
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.Assertions.*
@@ -32,6 +35,39 @@ class MsbCliBackendTest {
         assertTrue(capabilities.hardwareIsolated, "each msb sandbox is its own microVM")
         assertTrue(capabilities.checkpoint, "msb supports checkpoint via disk snapshot")
         assertTrue(capabilities.checkpointRestartsWorkload, "the stop/snapshot/start cycle restarts the workload")
+    }
+
+    // --- UDP Phase 1: installNetworkLinks' pre-flight UDP fail-fast (msb has no direct
+    // guest-to-guest networking, so a UDP-tagged link can never be emulated the way a TCP one is
+    // — see requireNoUdpLinks' own doc). Runs entirely against the nonexistent msbPath: the check
+    // is pure and throws before any process is ever spawned. ---
+
+    @Test fun `installNetworkLinks fails fast with a typed error naming the docker and host-port remedies for a udp link`() {
+        val backend = MsbCliBackend(msbPath)
+        val handle = MsbCliBackend.Handle(ContainerSpec(name = "rz-udp-1", image = "alpine:3.19", runId = "abc"))
+        val links = listOf(NetworkLink("sibling", 53, 40000, PortProtocol.UDP))
+
+        val e = assertThrows(UnsupportedByBackendException::class.java) {
+            backend.installNetworkLinks(handle, links)
+        }
+        assertTrue(e.message!!.contains("53"), "should name the offending guest port: ${e.message}")
+        assertTrue(e.message!!.contains("sibling"), "should name the offending alias: ${e.message}")
+        assertTrue(e.message!!.contains("docker", ignoreCase = true),
+            "remedy should point at the docker backend: ${e.message}")
+        assertTrue(e.message!!.contains("withExposedUdpPorts"),
+            "remedy should point at the host-published-UDP-port pattern: ${e.message}")
+    }
+
+    @Test fun `installNetworkLinks only rejects a udp link when one is actually present - a tcp-only link list is untouched by the guard`() {
+        val backend = MsbCliBackend(msbPath)
+        val handle = MsbCliBackend.Handle(ContainerSpec(name = "rz-tcp-1", image = "alpine:3.19", runId = "abc"))
+        val links = listOf(NetworkLink("sibling", 8080, 41000))   // protocol defaults to TCP
+        // Reaches requireNcAvailable next, which shells out to the nonexistent msbPath and fails
+        // there instead — proving the UDP guard itself let a tcp-only link list through rather
+        // than rejecting it. Any exception at all confirms this (never the UDP-specific message).
+        val e = assertThrows(Exception::class.java) { backend.installNetworkLinks(handle, links) }
+        assertFalse(e.message?.contains("UDP", ignoreCase = true) == true,
+            "a tcp-only link list must never trip the UDP guard: ${e.message}")
     }
 
     /** A fake `msb` executable that counts its own `rm` invocations in [counterFile] and, on

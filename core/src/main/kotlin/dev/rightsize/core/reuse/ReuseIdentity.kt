@@ -23,6 +23,17 @@ data class ReuseIdentitySpec(
     val diskLimitMb: Long? = null,
     val tmpfsRootMb: Long? = null,
     val networkDisabled: Boolean = false,
+    /**
+     * The UDP-exposed guest ports (`GenericContainer.withExposedUdpPorts`), kept apart from
+     * [exposedPorts] for the same reason [dev.rightsize.core.PortBinding] keeps a bare port
+     * number from being ambiguous between protocols: two otherwise-identical containers, one
+     * exposing port 53 over TCP and the other over UDP, are NOT interchangeable for reuse and
+     * must never hash to the same identity. Folded into [canonicalJson] the same
+     * omit-when-default way [diskLimitMb]/[tmpfsRootMb]/[networkDisabled] are — a spec that
+     * never touches UDP exposure hashes byte-for-byte the same as it did before this field
+     * existed, so the pinned cross-language vector below stays pinned.
+     */
+    val exposedUdpPorts: List<Int> = emptyList(),
 ) {
     /** A mounted file's guest destination plus a content hash — so identity busts when the
      * bytes a mount would copy in change, even if [guestPath] and every other field don't. */
@@ -74,7 +85,9 @@ object ReuseIdentity {
      * these three are OMITTED entirely rather than rendered as `null`/`false` when left at their
      * default, so a spec that never touches them renders (and hashes) byte-for-byte the same as
      * it did before these fields existed — the pinned vector below stays pinned. Setting any of
-     * them still changes the hash, the same as a non-null `memoryLimitMb` does. No whitespace
+     * them still changes the hash, the same as a non-null `memoryLimitMb` does. `exposedUdpPorts`
+     * (sorted ascending, same as `exposedPorts`) is appended last on the same omit-when-empty
+     * terms. No whitespace
      * anywhere — a single byte of formatting drift would change the hash for an otherwise-identical
      * spec. */
     internal fun canonicalJson(spec: ReuseIdentitySpec): String = buildString {
@@ -99,6 +112,11 @@ object ReuseIdentity {
         spec.diskLimitMb?.let { append(",\"diskLimitMb\":").append(it) }
         spec.tmpfsRootMb?.let { append(",\"tmpfsRootMb\":").append(it) }
         if (spec.networkDisabled) append(",\"networkDisabled\":true")
+        if (spec.exposedUdpPorts.isNotEmpty()) {
+            append(",\"exposedUdpPorts\":[")
+            spec.exposedUdpPorts.sorted().forEachIndexed { i, p -> if (i > 0) append(','); append(p) }
+            append(']')
+        }
         append('}')
     }
 

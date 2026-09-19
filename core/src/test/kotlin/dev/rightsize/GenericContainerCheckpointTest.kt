@@ -161,6 +161,20 @@ class GenericContainerCheckpointTest {
         } finally { c.stop() }
     }
 
+    // UDP Phase 1: withExposedUdpPorts flows into CheckpointSpec.exposedUdpPorts, kept apart from
+    // the TCP-only exposedPorts.
+    @Test fun `checkpoint carries withExposedUdpPorts into CheckpointSpec-exposedUdpPorts, separate from exposedPorts`() {
+        val backend = CheckpointFakeBackend()
+        val c = GenericContainer("alpine:3.19").withBackend(backend).waitingFor(CheckpointReady)
+            .withExposedPorts(8080).withExposedUdpPorts(53, 5353)
+        c.start()
+        try {
+            val cp = c.checkpoint()
+            assertEquals(listOf(8080), cp.spec.exposedPorts)
+            assertEquals(listOf(53, 5353), cp.spec.exposedUdpPorts)
+        } finally { c.stop() }
+    }
+
     @Test fun `checkpoint mints an absolute path under the checkpoint cache dir when the active backend is named microsandbox`(
         @TempDir tmp: Path,
     ) {
@@ -365,6 +379,35 @@ class GenericContainerCheckpointTest {
             assertEquals(listOf("sh", "-c", "sleep 120"), spec.command)
             assertEquals(listOf(5432), spec.ports.map { it.guestPort })
             assertEquals(512L, spec.memoryLimitMb)
+        } finally { restored.stop() }
+    }
+
+    // UDP Phase 1: fromCheckpoint splits the captured ports back out by protocol into the two
+    // separate builder fields — a checkpoint carrying both a TCP and a UDP exposed port (even the
+    // same guest port number on each) must re-seed both correctly, not collapse them into one.
+    @Test fun `fromCheckpoint splits captured exposedPorts and exposedUdpPorts into the right builder fields`() {
+        val backend = CheckpointFakeBackend()
+        val cp = Checkpoint(
+            ref = "rightsize/checkpoint:0123456789ab", backend = "fake",
+            spec = CheckpointSpec(
+                env = emptyMap(), command = null,
+                exposedPorts = listOf(53, 8080), exposedUdpPorts = listOf(53),
+            ),
+        )
+        val restored = GenericContainer.fromCheckpoint(cp).withBackend(backend).waitingFor(CheckpointReady)
+        restored.start()
+        try {
+            val spec = backend.created.single()
+            val tcpBindings = spec.ports.filter { it.protocol == dev.rightsize.core.PortProtocol.TCP }
+            val udpBindings = spec.ports.filter { it.protocol == dev.rightsize.core.PortProtocol.UDP }
+            assertEquals(setOf(53, 8080), tcpBindings.map { it.guestPort }.toSet())
+            assertEquals(listOf(53), udpBindings.map { it.guestPort })
+            // The two protocols' mapped host ports for the same guest port number 53 must differ.
+            val tcp53 = tcpBindings.single { it.guestPort == 53 }.hostPort
+            val udp53 = udpBindings.single { it.guestPort == 53 }.hostPort
+            assertNotEquals(tcp53, udp53)
+            assertEquals(tcp53, restored.getMappedPort(53))
+            assertEquals(udp53, restored.getMappedUdpPort(53))
         } finally { restored.stop() }
     }
 
@@ -623,7 +666,7 @@ class GenericContainerCheckpointTest {
             // across the three rightsize libraries — asserted literally, not just via round-trip.
             for (field in listOf(
                 "\"name\"", "\"ref\"", "\"backend\"", "\"createdIso\"", "\"spec\"",
-                "\"env\"", "\"command\"", "\"exposedPorts\"", "\"memoryLimitMb\"",
+                "\"env\"", "\"command\"", "\"exposedPorts\"", "\"memoryLimitMb\"", "\"exposedUdpPorts\"",
             )) {
                 assertTrue(field in json, "registry JSON missing pinned field $field: $json")
             }

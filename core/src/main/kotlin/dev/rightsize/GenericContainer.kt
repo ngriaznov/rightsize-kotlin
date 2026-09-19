@@ -53,6 +53,12 @@ fun nextSandboxName(): String = "rz-${RunId.value}-${counter.incrementAndGet()}"
 open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: String) {
     private val env = linkedMapOf<String, String>()
     private val exposedPorts = mutableListOf<Int>()
+    // Kept as a SEPARATE field from exposedPorts (not folded into one protocol-tagged list) so
+    // every existing reader of exposedPorts — waitTarget()'s exposedGuestPorts chief among them
+    // — stays TCP-only by construction, with nothing to filter: a UDP-only container is
+    // invisible to Wait.forListeningPort() the same way it always has been for a container that
+    // exposes nothing at all. See withExposedUdpPorts' doc and docs/concepts/networking.md.
+    private val exposedUdpPorts = mutableListOf<Int>()
     private var command: List<String>? = null
     private var network: Network? = null
     private val aliases = mutableListOf<String>()
@@ -86,6 +92,11 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
 
     private var handle: SandboxHandle? = null
     private var mappedPorts: Map<Int, Int> = emptyMap()
+    // The UDP counterpart of mappedPorts, keyed and populated exactly the same way but from
+    // exposedUdpPorts/FreePorts.allocateUdp — see getMappedUdpPort's doc for why this can never
+    // be folded into mappedPorts itself (a shared bare-Int key can't tell port 53/tcp apart from
+    // port 53/udp).
+    private var mappedUdpPorts: Map<Int, Int> = emptyMap()
     // True only while `handle` refers to a reuse-active sandbox (adopted or freshly created via
     // the reuse path) — `stop()` branches on this to leave the sandbox running instead of
     // stopping/removing it. Never true for an ordinary container.
@@ -98,6 +109,21 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
     protected fun removeEnv(key: String): SELF { env.remove(key); return this as SELF }
     /** Declares guest ports to publish; each gets a host port assigned before boot (see [getMappedPort]). */
     fun withExposedPorts(vararg ports: Int): SELF { exposedPorts += ports.toList(); return this as SELF }
+    /**
+     * The UDP sibling of [withExposedPorts]: declares guest ports to publish over UDP, each
+     * getting its own host port assigned before boot (see [getMappedUdpPort] — a DISTINCT
+     * accessor, never an overload of [getMappedPort], since a container may expose the SAME
+     * guest port number on both protocols at once, e.g. DNS's 53). Backed by a field entirely
+     * separate from [withExposedPorts]' own, on purpose: [dev.rightsize.core.wait.Wait.forListeningPort]
+     * and every other wait strategy only ever sees `exposedGuestPorts` sourced from
+     * [withExposedPorts] — a UDP-only container is therefore vacuously ready under the default
+     * wait, exactly as a container exposing nothing at all always has been; prefer
+     * [dev.rightsize.core.wait.Wait.forLogMessage] for a UDP service. Docker publishes each port
+     * with a native `<port>/udp` binding; microsandbox publishes it with `-p host:guest/udp` on
+     * both `msb run` and `msb restore`. See docs/concepts/networking.md's UDP section — including
+     * why joining an msb `Network` alongside a UDP-exposed sibling is unsupported in this phase.
+     */
+    fun withExposedUdpPorts(vararg ports: Int): SELF { exposedUdpPorts += ports.toList(); return this as SELF }
     /** Overrides the image's default entrypoint/command. */
     fun withCommand(vararg cmd: String): SELF { command = cmd.toList(); return this as SELF }
     /** Joins a [Network], making this container's exposed ports reachable at its [withNetworkAliases]. */
@@ -210,6 +236,20 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
             "— call start() first, or check that it did not stop/fail after start()"
         else "Port $guestPort is not exposed on ${describe()} — call withExposedPorts($guestPort) " +
             "before start(), or check exposedPorts for the port you actually declared"
+    )
+
+    /**
+     * The UDP sibling of [getMappedPort]: the host port [guestPort] is published on OVER UDP;
+     * only valid once [start] has succeeded. A DISTINCT accessor rather than an overload — a
+     * container may call both `withExposedPorts(53)` and `withExposedUdpPorts(53)`, and the two
+     * protocols' mapped host ports for the same guest port number are never the same value, so
+     * one overloaded accessor could never unambiguously answer "which one did you mean".
+     */
+    fun getMappedUdpPort(guestPort: Int): Int = mappedUdpPorts[guestPort] ?: error(
+        if (!isRunning) "Cannot get mapped UDP port $guestPort on ${describe()}: the container is not running " +
+            "— call start() first, or check that it did not stop/fail after start()"
+        else "UDP port $guestPort is not exposed on ${describe()} — call withExposedUdpPorts($guestPort) " +
+            "before start(), or check exposedUdpPorts for the port you actually declared"
     )
 
     /** Runs [cmd] inside the running container and returns its exit code and captured output. */
@@ -394,6 +434,7 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
             command = command,
             exposedPorts = exposedPorts.toList(),
             memoryLimitMb = memoryLimitMb,
+            exposedUdpPorts = exposedUdpPorts.toList(),
         )
         if (name != null) writeNamedCheckpointRecord(name, ref, spec)
         return Checkpoint(ref = ref, backend = backend.name, spec = spec)
@@ -456,6 +497,9 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
     protected open fun containerIsStarted() {}
 
     internal fun mappedPortsView(): Map<Int, Int> = mappedPorts
+    /** [Network]'s UDP-link-construction counterpart to [mappedPortsView] — see [getMappedUdpPort]'s
+     * doc for why this can never be folded into [mappedPortsView] itself. */
+    internal fun mappedUdpPortsView(): Map<Int, Int> = mappedUdpPorts
 
     /**
      * Boots the container: allocates host ports, creates and starts it on the active backend
@@ -568,13 +612,21 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
         }
     }
 
-    /** Allocates one free host port per exposed guest port, replacing any previous mapping. */
-    private fun allocatePorts() { mappedPorts = exposedPorts.associateWith { FreePorts.allocate() } }
+    /** Allocates one free host port per exposed guest port, replacing any previous mapping — TCP
+     * ports via [FreePorts.allocate] (binds a [java.net.ServerSocket] to prove the port is free),
+     * UDP ports via [FreePorts.allocateUdp] (a TCP bind proves nothing about a UDP port — the two
+     * protocols keep independent OS port tables — so this binds a UDP socket instead). */
+    private fun allocatePorts() {
+        mappedPorts = exposedPorts.associateWith { FreePorts.allocate() }
+        mappedUdpPorts = exposedUdpPorts.associateWith { FreePorts.allocateUdp() }
+    }
 
-    /** Returns every currently mapped host port to the allocator and clears the mapping. */
+    /** Returns every currently mapped host port (both protocols) to the allocator and clears both mappings. */
     private fun releasePorts() {
         mappedPorts.values.forEach { FreePorts.release(it) }
         mappedPorts = emptyMap()
+        mappedUdpPorts.values.forEach { FreePorts.release(it) }
+        mappedUdpPorts = emptyMap()
     }
 
     /**
@@ -599,7 +651,8 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
                 image = image,
                 env = env.toMap(),
                 command = command,
-                ports = mappedPorts.map { (g, h) -> PortBinding(hostPort = h, guestPort = g) },
+                ports = mappedPorts.map { (g, h) -> PortBinding(hostPort = h, guestPort = g) } +
+                    mappedUdpPorts.map { (g, h) -> PortBinding(hostPort = h, guestPort = g, protocol = PortProtocol.UDP) },
                 mounts = mounts.toList(),
                 networkId = net?.id,
                 aliases = aliases.toList(),
@@ -633,8 +686,9 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
                 val removed = runCatching { backend.remove(h) }.isSuccess
                 if (removed) Reaper.afterRemove(h.spec)
                 if (isPortBindConflict(e)) {
-                    conflicted += mappedPorts.values
+                    conflicted += mappedPorts.values + mappedUdpPorts.values
                     mappedPorts = emptyMap()
+                    mappedUdpPorts = emptyMap()
                     lastConflict = e
                     return@repeat
                 }
@@ -761,6 +815,7 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
         diskLimitMb = diskLimitMb,
         tmpfsRootMb = tmpfsRootMb,
         networkDisabled = networkDisabled,
+        exposedUdpPorts = exposedUdpPorts.toList(),
     )
 
     /**
@@ -815,7 +870,8 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
                 image = image,
                 env = env.toMap(),
                 command = command,
-                ports = mappedPorts.map { (g, h) -> PortBinding(hostPort = h, guestPort = g) },
+                ports = mappedPorts.map { (g, h) -> PortBinding(hostPort = h, guestPort = g) } +
+                    mappedUdpPorts.map { (g, h) -> PortBinding(hostPort = h, guestPort = g, protocol = PortProtocol.UDP) },
                 mounts = mounts.toList(),
                 runId = RunId.value,
                 memoryLimitMb = memoryLimitMb,
@@ -840,8 +896,9 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
                 runCatching { backend.stop(h) }
                 runCatching { backend.remove(h) }
                 if (isPortBindConflict(e)) {
-                    conflicted += mappedPorts.values
+                    conflicted += mappedPorts.values + mappedUdpPorts.values
                     mappedPorts = emptyMap()
+                    mappedUdpPorts = emptyMap()
                     lastConflict = e
                     return@repeat
                 }
@@ -937,6 +994,9 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
             checkpoint.spec.command?.let { c.withCommand(*it.toTypedArray()) }
             if (checkpoint.spec.exposedPorts.isNotEmpty()) {
                 c.withExposedPorts(*checkpoint.spec.exposedPorts.toIntArray())
+            }
+            if (checkpoint.spec.exposedUdpPorts.isNotEmpty()) {
+                c.withExposedUdpPorts(*checkpoint.spec.exposedUdpPorts.toIntArray())
             }
             checkpoint.spec.memoryLimitMb?.let { c.withMemoryLimit(it) }
             return c
