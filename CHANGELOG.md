@@ -7,6 +7,10 @@ reaches its first tagged release.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.7.11] - 2026-09-19
+
 ### Added
 
 - **UDP port exposure (Phase 1).** `PortBinding` gains a `protocol` field (`PortProtocol.TCP` |
@@ -959,7 +963,8 @@ Initial public release.
   exactly once; any other failure, or a second failure after the heal,
   propagates unchanged.
 
-[Unreleased]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.10...HEAD
+[Unreleased]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.11...HEAD
+[0.7.11]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.10...v0.7.11
 [0.7.10]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.9...v0.7.10
 [0.7.9]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.8...v0.7.9
 [0.7.8]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.7...v0.7.8
