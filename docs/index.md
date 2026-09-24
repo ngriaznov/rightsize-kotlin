@@ -38,7 +38,7 @@ same machine). The pitch isn't "faster than Docker"; it's "as fast as Docker, wi
 hardware isolation and nothing to install."
 
 The full comparison table, benchmark methodology, and platform matrix live in the
-[project README](https://github.com/ngriaznov/rightsize-kotlin#why) — this site doesn't
+[project README](https://github.com/ngriaznov/rightsize-kotlin#why-microvms) — this site doesn't
 repeat them. In one line: Apple Silicon macs, Linux-with-KVM, and Windows-with-WHP get
 microVMs; everything else falls back to Docker automatically, and tests run unchanged
 on either backend. Backend-specific edges are covered in

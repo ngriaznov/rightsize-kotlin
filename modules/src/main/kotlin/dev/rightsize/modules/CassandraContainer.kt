@@ -22,7 +22,7 @@ import java.time.Duration
  * ### `GPG_KEYS` must be overridden to a tab-free value — the difference between booting and aborting
  *
  * `cassandra:5.0.8`'s baked env includes a `GPG_KEYS` value that contains a literal TAB
- * character. Under msb 0.6.6, and still under the pinned 0.6.8, booting any image whose baked env
+ * character. Under msb 0.6.6, and still under the pinned 0.7.1, booting any image whose baked env
  * contains a TAB aborts before the
  * guest is even reachable:
  *

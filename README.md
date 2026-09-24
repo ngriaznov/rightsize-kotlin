@@ -145,7 +145,7 @@ rightsize picks a backend automatically; override with
 | Windows without WHP | Docker (auto-fallback)ᵇ |
 | Linux without KVM | Docker (auto-fallback) |
 
-ᵃ Windows msb support is upstream beta (microsandbox 0.6.8). rightsize detects a Windows
+ᵃ Windows msb support is upstream beta (microsandbox 0.7.1). rightsize detects a Windows
 build is available and attempts it; if WHP turns out not to be usable, msb's own `msb doctor`
 names the exact precondition (see ᵇ) instead of a generic failure.
 ᵇ Force with `RIGHTSIZE_BACKEND=docker`, or enable WHP: run `msb doctor --fix` in an
@@ -184,10 +184,15 @@ a native network alias. On microsandbox - where microVMs are fully isolated from
 other - rightsize transparently installs an `/etc/hosts` entry plus a TCP relay tunneled
 over the sandbox's exec channel.
 
-The microVM emulation has limits worth knowing: start dependencies before their consumers,
-one connection at a time per tunnel (fine for config fetches; not for a cross-container
-Kafka consumer), and the consumer image needs `nc`/busybox. Violations fail fast with an
-actionable error.
+The microVM emulation has limits worth knowing: start dependencies before their consumers (a
+consumer started first gets no link to them), one connection at a time per TCP tunnel (fine
+for config fetches; not for a cross-container Kafka consumer), and the consumer image needs
+`nc`/busybox - without it, `start()` fails fast with an actionable error. A container
+exposing UDP ports with `withExposedUdpPorts(...)` can also be a link target - the consumer
+gets an in-guest `nc`-based forwarder instead of the TCP tunnel, without the
+one-connection-at-a-time limit, but datagrams must stay at or under 1472 bytes of payload:
+msb raises no error above that, it breaks the receiving sandbox's entire inbound networking.
+See [Networking](docs/concepts/networking.md#udp) for the full picture.
 
 ## Reliability & lifecycle
 

@@ -114,10 +114,8 @@ than inventing a new structure.
 
 ## Release process
 
-rightsize is not yet published to a shared Maven repository — see
-[RELEASING.md](RELEASING.md) for the release checklist, including the steps that
-only make sense once the repository has a real GitHub remote (badges, CI status
-links, etc.).
+rightsize publishes to Maven Central under the `dev.rightsize` group — see
+[RELEASING.md](RELEASING.md) for the release checklist.
 
 ## Questions
 
