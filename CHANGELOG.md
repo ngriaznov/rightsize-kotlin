@@ -7,6 +7,10 @@ reaches its first tagged release.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.7.12] - 2026-09-24
+
 ### Added
 
 - **UDP network links on the microsandbox backend.** Joining an msb `Network` alongside a
@@ -978,7 +982,8 @@ Initial public release.
   exactly once; any other failure, or a second failure after the heal,
   propagates unchanged.
 
-[Unreleased]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.11...HEAD
+[Unreleased]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.12...HEAD
+[0.7.12]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.11...v0.7.12
 [0.7.11]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.10...v0.7.11
 [0.7.10]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.9...v0.7.10
 [0.7.9]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.8...v0.7.9
