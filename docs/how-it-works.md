@@ -78,19 +78,16 @@ guidance instead of attempting a download at all. See the full env var table in
 
 ## Attached-mode supervision
 
-This is the single biggest design pivot the project made: microsandbox's detached mode
-(`msb run -d`) boots the VM but does **not** start the image's own ENTRYPOINT/CMD — the
-guest comes up with only its init process, and redis/postgres/whatever never actually
-launches. This was confirmed empirically against the real `msb` binary before any
-library code was written.
-
-The fix is that rightsize's microsandbox backend runs every sandbox **attached**: each
-container is a real, held child `Process` that supervises its own microVM for its
-entire lifetime, and the image's ENTRYPOINT runs exactly as it would under Docker.
-Readiness, from the backend's point of view, means the sandbox's name shows
-`"Running"` in `msb ls --format json` — not the attached process's own exit code or
-stdout, which is a separate channel from the workload's actual logs (those come from
-`msb logs`).
+rightsize's microsandbox backend runs every sandbox **attached** rather than detached
+(`msb run -d`): each container is a real, held child `Process` that supervises its own
+microVM for its entire lifetime, and the image's ENTRYPOINT runs exactly as it would
+under Docker. Attaching gives the backend a supervising child to detect death against
+and a tail of msb's own boot output for diagnostics — a boot failure (a bad image, a
+port conflict, a crashed guest) surfaces as soon as that child exits, instead of a
+`msb ls` poll with nothing to explain a boot that never reaches Running. Readiness,
+from the backend's point of view, means the sandbox's name shows `"Running"` in
+`msb ls --format json` — not the attached process's own exit code or stdout, which is
+a separate channel from the workload's actual logs (those come from `msb logs`).
 
 ## Pre-allocated ports
 
@@ -117,10 +114,10 @@ absorbs this with a bounded retry (5 attempts, fresh ports each time) — see
 ## Networking: exec-tunnel emulation
 
 microsandbox microVMs are fully isolated from each other by design — there is no
-sandbox-to-sandbox networking and no sandbox-to-host TCP path on macOS under any
-tested `--net-rule` policy (confirmed empirically against the real binary: the
-`host.microsandbox.internal` gateway does not forward to host services or sibling
-published ports, and upstream SSH `-L`/`-R` forwarding is broken in msb 0.6.2).
+sandbox-to-sandbox networking path. A sandbox can reach host loopback services through
+its `host.microsandbox.internal` gateway when its network policy allows it
+(`--net-rule allow@host:<proto>:<port>`, or the host profile), but that gateway still
+doesn't forward to a sibling sandbox's published ports.
 
 rightsize emulates `Network` on top of this constraint rather than giving up on
 container-to-container connectivity entirely:
@@ -147,7 +144,7 @@ documented limits (start order, one connection per tunnel, the `nc` requirement)
 
 ### Why the tunnel serves one connection at a time
 
-msb 0.6.2's port-publish proxy never propagates the target side's TCP close back to
+msb's port-publish proxy never propagates the target side's TCP close back to
 the tunnel's host-side socket — a host client reading past the target's own
 `Connection: close` never observes a natural EOF. A pump written to wait for that EOF
 would simply hang forever after the first exchange. The tunnel instead infers "this

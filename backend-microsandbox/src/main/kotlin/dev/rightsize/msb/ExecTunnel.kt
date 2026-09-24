@@ -25,7 +25,7 @@ internal class ExecTunnel(
         // broken pump) busy-spins `msb exec` in a tight loop. Same backoff on both respawn paths.
         const val RESPAWN_BACKOFF_MS = 200L
 
-        // msb 0.6.2's host-port-publish proxy never propagates the target's own TCP close back
+        // msb's host-port-publish proxy never propagates the target's own TCP close back
         // to this host-side socket (empirically confirmed against the real binary) - a plain
         // `read() == 0` on the target->guest direction therefore never arrives,
         // and serveOneConnection blocks forever after the first exchange, wedging the tunnel to

@@ -70,14 +70,15 @@ test instead of the POSIX executable-bit check.
 
 ### Attached-mode supervision
 
-microsandbox's detached mode (`msb run -d`) does **not** start the image's own
-ENTRYPOINT — the VM boots with only its init process and the workload inside never
-launches. rightsize's msb backend therefore runs every sandbox **attached**: each
-container is a held child `Process` supervising its microVM, and the image's
-ENTRYPOINT/CMD runs exactly as it would under Docker. Readiness for backend purposes
-is "the sandbox name shows `Running` in `msb ls`" — not the attached process's own
-exit code or stdout; workload logs come from `msb logs`, a separate channel. See
-[How It Works](how-it-works.md) for more on why this shape was necessary.
+rightsize's msb backend runs every sandbox **attached** rather than detached (`msb run
+-d`): each container is a held child `Process` supervising its microVM, and the
+image's ENTRYPOINT/CMD runs exactly as it would under Docker. Attaching gives the
+backend a child to detect death against and a tail of msb's own boot output to
+diagnose a failure from, rather than a poll of `msb ls` with nothing to explain a
+failure that never reaches Running. Readiness for backend purposes is "the sandbox
+name shows `Running` in `msb ls`" — not the attached process's own exit code or
+stdout; workload logs come from `msb logs`, a separate channel. See
+[How It Works](how-it-works.md) for more on the supervision shape.
 
 On Windows, the attached `msb run` process's own stdout does not relay the guest
 workload's output at all (confirmed empirically) — `msb logs` is not just the
@@ -136,7 +137,7 @@ both — but a handful of edges are genuinely backend-specific rather than incid
 timing quirks. Know these before you hit them:
 
 - **`followOutput`'s tail-flush on microsandbox is a watchdog, not a stream close.**
-  `msb logs -f` doesn't exit when its sandbox stops (a documented gap in msb 0.6.2), so
+  `msb logs -f` doesn't exit when its sandbox stops, so
   the microsandbox backend polls in the background and replays only the
   not-yet-delivered tail once the sandbox is confirmed stopped. Consumers see the same
   ordered, no-duplicate output either backend produces — this is purely an

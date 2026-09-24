@@ -162,8 +162,8 @@ backend-specific rather than behavioral divergences:
   bridge networking - see [Networking](#networking).
 - **`followOutput` delivers the same ordered, no-duplicate log stream on both backends**,
   but on microsandbox the final tail can arrive shortly after the sandbox reports stopped,
-  rather than exactly at stream EOF (`msb logs -f` doesn't close on sandbox stop in 0.6.2,
-  so the backend replays the not-yet-delivered tail once stop is confirmed).
+  rather than exactly at stream EOF (`msb logs -f` doesn't close on sandbox stop, so the
+  backend replays the not-yet-delivered tail once stop is confirmed).
 
 ## Networking
 

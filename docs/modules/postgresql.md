@@ -80,21 +80,22 @@ first occurrence races the restart: a client can connect to the init-time instan
 the brief window just before it's torn down. Waiting for the *second* occurrence
 (`times = 2`) waits for the real, durable listener instead.
 
-**A control-character env var crashes microsandbox outright.** The official
+**A control-character env var crashed older msb releases outright.** The official
 `postgres:*-alpine` image bakes an env var, `DOCKER_PG_LLVM_DEPS`, whose value contains
 a literal tab character (from a package list built with `\t\t` continuation in the
-Dockerfile). microsandbox 0.6.2's krun VMM panics with `InvalidAscii` on that value
-before the guest ever boots — reproduced with zero rightsize-set env vars, so this is
-purely an artifact of the image, not anything this library added. Docker is
-unaffected. This module overrides the variable to an empty string
-(`withEnv("DOCKER_PG_LLVM_DEPS", "")`), which is a no-op on Docker and the fix on
-microsandbox. This override was verified against the alpine variant specifically;
-whether the Debian-based `latest` this module now defaults to bakes the same
-tab-containing value has not been re-verified, so the override stays in place
-unconditionally rather than being gated on the image chosen. If you hit a similar
-`InvalidAscii` panic with an image this module doesn't cover, look for a baked env var
-with an unusual byte in it — see [Troubleshooting](../troubleshooting.md) for the
-general pattern.
+Dockerfile). On msb releases before 0.7.1, the krun VMM panicked with `InvalidAscii` on
+that value before the guest ever booted — reproduced with zero rightsize-set env vars,
+so this was purely an artifact of the image, not anything this library added. Docker
+was unaffected. It's fixed on the pinned msb (0.7.1): the image boots with
+`DOCKER_PG_LLVM_DEPS` unmodified, no override needed. This module still overrides the
+variable to an empty string (`withEnv("DOCKER_PG_LLVM_DEPS", "")`) unconditionally — a
+no-op on Docker and on the pinned msb, and a guard for anyone pointing `MSB_PATH` at an
+older msb. The override was verified against the alpine variant specifically; whether
+the Debian-based `latest` this module now defaults to bakes the same tab-containing
+value has not been re-verified, which is the other reason it stays unconditional
+rather than gated on the image chosen. If you hit an `InvalidAscii` panic on an older
+msb with an image this module doesn't cover, look for a baked env var with an unusual
+byte in it — see [Troubleshooting](../troubleshooting.md) for the general pattern.
 
 ## Compatibility checking
 

@@ -33,15 +33,17 @@ class PostgreSQLContainer(image: DockerImageName) : GenericContainer<PostgreSQLC
         withEnv("POSTGRES_PASSWORD", passwordState)
         withEnv("POSTGRES_DB", databaseState)
         // The official postgres:*-alpine image bakes DOCKER_PG_LLVM_DEPS into its manifest with a
-        // literal tab character in the value (a package-list built with `\t\t` continuation). msb
-        // 0.6.2's krun VMM builder panics with InvalidAscii on that boot-env value before the guest
-        // ever starts (reproduced with zero rightsize-set env vars — it's the image, not us).
-        // Docker is unaffected. Overriding the var here wins over the image default in both
-        // backends' env-merge order and is a no-op for the build the image already baked, so it's
-        // a safe, backend-portable fix rather than an msb-only special case. This override was
-        // verified against the alpine variant specifically; whether the Debian-based `latest` this
-        // module now defaults to bakes the same tab-containing value has not been re-verified, so
-        // the override is left in place unconditionally rather than gated on the image chosen.
+        // literal tab character in the value (a package-list built with `\t\t` continuation). On
+        // older msb releases (0.6.x), the krun VMM builder panicked with InvalidAscii on that
+        // boot-env value before the guest ever started (reproduced with zero rightsize-set env
+        // vars — it's the image, not us). Docker was unaffected. Fixed on the pinned msb (0.7.1) —
+        // the image boots with this var unmodified now. Overriding it here still wins over the
+        // image default in both backends' env-merge order and is a no-op for the build the image
+        // already baked, so it stays a safe, backend-portable guard for an older msb rather than an
+        // msb-only special case. This override was verified against the alpine variant
+        // specifically; whether the Debian-based `latest` this module now defaults to bakes the
+        // same tab-containing value has not been re-verified, so the override is left in place
+        // unconditionally rather than gated on the image chosen.
         withEnv("DOCKER_PG_LLVM_DEPS", "")
         // The postgres entrypoint starts the server once to run initdb scripts against it, shuts
         // it down, then starts it again for real — printing "database system is ready to accept

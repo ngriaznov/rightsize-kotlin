@@ -67,10 +67,11 @@ class CassandraContainerTest {
 
 ## Backend notes
 
-**`GPG_KEYS` must be overridden to a tab-free value — this is the difference
-between the module booting and aborting.** `cassandra:5.0.8`'s baked env includes a
-`GPG_KEYS` value that contains a literal TAB character. Under msb 0.6.6 and still under 0.6.8, booting any
-image whose baked env contains a TAB aborts before the guest is even reachable:
+**`GPG_KEYS` carries a literal TAB in this image's baked env — harmless on the pinned
+msb, still overridden as a guard.** `cassandra:5.0.8`'s baked env includes a
+`GPG_KEYS` value that contains a literal TAB character. On older msb releases (0.6.x),
+booting any image whose baked env contained a TAB aborted before the guest was even
+reachable:
 
 ```
 sandbox process exited (signal: 6 (SIGABRT)) before agent relay became available
@@ -82,13 +83,14 @@ with `msb logs --source system` showing the root cause:
 panicked at msb_krun_vmm-0.1.25/src/builder.rs:1154: ... Err value: InvalidAscii
 ```
 
-This is msb's env-encoding step rejecting a TAB anywhere in the image's baked env,
-before Cassandra itself ever runs — not specific to anything Cassandra does.
-`withEnv("GPG_KEYS", "")` overrides the baked value with an empty, tab-free one.
-`GPG_KEYS` is consumed only at image build time (verifying the Apache download's
-signing keys), so overriding it here has no effect on anything Cassandra does at
-runtime. Verified directly: an otherwise identical `msb run` aborts with the
-signature above without this override and boots cleanly with it.
+That was msb's env-encoding step rejecting a TAB anywhere in the image's baked env,
+before Cassandra itself ever ran — not specific to anything Cassandra does. It's fixed
+on the pinned msb (0.7.1): `cassandra:5.0.8` boots with its baked `GPG_KEYS`
+unmodified. `withEnv("GPG_KEYS", "")` still overrides the baked value with an empty,
+tab-free one unconditionally, as a harmless guard for anyone pointing `MSB_PATH` at an
+older msb — `GPG_KEYS` is consumed only at image build time (verifying the Apache
+download's signing keys), so the override has no effect on anything Cassandra does at
+runtime either way.
 
 **Memory: a heap-bounded JVM, ladder verified at 2560 MB.** `MAX_HEAP_SIZE=512M`/
 `HEAP_NEWSIZE=128M` keep the JVM heap itself small, but the container's total

@@ -19,12 +19,11 @@ import java.time.Duration
  * tab into that value has not been re-verified, so this module does not gate the override on the
  * image chosen.
  *
- * ### `GPG_KEYS` must be overridden to a tab-free value — the difference between booting and aborting
+ * ### `GPG_KEYS` carries a literal TAB in this image's baked env — harmless on the pinned msb
  *
  * `cassandra:5.0.8`'s baked env includes a `GPG_KEYS` value that contains a literal TAB
- * character. Under msb 0.6.6, and still under the pinned 0.7.1, booting any image whose baked env
- * contains a TAB aborts before the
- * guest is even reachable:
+ * character. On older msb releases (0.6.x), booting any image whose baked env contained a TAB
+ * aborted before the guest was even reachable:
  *
  * ```
  * sandbox process exited (signal: 6 (SIGABRT)) before agent relay became available
@@ -36,12 +35,13 @@ import java.time.Duration
  * panicked at msb_krun_vmm-0.1.25/src/builder.rs:1154: ... Err value: InvalidAscii
  * ```
  *
- * This is not specific to Cassandra's own behavior — it is msb's env-encoding step rejecting a
- * TAB anywhere in the image's baked env, before Cassandra ever runs. `withEnv("GPG_KEYS", "")` in
- * this module overrides the baked value with an empty, tab-free one. `GPG_KEYS` is consumed only
- * at image build time (verifying the Apache download's signing keys), so overriding it here has
- * no effect on anything Cassandra does at runtime. Verified directly: an otherwise identical `msb
- * run` aborts with the signature above without this override and boots cleanly with it.
+ * That was not specific to Cassandra's own behavior — it was msb's env-encoding step rejecting a
+ * TAB anywhere in the image's baked env, before Cassandra ever ran. It's fixed on the pinned msb
+ * (0.7.1): `cassandra:5.0.8` boots with its baked `GPG_KEYS` unmodified. `withEnv("GPG_KEYS", "")`
+ * in this module still overrides it to an empty, tab-free value unconditionally, as a harmless
+ * guard for anyone pointing `MSB_PATH` at an older msb — `GPG_KEYS` is consumed only at image
+ * build time (verifying the Apache download's signing keys), so the override has no effect on
+ * anything Cassandra does at runtime either way.
  *
  * ### Memory — a heap-bounded JVM, ladder verified at 2560 MB
  *
@@ -69,8 +69,10 @@ class CassandraContainer(image: DockerImageName) : GenericContainer<CassandraCon
     init {
         image.assertCompatibleWith(EXPECTED_REPOSITORY)
         withExposedPorts(CQL_PORT)
-        // Baked GPG_KEYS contains a TAB; msb SIGABRTs on any TAB in an image's baked env (0.6.6 and 0.6.8 both)
-        // before the guest is reachable. See the class doc for the exact panic signature.
+        // Baked GPG_KEYS contains a TAB; older msb releases (0.6.x) SIGABRT on any TAB in an
+        // image's baked env before the guest is reachable. Fixed on the pinned msb (0.7.1); kept
+        // here as a harmless guard for an older msb via MSB_PATH. See the class doc for the exact
+        // panic signature.
         withEnv("GPG_KEYS", "")
         withEnv("MAX_HEAP_SIZE", "512M")
         withEnv("HEAP_NEWSIZE", "128M")

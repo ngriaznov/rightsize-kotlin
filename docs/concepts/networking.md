@@ -72,10 +72,11 @@ pattern you should copy. See why below.
   [UDP](#udp) below for that mechanism's own detail).
 
 This emulation is a genuine engineering achievement (there is no supported
-sandbox-to-sandbox or sandbox-to-host networking path in microsandbox 0.6.2 at all —
-see [How It Works](../how-it-works.md) for the tunnel design) but it comes with real,
-documented limits. rightsize is honest about them rather than papering over them with
-a "mostly works" story.
+sandbox-to-sandbox networking path in microsandbox at all — a sandbox can reach host
+loopback services through its gateway when policy allows it, but siblings still can't
+reach each other; see [How It Works](../how-it-works.md) for the tunnel design) but it
+comes with real, documented limits. rightsize is honest about them rather than
+papering over them with a "mostly works" story.
 
 ## Limits on the microsandbox backend
 

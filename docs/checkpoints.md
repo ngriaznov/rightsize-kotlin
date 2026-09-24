@@ -462,8 +462,8 @@ is already zstd-compressed; a docker `save` tar compresses poorly enough not to 
 
 `exportTo` never bundles the container image itself, on either backend — a docker archive is the
 committed layer(s) on top of the base image, not the base image; an msb archive is the disk
-snapshot artifact alone (`msb snapshot save` deliberately never runs with `--with-image`, whose
-import fails an integrity check on msb 0.6.6). The destination machine pulls the image normally on
+snapshot artifact alone (`msb snapshot save` never runs with `--with-image` — see
+[Roadmap](roadmap.md#self-contained-archives) for bundling the image too). The destination machine pulls the image normally on
 the restored container's first boot, exactly as it would for any other container using that image
 — make sure it's reachable there (a private registry needs the same credentials it would for a
 fresh pull).

@@ -185,9 +185,9 @@ interface SandboxBackend : AutoCloseable {
      * Writes checkpoint [ref]'s backend payload to [dest] — the artifact half of a portable
      * checkpoint archive (see docs/checkpoints.md's "Moving checkpoints between machines"
      * section) behind `Checkpoint.exportTo`: docker `docker save -o <dest> <ref>`, microsandbox
-     * `msb snapshot save <ref> <dest>` (never `--with-image`; its import fails an integrity
-     * check on msb 0.6.6, so archives never bundle the OCI image — the destination machine pulls
-     * it on the restored container's first boot instead). Only ever called after the generic
+     * `msb snapshot save <ref> <dest>` (never `--with-image`; this library doesn't bundle the OCI
+     * image into the archive, so the destination machine pulls it on the restored container's
+     * first boot instead — see docs/roadmap.md). Only ever called after the generic
      * layer's own backend-match and [hasCheckpoint] checks have both passed. Defaults to
      * throwing [UnsupportedByBackendException] for backends that don't implement it.
      */

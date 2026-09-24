@@ -14,8 +14,8 @@ class MsbCommandsTest {
         networkId = "rz-net-1", aliases = listOf("redis"), runId = "abc",
     )
 
-    // ATTACHED mode (no -d): detached mode never starts the image ENTRYPOINT (confirmed
-    // empirically against the real msb binary).
+    // rightsize always builds ATTACHED-mode argv (no -d), for supervision (death detection,
+    // boot diagnostics) rather than because detached mode fails to start the workload.
     @Test fun `run command carries all spec parts, attached, no -d`() {
         val cmd = MsbCommands.run(spec)
         assertEquals(listOf("run", "--name", "rz-abc-1",

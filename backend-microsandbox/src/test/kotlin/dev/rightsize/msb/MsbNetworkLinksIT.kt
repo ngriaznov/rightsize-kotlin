@@ -38,7 +38,7 @@ class MsbNetworkLinksIT {
         }
     }
 
-    // msb 0.6.2's port-publish proxy never propagates the target's own TCP close back to the
+    // msb's port-publish proxy never propagates the target's own TCP close back to the
     // tunnel's host-side socket - without the idle-timeout fix, the
     // target->guest pump blocks forever after the FIRST exchange, serveOneConnection never
     // returns, the in-guest `nc -l` listener is never respawned, and every connection after the

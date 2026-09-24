@@ -13,13 +13,16 @@ re-discovering the cause from scratch.
 runs — `msb status` shows the image's default command as metadata, but nothing is
 listening, nothing is logging.
 
-**Cause:** microsandbox's detached mode (`msb run -d`) boots the VM with only its init
-process — it does not start the image's own ENTRYPOINT/CMD at all on msb 0.6.2.
+**Cause:** On older msb releases (0.6.x), microsandbox's detached mode (`msb run -d`)
+booted the VM with only its init process — it did not start the image's own
+ENTRYPOINT/CMD at all. That's fixed on the pinned msb (0.7.1): detached mode runs the
+workload the same as Docker would.
 
-**Fix:** Not something you need to fix yourself — rightsize's microsandbox backend
-runs every sandbox in **attached** mode instead, holding a supervising child process
-per container so the ENTRYPOINT runs exactly as it would under Docker. If you're
-driving `msb` directly outside of rightsize and hit this, that's the fix: drop `-d`.
+**Fix:** rightsize's microsandbox backend runs every sandbox in **attached** mode
+regardless, holding a supervising child process per container for death detection and
+boot diagnostics (see [How It Works](how-it-works.md#attached-mode-supervision)) —
+that's not a workaround for this particular gap. If you're driving an older `msb`
+directly outside of rightsize and hit this, drop `-d`.
 
 ## `msb exec` hangs forever
 
@@ -39,8 +42,7 @@ redirect-from-`/dev/null` the child's stdin rather than leaving a pipe open.
 log line delivered slightly *after* the container itself reports `stop()` complete,
 rather than exactly at stream close.
 
-**Cause:** `msb logs -f` never exits once its sandbox stops (a documented gap in msb
-0.6.2) — it blocks on read forever rather than hitting EOF.
+**Cause:** `msb logs -f` never exits on its own once its sandbox stops.
 
 **Fix:** Already handled — the microsandbox backend runs a watchdog that, once the
 sandbox is confirmed stopped, quiesces the stuck follow process and replays only the
@@ -117,21 +119,24 @@ directory.
 
 ## A control-character panic (`InvalidAscii`) on container boot
 
-**Symptom:** A container fails to boot under the microsandbox backend with an
-`InvalidAscii`-style panic from the krun VMM, before the guest workload ever starts —
-reproduced even with zero rightsize-set environment variables.
+**Symptom:** On an older msb release, a container fails to boot under the microsandbox
+backend with an `InvalidAscii`-style panic from the krun VMM, before the guest
+workload ever starts — reproduced even with zero rightsize-set environment variables.
 
-**Cause:** microsandbox 0.6.2's krun VMM rejects environment variable values
-containing control characters. The official `postgres:*-alpine` image is a known
-example: it bakes `DOCKER_PG_LLVM_DEPS` with a literal tab character (from a
-Dockerfile-internal package list built with `\t\t` continuation).
+**Cause:** On older msb releases (0.6.x), the krun VMM rejected environment variable
+values containing control characters. The official `postgres:*-alpine` image was a
+known example: it bakes `DOCKER_PG_LLVM_DEPS` with a literal tab character (from a
+Dockerfile-internal package list built with `\t\t` continuation); Cassandra's
+`GPG_KEYS` is another. Fixed on the pinned msb (0.7.1) — both boot with those
+variables unmodified now.
 
-**Fix:** Already handled for `PostgreSQLContainer` — it overrides the offending
-variable to an empty string, which is a no-op on Docker and the fix on microsandbox.
-If you hit this with an image rightsize doesn't ship a module for, look for a baked env
-var with an unusual byte in it (check via `docker inspect <image>`) and override it the
-same way; there's no general-purpose sanitizer built into the backend yet, so this is
-handled per-image.
+**Fix:** `PostgreSQLContainer` and `CassandraContainer` still override their
+respective offending variables to an empty string unconditionally, as a harmless guard
+for anyone pointing `MSB_PATH` at an older msb — a no-op on Docker and on the pinned
+msb either way. If you're running an older msb directly and hit this with an image
+rightsize doesn't ship a module for, look for a baked env var with an unusual byte in
+it (check via `docker inspect <image>`) and override it the same way; there's no
+general-purpose sanitizer built into the backend, so this is handled per-image.
 
 ## Sandboxes are left behind after a crashed or SIGKILLed process
 
@@ -210,7 +215,7 @@ not a rightsize bug.
 alias works exactly once, then every subsequent connection from the same consumer
 hangs indefinitely.
 
-**Cause:** msb 0.6.2's port-publish proxy never propagates the target's own TCP close
+**Cause:** msb's port-publish proxy never propagates the target's own TCP close
 back to the tunnel's host-side socket — a host client reading a published port never
 observes EOF even after the guest workload closes its end. Naively pumping until a
 natural `read() == 0` therefore blocks forever after the first exchange, so the

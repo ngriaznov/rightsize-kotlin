@@ -167,10 +167,14 @@ class MsbCliBackend private constructor(
     override fun create(spec: ContainerSpec): SandboxHandle = Handle(spec)
 
     /**
-     * ATTACHED-mode supervision when `handle.spec.checkpointRef` is unset (detached `-d` mode
-     * never starts the image ENTRYPOINT — confirmed empirically against the real binary). The
-     * `msb run` child lives as long as the sandbox; readiness = name Running in `msb ls --format
-     * json`. Workload logs come from `msb logs`, not this process's stdout.
+     * ATTACHED-mode supervision when `handle.spec.checkpointRef` is unset. Detached `-d` mode
+     * does run the image's ENTRYPOINT on the pinned msb (0.7.1) — confirmed empirically against
+     * the real binary — but this backend still runs attached regardless: the `msb run` child
+     * gives it something to detect death against and a tail of boot output to classify a failure
+     * from (see [spawnAttachedRun], [awaitRunning]), rather than a `msb ls` poll with no signal
+     * to explain a boot that never reaches Running. The child lives as long as the sandbox;
+     * readiness = name Running in `msb ls --format json`. Workload logs come from `msb logs`, not
+     * this process's stdout.
      *
      * A workload that completes before this backend's poll ever samples Running (e.g. a short
      * build or script — see [isCleanFastExit]) is not a failed boot: the child still exits 0,
@@ -1444,8 +1448,8 @@ class MsbCliBackend private constructor(
         invoke(MsbCommands.logs(handle.id), LOGS_TIMEOUT_SEC).stdout
 
     /**
-     * `msb logs -f` is documented to "exit cleanly when the sandbox stops", but on msb 0.6.2 it
-     * blocks on read forever instead — so a workload's final unterminated line (no trailing '\n')
+     * `msb logs -f` is documented to "exit cleanly when the sandbox stops", but it never exits on
+     * its own once the sandbox stops — so a workload's final unterminated line (no trailing '\n')
      * would otherwise never reach `consumer`. A watchdog thread works around it. Guarantees:
      *
      * 1. Once the sandbox leaves Running (per `runningSandboxNames()`), the watchdog quiesces the
@@ -1564,11 +1568,10 @@ class MsbCliBackend private constructor(
     override fun removeNetwork(networkId: String) {}
 
     /**
-     * Emulate network aliases per protocol — there is no bridge/subnet on macOS 0.6.2, and no
-     * guest-to-guest networking of any kind on msb at all, so both routes are built entirely out
-     * of the exec channel. TCP links get a per-link [ExecTunnel]: it serves the in-guest
-     * `nc -l -p <guestPort>` listener and pumps bytes to `127.0.0.1:<targetHostPort>`, one
-     * connection at a time. UDP links get [installUdpForwarder] instead: an in-guest forwarder
+     * Emulate network aliases per protocol — msb gives sandboxes no network shared with each
+     * other, so each protocol takes its own route. TCP links get a per-link [ExecTunnel]: it
+     * serves the in-guest `nc -l -p <guestPort>` listener and pumps bytes to
+     * `127.0.0.1:<targetHostPort>`, one connection at a time. UDP links get [installUdpForwarder] instead: an in-guest forwarder
      * process, launched once at install time rather than per connection, that relays datagrams to
      * the gateway address `hostUdpEgressPorts` (see [MsbCommands.run]/[MsbCommands.restore])
      * already opened an egress rule for.

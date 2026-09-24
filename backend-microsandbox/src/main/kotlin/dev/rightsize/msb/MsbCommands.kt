@@ -8,8 +8,8 @@ import java.nio.file.Path
 
 /**
  * Pure msb CLI argv construction. Flag spellings verified empirically against the real
- * `msb` binary. ATTACHED mode (no -d): `msb run -d` (detached) never starts the image's
- * own ENTRYPOINT/CMD, only attached mode does.
+ * `msb` binary. rightsize always builds ATTACHED-mode argv (no `-d`) — see
+ * [MsbCliBackend]'s own doc for why it stays attached.
  */
 object MsbCommands {
     fun run(spec: ContainerSpec): List<String> = buildList {
@@ -43,9 +43,9 @@ object MsbCommands {
         // is dropped, which on Windows strips the internal spec's option block and re-creates
         // the same misparse one layer down (captured: `--mount "fm_…:\\?\C:\…": expected flag
         // or key=value option`). `nodev` always survives the carry-over, and for a single-file
-        // mount it is meaningless (no device nodes to block): verified against a real msb
-        // 0.6.8 — `rw,nodev` mounts `rw,nodev` and accepts an in-guest write, `ro,nodev`
-        // rejects one with `Read-only file system`.
+        // mount it is meaningless (no device nodes to block): this parity gap closed as of msb
+        // 0.6.8, confirmed against a real binary — `rw,nodev` mounts `rw,nodev` and accepts an
+        // in-guest write, `ro,nodev` rejects one with `Read-only file system`.
         spec.mounts.forEach {
             add("--mount-file")
             add("${it.hostPath}:${it.guestPath}:${if (it.readOnly) "ro" else "rw"},nodev")
@@ -230,9 +230,10 @@ object MsbCommands {
      * `msb snapshot save <ref> <dest>` — writes a `.tar.zst` artifact archive for [ref] to
      * [dest]; the artifact half of a portable checkpoint archive (see
      * [MsbCliBackend.exportCheckpoint], docs/checkpoints.md's "Moving checkpoints between
-     * machines" section). Deliberately never `--with-image`: its import fails an integrity check
-     * ("raw manifest digest mismatch") on msb 0.6.6, so the destination machine pulls the OCI
-     * image on the restored container's first boot instead.
+     * machines" section). Deliberately never `--with-image`: this library doesn't bundle the OCI
+     * image into the archive, so the destination machine pulls it on the restored container's
+     * first boot instead. `--with-image` itself works on the pinned msb (0.7.1); bundling the
+     * image is a roadmap item, not something this library does yet — see docs/roadmap.md.
      */
     fun snapshotExport(ref: String, dest: Path) = listOf("snapshot", "save", ref, dest.toString())
 
