@@ -1564,50 +1564,41 @@ class MsbCliBackend private constructor(
     override fun removeNetwork(networkId: String) {}
 
     /**
-     * Emulate network aliases with per-link exec-stream TCP tunnels (there is no bridge/subnet
-     * on macOS 0.6.2; the only data path into a running sandbox is the exec channel). For each link:
-     * add `127.0.0.1 <alias>` to /etc/hosts, then spawn an [ExecTunnel] that repeatedly serves the
-     * in-guest `nc -l -p <guestPort>` listener and pumps bytes to `127.0.0.1:<targetHostPort>`.
+     * Emulate network aliases per protocol — there is no bridge/subnet on macOS 0.6.2, and no
+     * guest-to-guest networking of any kind on msb at all, so both routes are built entirely out
+     * of the exec channel. TCP links get a per-link [ExecTunnel]: it serves the in-guest
+     * `nc -l -p <guestPort>` listener and pumps bytes to `127.0.0.1:<targetHostPort>`, one
+     * connection at a time. UDP links get [installUdpForwarder] instead: an in-guest forwarder
+     * process, launched once at install time rather than per connection, that relays datagrams to
+     * the gateway address `hostUdpEgressPorts` (see [MsbCommands.run]/[MsbCommands.restore])
+     * already opened an egress rule for.
      *
-     * Five concerns, each its own step: reject any UDP link outright, reject duplicate guest
-     * ports, probe for `nc`, install the `/etc/hosts` aliases, then spawn one tunnel per link.
+     * Five concerns, each its own step: reject duplicate guest ports, reject invalid aliases,
+     * probe each protocol actually in play for the tool it needs, install the shared
+     * `/etc/hosts` aliases, then install one tunnel/forwarder per link.
      */
     override fun installNetworkLinks(handle: SandboxHandle, links: List<NetworkLink>) {
         if (links.isEmpty()) return
         handle as Handle
-        requireNoUdpLinks(links)
         requireNoDuplicateGuestPorts(links)
         requireAliasesAreValid(links)
-        requireNcAvailable(handle)
+        val (udpLinks, tcpLinks) = links.partition { it.protocol == PortProtocol.UDP }
+        if (tcpLinks.isNotEmpty()) requireNcAvailable(handle)
+        if (udpLinks.isNotEmpty()) requireUdpForwarderCapable(handle)
         installHostsAliases(handle, links)
-        links.forEach { handle.resources += ExecTunnel(msb, handle.id, it) }
+        tcpLinks.forEach { handle.resources += ExecTunnel(msb, handle.id, it) }
+        udpLinks.forEach { installUdpForwarder(handle, it) }
     }
 
     /**
-     * msb has no direct guest-to-guest networking at all — this backend's `Network` emulation is
-     * a TCP exec-tunnel relay (see [ExecTunnel]), which has no UDP equivalent, so a UDP-tagged
-     * link is rejected outright, before the duplicate-port/alias/`nc` checks below even run (a
-     * UDP link can't be "fixed" by clearing any of those) — same
-     * unsupported-with-remedy [UnsupportedByBackendException] shape as [requireNcAvailable]'s own
-     * gap-naming guard. The remedy names both msb-compatible escape hatches: switch to the docker
-     * backend for real container-to-container UDP, or — staying on msb — publish the UDP service
-     * on a host port (`withExposedUdpPorts` + `getMappedUdpPort`) and have the consumer dial that
-     * instead of a network alias. See docs/concepts/networking.md's UDP section.
+     * Duplicates are checked per (protocol, guestPort), not guestPort alone: a TCP link and a UDP
+     * link may legitimately share one guest port number (DNS's 53/tcp + 53/udp is the usual
+     * case) — they route over entirely separate mechanisms ([ExecTunnel] vs
+     * [installUdpForwarder]) and never collide with each other, only with another link of their
+     * OWN protocol on the same port.
      */
-    private fun requireNoUdpLinks(links: List<NetworkLink>) {
-        val udpLink = links.firstOrNull { it.protocol == PortProtocol.UDP } ?: return
-        throw UnsupportedByBackendException(
-            "container-to-container UDP network links (guest port ${udpLink.guestPort} on alias " +
-                "'${udpLink.alias}') — microsandbox has no guest-to-guest networking to emulate this over",
-            name,
-            remedy = "run this test with RIGHTSIZE_BACKEND=docker for real container-to-container UDP, " +
-                "or publish the UDP service on a host port with withExposedUdpPorts(...) + " +
-                "getMappedUdpPort(...) and have the consumer dial that instead of a network alias",
-        )
-    }
-
     private fun requireNoDuplicateGuestPorts(links: List<NetworkLink>) {
-        links.groupBy { it.guestPort }.values.firstOrNull { it.size > 1 }?.let { dup ->
+        links.groupBy { it.protocol to it.guestPort }.values.firstOrNull { it.size > 1 }?.let { dup ->
             throw UnsupportedByBackendException(
                 "two siblings exposing the same guest port ${dup.first().guestPort} on one network", name)
         }
@@ -1639,6 +1630,73 @@ class MsbCliBackend private constructor(
             .joinToString("; ") { "echo '127.0.0.1 $it' >> /etc/hosts" }
         val r = exec(handle, listOf("sh", "-c", hostsEntries))
         check(r.exitCode == 0) { "failed to install /etc/hosts aliases in ${handle.id}: ${r.stderr}" }
+    }
+
+    /**
+     * The UDP forwarder needs more from the guest's `nc` than [requireNcAvailable]'s plain
+     * `command -v nc` ever checked: `-e PROG` (to exec the relay once a listener locks onto a
+     * client) and `-u` (UDP mode), plus a `timeout` binary to bound each relay's lifetime — see
+     * [UDP_FORWARDER_SCRIPT]. Busybox prints its own usage text to STDERR on `--help`, with a
+     * non-zero exit, hence `2>&1` ahead of each grep.
+     */
+    private fun requireUdpForwarderCapable(handle: Handle) {
+        val probe = exec(handle, listOf("sh", "-c",
+            "command -v nc >/dev/null && command -v timeout >/dev/null && " +
+                "nc --help 2>&1 | grep -q -- '-e PROG' && nc --help 2>&1 | grep -q -- '-u'"))
+        if (probe.exitCode != 0) throw UnsupportedByBackendException(
+            "UDP network links (consumer image '${handle.spec.image}' has no busybox-style nc " +
+                "with -u/-e, or no timeout)", name,
+            remedy = "run this test with RIGHTSIZE_BACKEND=docker instead")
+    }
+
+    /**
+     * Writes [UDP_FORWARDER_SCRIPT] to `/tmp/rz-udp-link-<guestPort>.sh` via a QUOTED heredoc (no
+     * shell expansion while writing — the script's own `$P`/`$H`/etc. must reach disk literally)
+     * and launches it detached, then waits for [link]'s guest port to actually bind. A detached
+     * background process outlives this exec session, and every guest process dies with the
+     * sandbox regardless — a UDP link needs no host-side resource and no teardown code, unlike
+     * [ExecTunnel]'s own worker thread/subprocess pair. After a checkpoint reboot the existing
+     * link-replay (`GenericContainer.checkpoint`'s own re-install) runs this same install again in
+     * the rebooted sandbox: `/tmp` is tmpfs there, so nothing survives across the reboot to skip.
+     */
+    private fun installUdpForwarder(handle: Handle, link: NetworkLink) {
+        val scriptPath = "/tmp/rz-udp-link-${link.guestPort}.sh"
+        val logPath = "/tmp/rz-udp-link-${link.guestPort}.log"
+        val write = exec(handle, listOf("sh", "-c",
+            "cat > $scriptPath <<'RZ_UDP_LINK_EOF'\n$UDP_FORWARDER_SCRIPT\nRZ_UDP_LINK_EOF"))
+        check(write.exitCode == 0) {
+            "failed to write the UDP forwarder script to $scriptPath in ${handle.id}: ${write.stderr}"
+        }
+        val launch = exec(handle, listOf("sh", "-c",
+            "nohup sh $scriptPath ${link.guestPort} ${link.targetHostPort} >$logPath 2>&1 &"))
+        check(launch.exitCode == 0) {
+            "failed to launch the UDP forwarder for guest port ${link.guestPort} in ${handle.id}: ${launch.stderr}"
+        }
+        awaitUdpForwarderReady(handle, link, logPath)
+    }
+
+    /**
+     * Polls every [UDP_FORWARDER_READINESS_POLL_MS] for up to
+     * [UDP_FORWARDER_READINESS_BUDGET_MS] until [link]'s guest port shows up bound in
+     * `/proc/net/udp`/`/proc/net/udp6` — the local-address column's port there is 4 uppercase hex
+     * digits after the colon (`man proc`), hence the `%04X` formatting. A timeout tails [logPath]
+     * into the error, so a startup failure the earlier capability probe didn't catch is visible
+     * without a second round-trip.
+     */
+    private fun awaitUdpForwarderReady(handle: Handle, link: NetworkLink, logPath: String) {
+        val hex = "%04X".format(link.guestPort)
+        val probeCmd = "awk -v p=':$hex' 'NR>1 && substr(\$2, length(\$2)-4) == p {f=1} END {exit !f}' " +
+            "/proc/net/udp /proc/net/udp6"
+        val deadline = System.currentTimeMillis() + UDP_FORWARDER_READINESS_BUDGET_MS
+        while (true) {
+            if (exec(handle, listOf("sh", "-c", probeCmd)).exitCode == 0) return
+            if (System.currentTimeMillis() >= deadline) {
+                val tail = exec(handle, listOf("sh", "-c", "tail -c 2000 $logPath 2>/dev/null")).stdout
+                error("UDP forwarder for guest port ${link.guestPort} in ${handle.id} never bound " +
+                    "within ${UDP_FORWARDER_READINESS_BUDGET_MS}ms — $logPath tail: $tail")
+            }
+            Thread.sleep(UDP_FORWARDER_READINESS_POLL_MS)
+        }
     }
 
     override fun close() { startedNames.toList().forEach { silently(it) } }
@@ -1756,6 +1814,12 @@ private const val BROKER_EC_WAIT_BUDGET_SEC = 30
 // trip; a timeout here is broker INFRASTRUCTURE trouble (BrokerOutcome.BrokerFailure), not a
 // restore classification.
 private const val BROKER_PROCESS_TIMEOUT_SEC = 45L
+// installUdpForwarder's own readiness poll (see awaitUdpForwarderReady) — a tighter cadence than
+// READINESS_POLL_MS's 300ms since a UDP forwarder binding its listener is a local guest-side
+// event, not a boot msb ls has to report on, and a bounded total budget rather than an attempt
+// count, same shape as every other wall-clock wait in this file.
+private const val UDP_FORWARDER_READINESS_POLL_MS = 100L
+private const val UDP_FORWARDER_READINESS_BUDGET_MS = 5_000L
 
 /** The one boot failure [MsbCliBackend] heals and retries — carries the `msb run` child's
  * combined output for the second-failure diagnostic. Internal to the boot path: never
@@ -2152,6 +2216,49 @@ internal val WORKLOAD_CMDLINE_CAPTURE_SCRIPT = """
       exit 0
     done
     exit 1
+""".trimIndent()
+
+/**
+ * A busybox-compatible POSIX `sh` script ([MsbCliBackend.installUdpForwarder] writes and launches
+ * it) that relays UDP datagrams arriving on guest port `$1` to `<gateway>:$2` — a link's
+ * `guestPort`/`targetHostPort` pair — forever, serving one client socket at a time but never
+ * getting stuck on the first: `nc -u -l` locks onto whichever peer sends the first datagram and
+ * ignores every other source from then on, so a fresh listener has to be started before that
+ * happens again. Detecting "locked" by watching the listener's own `/proc/<pid>/cmdline`: right
+ * after the backgrounded `nc -u -l` forks, the CHILD's cmdline still reads as the supervisor's own
+ * `sh /tmp/rz-udp-link-<port>.sh ...` (the exec into `nc` hasn't landed yet), so the first wait
+ * loop holds WHILE the cmdline still contains `rz-udp-link` (this script's own path) and only
+ * proceeds once that's gone, i.e. once `nc` has actually exec'd; only then does the second loop's
+ * watch for `-l` to disappear from that cmdline mean "a client connected" — the listener has
+ * locked onto it, so the next listener can start — rather than "the fork hasn't landed yet";
+ * checking either signal too early piles up listeners.
+ * `timeout 60` bounds each individual relay (each distinct client source PORT gets its own,
+ * separately timed) at msb's own UDP NAT session idle expiry, so a client that keeps sending past
+ * that window gets a fresh relay rather than a silently expired one. `$H` resolves to the gateway
+ * IPv4 literal read straight out of `/etc/hosts`, never the bare hostname: `host.microsandbox.
+ * internal` also resolves to an IPv6 gateway address, which msb rewrites to `::1` — where the UDP
+ * link's target host port is never listening (it's bound to `127.0.0.1`); `: ${H:=...}` falls
+ * back to the bare hostname only for the case `/etc/hosts` carries no IPv4 gateway line to match.
+ *
+ * No character in this script is a double quote, on purpose: on Windows hosts the JDK's default
+ * `ProcessBuilder` command-line building wraps an exec argument in quotes without escaping any `"`
+ * already inside it, so one anywhere here would reach `msb.exe` mangled. Every value this script
+ * holds — `$1`/`$2`, `$H`, a pid — is a number or an IP literal, so nothing needs quoting.
+ *
+ * EXACTLY this text (only whitespace may differ) reaches the guest, via a quoted heredoc so
+ * nothing here is shell-expanded while it's being written — see [MsbCliBackend.installUdpForwarder].
+ */
+internal val UDP_FORWARDER_SCRIPT = """
+    P=${'$'}1; HP=${'$'}2
+    H=${'$'}(awk -v n=host.microsandbox.internal '${'$'}2 == n && ${'$'}1 ~ /^[0-9.]+${'$'}/ { print ${'$'}1; exit }' /etc/hosts)
+    : ${'$'}{H:=host.microsandbox.internal}
+    while true; do
+      nc -u -l -p ${'$'}P -e timeout 60 nc -u ${'$'}H ${'$'}HP &
+      pid=${'$'}!
+      while [ -e /proc/${'$'}pid ] && grep -q rz-udp-link /proc/${'$'}pid/cmdline 2>/dev/null; do sleep 0.01; done
+      while [ -e /proc/${'$'}pid ] && tr '\0' ' ' < /proc/${'$'}pid/cmdline 2>/dev/null | grep -q -- ' -l '; do sleep 0.05; done
+      [ -e /proc/${'$'}pid ] || sleep 0.2
+    done
 """.trimIndent()
 
 /**

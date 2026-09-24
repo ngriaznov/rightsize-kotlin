@@ -230,6 +230,74 @@ class GenericContainerTest {
         )
     }
 
+    // hostUdpEgressPorts: the core (never a backend) computes the distinct, sorted UDP-linked
+    // target host ports and hands them to backend.create BEFORE start — see GenericContainer's
+    // own start()/createStartedContainer doc for why. FakeBackend records the spec exactly as
+    // issued, so these assert the value independent of any msb argv concern (MsbCommandsTest's job).
+
+    @Test fun `hostUdpEgressPorts on the consumer's spec is the udp sibling's mapped host port, and installNetworkLinks gets the exact same precomputed links`() {
+        val backend = FakeBackend()
+        val net = Network.newNetwork()
+        val udpServer = container(backend).withExposedUdpPorts(53)
+            .withNetwork(net).withNetworkAliases("dns")
+        udpServer.start()
+        val consumer = container(backend).withExposedPorts(8080).withNetwork(net)
+        consumer.start()
+        try {
+            assertEquals(listOf(udpServer.getMappedUdpPort(53)), backend.created.last().hostUdpEgressPorts)
+            val (_, installed) = backend.installedLinks.single()
+            assertEquals(listOf(NetworkLink("dns", 53, udpServer.getMappedUdpPort(53), PortProtocol.UDP)), installed)
+        } finally { consumer.stop(); udpServer.stop() }
+    }
+
+    @Test fun `hostUdpEgressPorts is empty with no network at all, and with a tcp-only network`() {
+        val backend = FakeBackend()
+        val plain = container(backend).withExposedPorts(6379)
+        plain.start()
+        try {
+            assertEquals(emptyList<Int>(), backend.created.single().hostUdpEgressPorts)
+        } finally { plain.stop() }
+
+        val net = Network.newNetwork()
+        val stub = container(backend).withExposedPorts(8888).withNetwork(net).withNetworkAliases("configuration-stub")
+        stub.start()
+        val app = container(backend).withExposedPorts(8080).withNetwork(net)
+        app.start()
+        try {
+            assertEquals(emptyList<Int>(), backend.created.last().hostUdpEgressPorts)
+        } finally { app.stop(); stub.stop() }
+    }
+
+    @Test fun `hostUdpEgressPorts dedups one target host port reachable via two aliases on the same sibling`() {
+        val backend = FakeBackend()
+        val net = Network.newNetwork()
+        val server = container(backend).withExposedUdpPorts(53)
+            .withNetwork(net).withNetworkAliases("dns-a", "dns-b")
+        server.start()
+        val consumer = container(backend).withExposedPorts(8080).withNetwork(net)
+        consumer.start()
+        try {
+            // Two links (one per alias) target the SAME host port — the list must not double-count it.
+            assertEquals(listOf(server.getMappedUdpPort(53)), backend.created.last().hostUdpEgressPorts)
+        } finally { consumer.stop(); server.stop() }
+    }
+
+    @Test fun `hostUdpEgressPorts is distinct and sorted ascending across two different udp-linked siblings`() {
+        val backend = FakeBackend()
+        val net = Network.newNetwork()
+        val a = container(backend).withExposedUdpPorts(53).withNetwork(net).withNetworkAliases("a")
+        a.start()
+        val b = container(backend).withExposedUdpPorts(9999).withNetwork(net).withNetworkAliases("b")
+        b.start()
+        val consumer = container(backend).withExposedPorts(8080).withNetwork(net)
+        consumer.start()
+        try {
+            val actual = backend.created.last().hostUdpEgressPorts
+            assertEquals(actual.sorted(), actual, "hostUdpEgressPorts must be sorted ascending")
+            assertEquals(setOf(a.getMappedUdpPort(53), b.getMappedUdpPort(9999)), actual.toSet())
+        } finally { consumer.stop(); a.stop(); b.stop() }
+    }
+
     @Test fun `single container on a network installs no links but is still registered as a member`() {
         val backend = FakeBackend()
         val net = Network.newNetwork()

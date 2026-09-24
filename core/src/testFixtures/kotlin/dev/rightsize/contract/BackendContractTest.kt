@@ -816,16 +816,13 @@ abstract class BackendContractTest {
     }
 
     /**
-     * Container-to-container UDP on a shared network — docker-only in Phase 1: msb has no direct
-     * guest-to-guest networking (its `Network` emulation is a TCP exec-tunnel relay with no UDP
-     * equivalent — see `MsbCliBackend.installNetworkLinks`'s pre-flight fail-fast), so this is
-     * gated to the docker backend via [Assumptions] rather than exercised generically here.
+     * Container-to-container UDP on a shared network — runs on BOTH backends: docker's native UDP
+     * networking, and (via a network alias) msb's in-guest forwarder relaying the client's
+     * datagram through the gateway to the server's own published UDP host port (see
+     * `MsbCliBackend.installUdpForwarder`). Neither backend needs branching in this test — the
+     * client dials the alias exactly the same way either way.
      */
-    @Test fun `docker network members exchange UDP datagrams natively, container to container`() {
-        val backend = Backends.active()
-        Assumptions.assumeTrue(backend.name.equals("docker", ignoreCase = true),
-            "container-to-container UDP over a Network is docker-only in Phase 1 — msb has no direct " +
-                "guest-to-guest networking to route it over")
+    @Test fun `network members exchange UDP datagrams, container to container, over an alias`() {
         Network.newNetwork().use { net ->
             val marker = "rz-udp-echo-${System.nanoTime()}"
             val server = GenericContainer("alpine:3.19")

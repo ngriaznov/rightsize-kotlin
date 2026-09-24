@@ -11,7 +11,8 @@ import java.util.UUID
  * [GenericContainer.withNetwork] and [GenericContainer.withNetworkAliases], then reach a sibling
  * via [resolve]. On Docker this is a native network alias; on microsandbox — where microVMs are
  * fully isolated from each other — rightsize emulates it with an `/etc/hosts` entry plus an
- * exec-tunneled TCP relay (see the backend's `installNetworkLinks`).
+ * exec-tunneled TCP relay per TCP link, or an in-guest forwarder per UDP link (see the backend's
+ * `installNetworkLinks`).
  */
 class Network private constructor(val id: String) : AutoCloseable {
     private data class Member(val container: GenericContainer<*>, val aliases: List<String>)
@@ -25,9 +26,8 @@ class Network private constructor(val id: String) : AutoCloseable {
     /** One link per (alias, exposed guest port) of a single already-running sibling — both
      * protocols: a TCP link per [dev.rightsize.GenericContainer.mappedPortsView] entry, plus a
      * UDP-tagged one per [dev.rightsize.GenericContainer.mappedUdpPortsView] entry. Docker's
-     * native networks carry either transport with no change of behavior; msb's exec-tunnel
-     * emulation rejects any UDP-tagged link up front (see `MsbCliBackend.installNetworkLinks`),
-     * so a UDP one reaching a starting member there fails that member's own `start()` fast. */
+     * native networks carry either transport with no change of behavior; msb routes each by its
+     * protocol (see `MsbCliBackend.installNetworkLinks`). */
     private fun linksFor(member: Member): List<NetworkLink> =
         member.aliases.flatMap { alias ->
             member.container.mappedPortsView().map { (guest, host) -> NetworkLink(alias, guest, host) } +

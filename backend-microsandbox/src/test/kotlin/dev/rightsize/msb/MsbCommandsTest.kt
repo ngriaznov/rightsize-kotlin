@@ -190,6 +190,36 @@ class MsbCommandsTest {
         assertEquals(listOf("restore", "rz-ckpt-0123456789ab", "--name", "rz-abc-1", "-p", "40000:53/udp"), cmd)
     }
 
+    // --- UDP network links: run's --net-rule per port, restore's replacement policy ---
+
+    @Test fun `run command omits --net-rule when hostUdpEgressPorts is empty, byte-identical to today`() {
+        assertFalse(MsbCommands.run(spec).contains("--net-rule"))
+    }
+
+    @Test fun `run command emits one --net-rule allow-host-udp per port, in list order, before -p`() {
+        val cmd = MsbCommands.run(spec.copy(hostUdpEgressPorts = listOf(40000, 40001)))
+        val ruleIndices = cmd.withIndex().filter { it.value == "--net-rule" }.map { it.index }
+        assertEquals(2, ruleIndices.size, "argv was $cmd")
+        assertEquals("allow@host:udp:40000", cmd[ruleIndices[0] + 1])
+        assertEquals("allow@host:udp:40001", cmd[ruleIndices[1] + 1])
+        assertTrue(ruleIndices.last() < cmd.indexOf("-p"), "the net-rule flags must sit before -p: $cmd")
+    }
+
+    @Test fun `restore command omits --net-default and --net-rule when hostUdpEgressPorts is empty, byte-identical to today`() {
+        val cmd = MsbCommands.restore(spec.copy(checkpointRef = "rz-ckpt-0123456789ab"))
+        assertFalse(cmd.contains("--net-default"))
+        assertFalse(cmd.contains("--net-rule"))
+    }
+
+    @Test fun `restore command emits the full replacement policy, ports comma-joined in list order, when hostUdpEgressPorts is non-empty`() {
+        val cmd = MsbCommands.restore(spec.copy(
+            checkpointRef = "rz-ckpt-0123456789ab", ports = emptyList(),
+            hostUdpEgressPorts = listOf(40000, 40001)))
+        assertEquals(listOf("restore", "rz-ckpt-0123456789ab", "--name", "rz-abc-1",
+            "--net-default", "deny",
+            "--net-rule", "allow@public,allow@dns,allow@host:udp:40000,allow@host:udp:40001,allow:ingress@any"), cmd)
+    }
+
     @Test fun `exec logs stop rm ls`() {
         assertEquals(listOf("exec", "rz-abc-1", "--", "redis-cli", "ping"),
             MsbCommands.exec("rz-abc-1", listOf("redis-cli", "ping")))

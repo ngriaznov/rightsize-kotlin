@@ -84,8 +84,8 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
     // CheckpointRestoreOverrideUnsupportedException's doc).
     private var checkpointCapturedEnv: Map<String, String> = emptyMap()
     private var checkpointCapturedCommand: List<String>? = null
-    // The links installed by linkToRunningSiblings at start() — empty when this container never
-    // joined a Network or joined one with no running siblings yet. checkpoint() replays these
+    // The links start() installed — empty when this container never joined a Network or joined
+    // one with no running siblings yet. checkpoint() replays these
     // after a workload-restarting backend's cycle, since the reboot tears the emulated tunnels
     // down (see checkpoint's doc).
     private var startNetworkLinks: List<NetworkLink> = emptyList()
@@ -121,7 +121,8 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
      * [dev.rightsize.core.wait.Wait.forLogMessage] for a UDP service. Docker publishes each port
      * with a native `<port>/udp` binding; microsandbox publishes it with `-p host:guest/udp` on
      * both `msb run` and `msb restore`. See docs/concepts/networking.md's UDP section — including
-     * why joining an msb `Network` alongside a UDP-exposed sibling is unsupported in this phase.
+     * how a UDP-exposed sibling also works as a [Network] link target on the microsandbox
+     * backend, via an in-guest UDP forwarder rather than the TCP tunnel's relay.
      */
     fun withExposedUdpPorts(vararg ports: Int): SELF { exposedUdpPorts += ports.toList(); return this as SELF }
     /** Overrides the image's default entrypoint/command. */
@@ -561,12 +562,23 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
         // window between the two never leaves a created-but-unlisted network for the sweep or
         // watchdog to miss (see RunLedger.beforeNetworkCreate's doc comment).
         val net = network?.also { Reaper.beforeNetworkCreate(backend, it.id); backend.ensureNetwork(it.id) }
+        // Computed BEFORE create — not after, the way linking used to work — because
+        // hostUdpEgressPorts (below) must already be on the spec the backend's create/run argv is
+        // built from: msb cannot change a running sandbox's network policy, so an egress rule for
+        // a UDP link has to be baked in at boot. Still a snapshot of RUNNING siblings only,
+        // exactly as before; this container is not registered on [net] yet, so it can never be
+        // its own sibling.
+        val links = net?.linksForNewMember() ?: emptyList()
 
-        val h = createStartedContainer(net)   // allocate → create → start (with port-retry)
+        val h = createStartedContainer(net, links)   // allocate → create → start (with port-retry)
         handle = h
 
         try {
-            linkToRunningSiblings(h, net)      // dial-able before our own boot begins
+            // Install EXACTLY the links the spec above was built from — never recompute here, or
+            // a sibling that started in between could add a link the just-issued create/run argv
+            // never opened a policy rule for.
+            startNetworkLinks = links
+            backend.installNetworkLinks(h, links)   // dial-able before our own boot begins
             net?.register(this, aliases, backend)   // AFTER linking, so we never link to ourselves
             waitStrategy.waitUntilReady(waitTarget())
         } catch (e: Exception) {
@@ -601,17 +613,6 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
         if (networkDisabled && networkId != null) throw NetworkDisabledConflictException()
     }
 
-    /** Links to siblings already running when we start; a failure here still tears us down.
-     * Stashes the computed links in [startNetworkLinks] so [checkpoint] can replay them after a
-     * workload-restarting backend's cycle. */
-    private fun linkToRunningSiblings(handle: SandboxHandle, net: Network?) {
-        net?.let {
-            val links = it.linksForNewMember()
-            startNetworkLinks = links
-            backend.installNetworkLinks(handle, links)
-        }
-    }
-
     /** Allocates one free host port per exposed guest port, replacing any previous mapping — TCP
      * ports via [FreePorts.allocate] (binds a [java.net.ServerSocket] to prove the port is free),
      * UDP ports via [FreePorts.allocateUdp] (a TCP bind proves nothing about a UDP port — the two
@@ -636,13 +637,18 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
      * backend reports a host-port bind conflict — the retry is this method's own concern, not
      * something a caller should have to orchestrate.
      */
-    private fun createStartedContainer(net: Network?): SandboxHandle {
+    private fun createStartedContainer(net: Network?, links: List<NetworkLink>): SandboxHandle {
         var lastConflict: Exception? = null
         // Ports that hit a bind conflict stay quarantined (held in FreePorts' issued set, not
         // returned) until this retry loop exits: releasing them immediately would let the next
         // attempt legally re-pick the very port that just conflicted, wasting an attempt on a
         // proven-contended port.
         val conflicted = mutableListOf<Int>()
+        // The distinct host UDP ports [links] target, sorted ascending for a deterministic argv —
+        // fixed for every attempt below, since [links] itself never changes across a port-bind
+        // retry (only THIS container's own ports get re-rolled).
+        val udpEgressPorts = links.filter { it.protocol == PortProtocol.UDP }
+            .map { it.targetHostPort }.distinct().sorted()
         try {
         repeat(PORT_BIND_ATTEMPTS) {
             allocatePorts()
@@ -664,6 +670,10 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
                 networkDisabled = networkDisabled,
             )
             spec = customizeSpec(spec) { guest -> mappedPorts.getValue(guest) }
+            // Applied AFTER customizeSpec, never before, so a subclass hook overriding
+            // customizeSpec can never drop it — see start()'s own doc on why this has to be on
+            // the spec the backend actually receives.
+            spec = spec.copy(hostUdpEgressPorts = udpEgressPorts)
             validateSpecConflicts(spec.diskLimitMb, spec.tmpfsRootMb, spec.memoryLimitMb, spec.networkDisabled, spec.networkId)
             Reaper.beforeCreate(backend, spec)
             val h = try {
@@ -865,6 +875,9 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
         try {
         repeat(PORT_BIND_ATTEMPTS) {
             allocatePorts()
+            // No networkId/aliases, and hostUdpEgressPorts stays at its empty default: startReuse
+            // already rejected withNetwork() before ever reaching this method (see
+            // ReuseNetworkConflictException), so a reuse sandbox never has links to compute one from.
             var spec = ContainerSpec(
                 name = name,
                 image = image,

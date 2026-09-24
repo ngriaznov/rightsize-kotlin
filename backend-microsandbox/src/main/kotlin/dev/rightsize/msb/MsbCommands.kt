@@ -25,6 +25,10 @@ object MsbCommands {
         // `--net private` keeps published ports and private-range network links working while
         // blocking public-internet egress — `--net none` was tried and breaks port forwarding.
         if (spec.networkDisabled) { add("--net"); add("private") }
+        // One rule per UDP network link this sandbox needs to reach — a bare --net-rule (no
+        // --net flag) PREPENDS to msb's default policy rather than replacing it, so public
+        // internet/DNS/published-port ingress keep working alongside it.
+        spec.hostUdpEgressPorts.forEach { add("--net-rule"); add("allow@host:udp:$it") }
         spec.ports.forEach { add("-p"); add(portArg(it)) }
         spec.env.forEach { (k, v) -> add("-e"); add("$k=$v") }
         // The option block is always spelled out, never left to msb's defaults, for two
@@ -110,7 +114,12 @@ object MsbCommands {
      * env/command (see `GenericContainer.start`'s override check). [spec.ports] and
      * [spec.memoryLimitMb] DO carry over — `RestoreResourceArgs`/`RestoreControlArgs` both take
      * `-p`/`-m` for exactly this, sizing the fresh destination sandbox rather than describing
-     * what was captured.
+     * what was captured. [spec.hostUdpEgressPorts] DOES carry over too, as the `--net-default`/
+     * `--net-rule` policy below — unlike env/command/mounts/disk/network-disabled, it was never
+     * part of what the snapshot captured in the first place: it is per-run wiring the core
+     * recomputes from this restore's own [dev.rightsize.core.NetworkLink]s before every start
+     * (see `GenericContainer.start`'s own doc), so re-deriving it fresh for THIS restore is
+     * exactly right, not a captured value being replayed.
      */
     fun restore(spec: ContainerSpec): List<String> = buildList {
         val ref = requireNotNull(spec.checkpointRef) { "MsbCommands.restore requires spec.checkpointRef to be set" }
@@ -118,6 +127,19 @@ object MsbCommands {
         add("--name"); add(spec.name)
         spec.memoryLimitMb?.let { add("-m"); add("${it}M") }
         spec.ports.forEach { add("-p"); add(portArg(it)) }
+        // Three reasons this is a full replacement policy, not a single added rule like run()'s:
+        // restore never carries a CLI-given policy into the restored sandbox at all (msb falls
+        // back to its own default); restore's --net-rule only takes effect together with
+        // --net-default (there is no --net profile flag on restore); and --net-default replaces
+        // BOTH directions at once, so the published-port ingress a bare policy gets for free on
+        // `run` has to be re-stated here explicitly (allow:ingress@any) or restored ports go dark.
+        if (spec.hostUdpEgressPorts.isNotEmpty()) {
+            add("--net-default"); add("deny")
+            add("--net-rule")
+            add((listOf("allow@public", "allow@dns") +
+                spec.hostUdpEgressPorts.map { "allow@host:udp:$it" } +
+                listOf("allow:ingress@any")).joinToString(","))
+        }
     }
 
     /** `<host>:<guest>`, with a trailing `/udp` for a UDP [dev.rightsize.core.PortBinding] — the

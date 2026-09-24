@@ -7,7 +7,22 @@ reaches its first tagged release.
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- **UDP network links on the microsandbox backend.** Joining an msb `Network` alongside a
+  UDP-exposed sibling (`withExposedUdpPorts`) no longer fails `start()` — the typed
+  `UnsupportedByBackendException` rejection is removed. A consumer's sandbox now boots with one
+  `--net-rule allow@host:udp:<port>` egress rule per linked UDP target (added to `msb run`'s argv;
+  `msb restore` gets the equivalent full replacement policy, since a restore drops whatever CLI
+  policy `run` had), and an in-guest forwarder relays datagrams sent to the alias's guest port
+  through the gateway to the target's already-published UDP host port. The consumer's image needs
+  busybox-style `nc` (`-u`/`-e`) and `timeout`; an image without them fails fast with a typed
+  error naming the gap, same as the existing TCP-tunnel check. `ContainerSpec` gains
+  `hostUdpEgressPorts: List<Int>` — per-run wiring computed by the core before `backend.create`,
+  never part of a checkpoint's captured spec or the reuse identity hash. See
+  [Networking](docs/concepts/networking.md#udp) for the full picture, including a datagram size
+  limit (roughly 1472 bytes of payload) that permanently breaks a sandbox's inbound networking on
+  microsandbox if exceeded — an upstream msb limitation, not something this library guards against.
 
 ## [0.7.11] - 2026-09-19
 

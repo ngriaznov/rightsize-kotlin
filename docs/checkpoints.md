@@ -146,9 +146,10 @@ the snapshot succeeds but the re-boot from it fails (after the stopped sandbox h
 removed), `checkpoint()` throws naming the checkpoint ref: the original sandbox is gone, but its
 state is still recoverable via `GenericContainer.fromCheckpoint`.
 
-The reboot also kills microsandbox's emulated network links (the exec-tunneled `installNetworkLinks`
-connections a container on a `Network` had at start), so `checkpoint()` re-establishes them against
-the same sandbox before returning, right alongside the wait-strategy re-run.
+The reboot also kills microsandbox's emulated network links — both the exec-tunneled TCP relays
+and the in-guest UDP forwarders `installNetworkLinks` installed for a container on a `Network` at
+start — so `checkpoint()` re-establishes them against the same sandbox before returning, right
+alongside the wait-strategy re-run.
 
 ## Capability
 

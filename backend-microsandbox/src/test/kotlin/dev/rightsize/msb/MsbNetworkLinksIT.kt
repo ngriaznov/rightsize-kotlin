@@ -154,6 +154,105 @@ class MsbNetworkLinksIT {
         }
     }
 
+    // --- UDP network links: scenario 1 (a single client reaching a UDP sibling by alias) is
+    // covered generically for both backends by BackendContractTest's own network-links test — the
+    // two scenarios below are msb-specific: the forwarder actually serving more than one client,
+    // and the capability-probe failure this backend's install path is responsible for itself. ---
+
+    // Proves the forwarder respawns its listener after each client locks on (see
+    // UDP_FORWARDER_SCRIPT's own doc) rather than wedging to the first one forever. Needs a
+    // server that genuinely answers more than one client — busybox `nc -u -l` (no `-lk` support
+    // for UDP) serves exactly one, so this uses socat's forking UDP listener instead, per its own
+    // documented multi-client shape (`-T5 UDP4-RECVFROM:<port>,fork EXEC:cat`, args only — the
+    // image's own ENTRYPOINT is `socat`).
+    @Test fun `the forwarder serves three sequential udp clients, each getting its own payload back`() {
+        Network.newNetwork().use { net ->
+            val server = GenericContainer("alpine/socat:1.8.1.3")
+                .withCommand("-T5", "UDP4-RECVFROM:9153,fork", "EXEC:cat")
+                .withExposedUdpPorts(9153)
+                .withNetwork(net).withNetworkAliases("udp-echo")
+                .waitingFor(Wait.forLogMessage(".*", 0))
+            server.start()
+            val client = GenericContainer("alpine:3.19")
+                .withNetwork(net)
+                .withCommand("sleep", "300")
+                .waitingFor(Wait.forLogMessage(".*", 0))
+            client.start()
+            try {
+                repeat(3) { i ->
+                    val payload = "rz-udp-multi-${System.nanoTime()}-$i"
+                    var got = ""
+                    var attempts = 0
+                    // UDP is lossy and the forwarder may still be mid-respawn from the PREVIOUS
+                    // client — retry the send, unique payload per client so a stale reply from an
+                    // earlier attempt can never be mistaken for this one's own.
+                    while (attempts < 10 && payload !in got) {
+                        got = client.execInContainer("sh", "-c",
+                            "echo $payload | nc -u -w2 udp-echo 9153").stdout
+                        if (payload !in got) Thread.sleep(500)
+                        attempts++
+                    }
+                    assertTrue(payload in got, "client $i never got its own payload back after $attempts attempt(s): $got")
+                }
+            } finally { client.stop(); server.stop() }
+        }
+    }
+
+    // Same no-nc image the TCP tunnel's own fail-fast test above uses (mongo:8.0 boots but has no
+    // busybox nc at all) — it fails MsbCliBackend.requireUdpForwarderCapable's `command -v nc`
+    // clause before ever reaching the `-u`/`-e`/timeout checks, so it exercises this path exactly
+    // the same way it exercises the TCP one.
+    @Test fun `consumer image without nc fails fast with docker hint for a udp link too`() {
+        Network.newNetwork().use { net ->
+            val server = GenericContainer("alpine:3.19")
+                .withCommand("sh", "-c", "nc -u -l -p 9153 > /srv/got.txt")
+                .withExposedUdpPorts(9153)
+                .withNetwork(net).withNetworkAliases("udp-echo")
+                .waitingFor(Wait.forLogMessage(".*", 0))
+            server.start()
+            val consumer = GenericContainer("mongo:8.0")
+                .withCommand("sleep", "300")
+                .withNetwork(net).waitingFor(Wait.forLogMessage(".*", 0))
+            try {
+                val ex = assertThrows(Exception::class.java) { consumer.start() }
+                assertTrue(ex.message!!.contains("UDP", ignoreCase = true),
+                    "error should name the missing UDP capability: ${ex.message}")
+                assertTrue(ex.message!!.contains("docker", ignoreCase = true),
+                    "error should point at the docker backend: ${ex.message}")
+                // No consumer.stop() compensation here: start() must self-clean the
+                // half-started container when installNetworkLinks fails fast.
+            } finally { server.stop() }
+        }
+    }
+
+    // Scenario 4: a UDP link survives a checkpoint of the consumer. msb's checkpoint reboots the
+    // consumer through `msb restore`, which does not carry the run-time network policy over, so
+    // the restore argv has to re-grant the host UDP port, and the reboot wipes /tmp, so the link
+    // replay has to reinstall the forwarder.
+    @Test fun `a checkpointed consumer keeps its udp link`() {
+        Network.newNetwork().use { net ->
+            val server = GenericContainer("alpine/socat:1.8.1.3")
+                .withCommand("-T5", "UDP4-RECVFROM:9153,fork", "EXEC:cat")
+                .withExposedUdpPorts(9153)
+                .withNetwork(net).withNetworkAliases("udp-echo-ckpt")
+                .waitingFor(Wait.forLogMessage(".*", 0))
+            server.start()
+            val consumer = GenericContainer("alpine:3.19")
+                .withCommand("sleep", "3600")
+                .withNetwork(net)
+                .waitingFor(Wait.forLogMessage(".*", 0))
+            consumer.start()
+            try {
+                val nonce = System.nanoTime()
+                assertTrue(udpEchoRoundTrip(consumer, "udp-echo-ckpt", "before-$nonce"),
+                    "the udp link must work before the checkpoint")
+                consumer.checkpoint()
+                assertTrue(udpEchoRoundTrip(consumer, "udp-echo-ckpt", "after-$nonce"),
+                    "the udp link must work again after the checkpoint reboot")
+            } finally { consumer.stop(); server.stop() }
+        }
+    }
+
     // A sibling alias that would break out of the `sh -c "echo '127.0.0.1 $alias' >>
     // /etc/hosts"` quoting must be rejected up front by installNetworkLinks' alias-charset
     // validation (UnsupportedByBackendException naming the alias), never reach the hosts-install
@@ -182,5 +281,19 @@ class MsbNetworkLinksIT {
                 // half-started container when installNetworkLinks fails fast.
             } finally { server.stop() }
         }
+    }
+
+    // UDP is lossy and the forwarder may still be mid-respawn (or, for the checkpoint scenario,
+    // mid-reboot) — retry with a unique payload per call so a stale reply can never be mistaken
+    // for this call's own, same shape as the multi-client test above.
+    private fun udpEchoRoundTrip(consumer: GenericContainer<*>, alias: String, payload: String): Boolean {
+        var got = ""
+        var attempts = 0
+        while (attempts < 10 && payload !in got) {
+            got = consumer.execInContainer("sh", "-c", "echo $payload | nc -u -w2 $alias 9153").stdout
+            if (payload !in got) Thread.sleep(500)
+            attempts++
+        }
+        return payload in got
     }
 }

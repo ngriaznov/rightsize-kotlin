@@ -66,8 +66,10 @@ pattern you should copy. See why below.
 - **On the microsandbox backend**, there is no such thing as a virtual network between
   microVMs — each one is fully isolated by design. rightsize emulates `Network`
   instead: it installs an `/etc/hosts` entry mapping the alias to `127.0.0.1` inside
-  the consumer's guest, plus a TCP relay tunneled over the sandbox's `exec` channel
-  that forwards guest-side connections to the sibling's real host-published port.
+  the consumer's guest, plus a relay tunneled over the sandbox's `exec` channel that
+  forwards guest-side connections to the sibling's real host-published port — a TCP
+  relay for a TCP link, or an in-guest UDP forwarder for a UDP-protocol one (see
+  [UDP](#udp) below for that mechanism's own detail).
 
 This emulation is a genuine engineering achievement (there is no supported
 sandbox-to-sandbox or sandbox-to-host networking path in microsandbox 0.6.2 at all —
@@ -130,19 +132,28 @@ nothing at all. Give a UDP-only container an explicit `Wait.forLogMessage(...)` 
 `AbstractWaitStrategy` that actually probes the UDP service) rather than relying on the
 default — see [Wait Strategies](wait-strategies.md).
 
-**Container-to-container UDP over a `Network` is Docker-only in this phase.** Docker's native
+**Container-to-container UDP over a `Network` works on both backends.** Docker's native
 networking carries UDP the same as TCP, no different from anything else described above. On
-microsandbox, `Network` is emulated with a TCP exec-tunnel relay (see
-[What's actually happening underneath](#whats-actually-happening-underneath)) — there is no
-UDP equivalent, because microsandbox has no direct guest-to-guest networking at all to build
-one over. Joining an msb `Network` where any member's link would be UDP fails `start()` fast
-with a typed `UnsupportedByBackendException` naming the guest port and alias, before any
-tunnel/hosts work — the error's own remedy names both escape hatches:
+microsandbox — which has no direct guest-to-guest networking at all — a UDP link is instead
+routed through the host: the target's UDP port must already be published
+(`withExposedUdpPorts`, and the target must be running before the consumer starts, same as any
+other link), the consumer's sandbox gets one host-UDP egress rule per linked port (nothing
+broader), and an in-guest forwarder relays datagrams from the alias's guest port to that
+published port through the gateway. Each distinct client socket holds its own small relay for
+up to 60 seconds of idle time before it's recycled.
 
-- run with `RIGHTSIZE_BACKEND=docker` for real container-to-container UDP, or
-- stay on microsandbox and publish the UDP service on a **host** port instead
-  (`withExposedUdpPorts` + `getMappedUdpPort`), having the consumer dial that host port rather
-  than a network alias — this is the msb-compatible pattern for UDP services in Phase 1.
+The consumer's image needs more than the TCP tunnel's plain `nc` (see
+[Limits on the microsandbox backend](#limits-on-the-microsandbox-backend) above): busybox-style
+`nc` with `-u` (UDP mode) and `-e` (exec-on-connect), plus a `timeout` binary. Alpine/busybox
+images have all three; Debian/Ubuntu images and OpenBSD netcat do not — joining with an incapable
+consumer image fails `start()` fast with a typed `UnsupportedByBackendException` naming the gap
+and the image, the same fail-fast shape the TCP case already has.
+
+**Datagram size limit (msb only).** A datagram over roughly 1472 bytes of payload sent into a
+published UDP port permanently kills the receiving sandbox's whole inbound networking (DNS, HTTP,
+every published port) — this is an msb limitation, not something this library can guard against,
+and it applies to both a UDP link and a plain `withExposedUdpPorts` host mapping. Keep UDP
+payloads at or under that limit on microsandbox.
 
 ## Cleanup
 

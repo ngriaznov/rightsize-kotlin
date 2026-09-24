@@ -84,6 +84,19 @@ data class ContainerSpec(
      * a network. Part of reuse identity, same as [memoryLimitMb].
      */
     val networkDisabled: Boolean = false,
+    /**
+     * The host loopback UDP ports this sandbox's network links need to reach — the DISTINCT,
+     * ascending-sorted `targetHostPort`s of the UDP-protocol [dev.rightsize.core.NetworkLink]s
+     * [dev.rightsize.Network.linksForNewMember] computed for this start, filled in by the core
+     * before `backend.create`. A backend that routes links through the host (microsandbox: see
+     * `MsbCommands.run`'s `--net-rule` emission) opens exactly these ports and none broader;
+     * docker's native networking ignores this field entirely. Per-run wiring, never identity: NOT
+     * written to the named-checkpoint registry (see [CheckpointSpec]), never part of the reuse
+     * identity hash (see `dev.rightsize.core.reuse.ReuseIdentitySpec`), and never added to the
+     * pinned diagnostics report format — none of those describe a sandbox's own configuration,
+     * only which siblings happened to be running when THIS one started.
+     */
+    val hostUdpEgressPorts: List<Int> = emptyList(),
 )
 
 /** Opaque per-backend container reference; [id] is backend-native, [spec] is what created it. */

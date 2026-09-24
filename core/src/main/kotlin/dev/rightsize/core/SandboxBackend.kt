@@ -4,10 +4,11 @@ import java.nio.file.Path
 
 /** A tunnel/alias route: inside the consumer, `alias:guestPort` must reach
  * `127.0.0.1:targetHostPort` on the host, over [protocol]. [protocol] is a trailing, defaulted
- * field — every pre-UDP caller/producer keeps meaning TCP. A backend that cannot route a given
- * [protocol] (microsandbox's exec-tunnel emulation is TCP-only — see
- * `MsbCliBackend.installNetworkLinks`) fails fast with a typed [UnsupportedByBackendException]
- * rather than silently dropping the link. */
+ * field — every pre-UDP caller/producer keeps meaning TCP. Docker's native networks carry both
+ * transports; microsandbox emulates each differently (a TCP link gets an exec-tunnel, a UDP link
+ * an in-guest forwarder — see `MsbCliBackend.installNetworkLinks`). A backend that cannot route a
+ * given link fails fast with a typed [UnsupportedByBackendException] rather than silently
+ * dropping it. */
 data class NetworkLink(
     val alias: String, val guestPort: Int, val targetHostPort: Int,
     val protocol: PortProtocol = PortProtocol.TCP,
