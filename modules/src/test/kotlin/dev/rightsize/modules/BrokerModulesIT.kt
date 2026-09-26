@@ -24,7 +24,13 @@ class BrokerModulesIT {
             "key.deserializer" to "org.apache.kafka.common.serialization.StringDeserializer",
             "value.deserializer" to "org.apache.kafka.common.serialization.StringDeserializer")).use { c ->
             c.subscribe(listOf("t1"))
-            val records = c.poll(Duration.ofSeconds(15))
+            // Up to 60s, not one 15s poll: the consumer-group join plus first fetch on a
+            // loaded CI runner (Windows especially) can outlast 15s; the message arrives,
+            // just late. No message within 60s is still a failure.
+            val deadline = System.nanoTime() + Duration.ofSeconds(60).toNanos()
+            var records = c.poll(Duration.ofSeconds(1))
+            while (records.isEmpty && System.nanoTime() < deadline) records = c.poll(Duration.ofSeconds(1))
+            assertFalse(records.isEmpty, "no message within 60s")
             assertEquals("v", records.first().value())
         }
     }
