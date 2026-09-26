@@ -47,6 +47,16 @@ jobs:
           path: ~/.microsandbox/cache
           key: msb-images-${{ runner.os }}-${{ github.run_id }}
           restore-keys: msb-images-${{ runner.os }}-
+      # The msb install itself (binary plus libkrunfw), keyed on the provisioner source,
+      # which holds the pinned version: without it every run downloads both from
+      # GitHub, and a timeout there fails the lane. Only the msb/ subtree: the rest of
+      # the cache root holds reuse registries and reaper ledgers, which name sandboxes
+      # that go away with the runner.
+      - id: msb-install
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/rightsize/msb
+          key: rightsize-msb-install-${{ runner.os }}-${{ hashFiles('backend-microsandbox/src/main/kotlin/dev/rightsize/msb/MsbProvisioner.kt') }}
       - shell: bash
         run: RIGHTSIZE_BACKEND=microsandbox ./gradlew integrationTest 2>&1 | tee /tmp/it-output.log
       # msb's image cache can be left with an index pointing at layer files that don't
@@ -68,6 +78,23 @@ jobs:
         with:
           path: ~/.microsandbox/cache
           key: msb-images-${{ runner.os }}-${{ github.run_id }}
+      # Bank a freshly downloaded install even when a test failed, but only a complete
+      # one: the provisioner moves the msb binary into place last, so a download cut
+      # short leaves no bin/msb, and a partial install saved under this key would be
+      # restored, and downloaded again, on every run until the key changes.
+      - name: Check the msb install is complete
+        id: msb-install-complete
+        if: always() && steps.msb-install.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          if ls ~/.cache/rightsize/msb/*/bin/msb* >/dev/null 2>&1; then
+            echo "complete=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/cache/save@v4
+        if: always() && steps.msb-install-complete.outputs.complete == 'true'
+        with:
+          path: ~/.cache/rightsize/msb
+          key: rightsize-msb-install-${{ runner.os }}-${{ hashFiles('backend-microsandbox/src/main/kotlin/dev/rightsize/msb/MsbProvisioner.kt') }}
 
   msb-windows:
     runs-on: windows-2025   # WHP is pre-enabled on this image (confirmed on windows-2022 and
@@ -83,6 +110,12 @@ jobs:
           path: ~/.microsandbox/cache
           key: msb-images-${{ runner.os }}-${{ github.run_id }}
           restore-keys: msb-images-${{ runner.os }}-
+      # Same msb install cache as msb-linux, at this library's Windows cache root.
+      - id: msb-install
+        uses: actions/cache/restore@v4
+        with:
+          path: ~\AppData\Local\rightsize\msb
+          key: rightsize-msb-install-${{ runner.os }}-${{ hashFiles('backend-microsandbox/src/main/kotlin/dev/rightsize/msb/MsbProvisioner.kt') }}
       # --max-workers=1 serializes the per-module integrationTest tasks (the repo sets
       # org.gradle.parallel=true, which otherwise runs them concurrently): msb on Windows
       # has a database-migration race under concurrent sandbox creation, so sandboxes
@@ -105,6 +138,20 @@ jobs:
         with:
           path: ~/.microsandbox/cache
           key: msb-images-${{ runner.os }}-${{ github.run_id }}
+      # Same complete-install guard as msb-linux.
+      - name: Check the msb install is complete
+        id: msb-install-complete
+        if: always() && steps.msb-install.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          if ls ~/AppData/Local/rightsize/msb/*/bin/msb* >/dev/null 2>&1; then
+            echo "complete=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/cache/save@v4
+        if: always() && steps.msb-install-complete.outputs.complete == 'true'
+        with:
+          path: ~\AppData\Local\rightsize\msb
+          key: rightsize-msb-install-${{ runner.os }}-${{ hashFiles('backend-microsandbox/src/main/kotlin/dev/rightsize/msb/MsbProvisioner.kt') }}
 
   # No msb-macos job: GitHub's hosted Apple Silicon runners are themselves VMs
   # without nested virtualization, so Hypervisor.framework VM creation fails
