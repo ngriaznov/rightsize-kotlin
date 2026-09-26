@@ -85,7 +85,7 @@ panicked at msb_krun_vmm-0.1.25/src/builder.rs:1154: ... Err value: InvalidAscii
 
 That was msb's env-encoding step rejecting a TAB anywhere in the image's baked env,
 before Cassandra itself ever ran — not specific to anything Cassandra does. It's fixed
-on the pinned msb (0.7.1): `cassandra:5.0.8` boots with its baked `GPG_KEYS`
+as of msb 0.7.1: `cassandra:5.0.8` boots with its baked `GPG_KEYS`
 unmodified. `withEnv("GPG_KEYS", "")` still overrides the baked value with an empty,
 tab-free one unconditionally, as a harmless guard for anyone pointing `MSB_PATH` at an
 older msb — `GPG_KEYS` is consumed only at image build time (verifying the Apache

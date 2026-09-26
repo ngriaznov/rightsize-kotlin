@@ -45,7 +45,7 @@ is the whole story that matters from the outside.
 ### Provisioning
 
 On first use, if no runtime is already cached (or `MSB_PATH` isn't set), rightsize
-downloads a pinned `msb` release (currently `0.7.1`) plus its `libkrunfw` companion
+downloads a pinned `msb` release (currently `0.7.3`) plus its `libkrunfw` companion
 library from GitHub releases, matched to your OS/architecture
 (`msb-darwin-aarch64`, `msb-linux-x86_64`, `msb-linux-aarch64`,
 `msb-windows-x86_64.exe`, `msb-windows-aarch64.exe`, and the corresponding
@@ -168,7 +168,7 @@ timing quirks. Know these before you hit them:
   image; microsandbox stops the sandbox, snapshots its disk, and reboots it, which restarts the
   workload (`capabilities.checkpointRestartsWorkload`). See [Checkpoint /
   Restore](checkpoints.md#mechanism-per-backend) for the full comparison.
-- **Native Windows msb support is upstream beta (microsandbox 0.7.1).** The guest is
+- **Native Windows msb support is upstream beta (microsandbox 0.7.3).** The guest is
   Linux on every host, so guest-side behavior (entrypoints, `/etc/hosts` aliasing, the
   exec-stream tunnels) is unaffected by running on Windows — the Windows-specific
   surface is entirely host-side (downloading a `.exe`/`.dll` pair, the cache root,

@@ -36,7 +36,7 @@ class PostgreSQLContainer(image: DockerImageName) : GenericContainer<PostgreSQLC
         // literal tab character in the value (a package-list built with `\t\t` continuation). On
         // older msb releases (0.6.x), the krun VMM builder panicked with InvalidAscii on that
         // boot-env value before the guest ever started (reproduced with zero rightsize-set env
-        // vars — it's the image, not us). Docker was unaffected. Fixed on the pinned msb (0.7.1) —
+        // vars — it's the image, not us). Docker was unaffected. Fixed as of msb 0.7.1 —
         // the image boots with this var unmodified now. Overriding it here still wins over the
         // image default in both backends' env-merge order and is a no-op for the build the image
         // already baked, so it stays a safe, backend-portable guard for an older msb rather than an

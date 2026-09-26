@@ -168,7 +168,7 @@ class MsbCliBackend private constructor(
 
     /**
      * ATTACHED-mode supervision when `handle.spec.checkpointRef` is unset. Detached `-d` mode
-     * does run the image's ENTRYPOINT on the pinned msb (0.7.1) — confirmed empirically against
+     * does run the image's ENTRYPOINT as of msb 0.7.1 — confirmed empirically against
      * the real binary — but this backend still runs attached regardless: the `msb run` child
      * gives it something to detect death against and a tail of boot output to classify a failure
      * from (see [spawnAttachedRun], [awaitRunning]), rather than a `msb ls` poll with no signal

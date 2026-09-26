@@ -232,7 +232,7 @@ object MsbCommands {
      * [MsbCliBackend.exportCheckpoint], docs/checkpoints.md's "Moving checkpoints between
      * machines" section). Deliberately never `--with-image`: this library doesn't bundle the OCI
      * image into the archive, so the destination machine pulls it on the restored container's
-     * first boot instead. `--with-image` itself works on the pinned msb (0.7.1); bundling the
+     * first boot instead. `--with-image` itself works as of msb 0.7.1; bundling the
      * image is a roadmap item, not something this library does yet — see docs/roadmap.md.
      */
     fun snapshotExport(ref: String, dest: Path) = listOf("snapshot", "save", ref, dest.toString())

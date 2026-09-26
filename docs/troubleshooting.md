@@ -15,7 +15,7 @@ listening, nothing is logging.
 
 **Cause:** On older msb releases (0.6.x), microsandbox's detached mode (`msb run -d`)
 booted the VM with only its init process — it did not start the image's own
-ENTRYPOINT/CMD at all. That's fixed on the pinned msb (0.7.1): detached mode runs the
+ENTRYPOINT/CMD at all. That's fixed as of msb 0.7.1: detached mode runs the
 workload the same as Docker would.
 
 **Fix:** rightsize's microsandbox backend runs every sandbox in **attached** mode
@@ -127,7 +127,7 @@ workload ever starts — reproduced even with zero rightsize-set environment var
 values containing control characters. The official `postgres:*-alpine` image was a
 known example: it bakes `DOCKER_PG_LLVM_DEPS` with a literal tab character (from a
 Dockerfile-internal package list built with `\t\t` continuation); Cassandra's
-`GPG_KEYS` is another. Fixed on the pinned msb (0.7.1) — both boot with those
+`GPG_KEYS` is another. Fixed as of msb 0.7.1 — both boot with those
 variables unmodified now.
 
 **Fix:** `PostgreSQLContainer` and `CassandraContainer` still override their

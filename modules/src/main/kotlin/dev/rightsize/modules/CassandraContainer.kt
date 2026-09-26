@@ -36,8 +36,8 @@ import java.time.Duration
  * ```
  *
  * That was not specific to Cassandra's own behavior — it was msb's env-encoding step rejecting a
- * TAB anywhere in the image's baked env, before Cassandra ever ran. It's fixed on the pinned msb
- * (0.7.1): `cassandra:5.0.8` boots with its baked `GPG_KEYS` unmodified. `withEnv("GPG_KEYS", "")`
+ * TAB anywhere in the image's baked env, before Cassandra ever ran. It's fixed as of msb
+ * 0.7.1: `cassandra:5.0.8` boots with its baked `GPG_KEYS` unmodified. `withEnv("GPG_KEYS", "")`
  * in this module still overrides it to an empty, tab-free value unconditionally, as a harmless
  * guard for anyone pointing `MSB_PATH` at an older msb — `GPG_KEYS` is consumed only at image
  * build time (verifying the Apache download's signing keys), so the override has no effect on
@@ -70,7 +70,7 @@ class CassandraContainer(image: DockerImageName) : GenericContainer<CassandraCon
         image.assertCompatibleWith(EXPECTED_REPOSITORY)
         withExposedPorts(CQL_PORT)
         // Baked GPG_KEYS contains a TAB; older msb releases (0.6.x) SIGABRT on any TAB in an
-        // image's baked env before the guest is reachable. Fixed on the pinned msb (0.7.1); kept
+        // image's baked env before the guest is reachable. Fixed as of msb 0.7.1; kept
         // here as a harmless guard for an older msb via MSB_PATH. See the class doc for the exact
         // panic signature.
         withEnv("GPG_KEYS", "")

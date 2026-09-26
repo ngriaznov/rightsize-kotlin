@@ -86,7 +86,7 @@ a literal tab character (from a package list built with `\t\t` continuation in t
 Dockerfile). On msb releases before 0.7.1, the krun VMM panicked with `InvalidAscii` on
 that value before the guest ever booted — reproduced with zero rightsize-set env vars,
 so this was purely an artifact of the image, not anything this library added. Docker
-was unaffected. It's fixed on the pinned msb (0.7.1): the image boots with
+was unaffected. It's fixed as of msb 0.7.1: the image boots with
 `DOCKER_PG_LLVM_DEPS` unmodified, no override needed. This module still overrides the
 variable to an empty string (`withEnv("DOCKER_PG_LLVM_DEPS", "")`) unconditionally — a
 no-op on Docker and on the pinned msb, and a guard for anyone pointing `MSB_PATH` at an

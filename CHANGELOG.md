@@ -7,7 +7,22 @@ reaches its first tagged release.
 
 ## [Unreleased]
 
-Nothing yet.
+### Changed
+
+- **The pinned msb is now 0.7.3** (was 0.7.1). The CLI surface this library drives
+  is unchanged: 0.7.3 renames `snapshot create --from-sandbox` to `--sandbox` and
+  `snapshot save`/`load` to `export`/`import`, and keeps the old spellings as
+  aliases, which this library still uses. Its new strict hostname policy default
+  only affects hostname-based network allow rules, and this library never emits
+  those.
+
+  **0.7.3 migrates msb's shared state database under `MSB_HOME` on first use.**
+  After that, an older msb binary refuses the same home outright ("database schema
+  is newer than this msb binary or has an unknown migration prefix"). That includes
+  the msb 0.7.1 that rightsize 0.7.12 and earlier provision: on a machine that runs
+  both this release and an older rightsize, give one of them its own `MSB_HOME`, or
+  upgrade the older one. The same applies to `MSB_PATH` pointed at a binary older
+  than 0.7.3.
 
 ## [0.7.12] - 2026-09-24
 
