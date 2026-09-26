@@ -24,6 +24,16 @@ reaches its first tagged release.
   upgrade the older one. The same applies to `MSB_PATH` pointed at a binary older
   than 0.7.3.
 
+- **`MinIOContainer` now defaults to `pgsty/minio:latest`** (was
+  `quay.io/minio/minio:latest`). MinIO no longer publishes public images: Docker
+  Hub's `minio/minio` was removed earlier, and `quay.io/minio/minio` now refuses
+  anonymous pulls too, so the old default failed to start with an "unauthorized"
+  registry error. `pgsty/minio` is Pigsty's community build of MinIO from source,
+  released regularly for amd64 and arm64, with upstream's image layout and the
+  bundled `mc` client. Images from `minio/minio` and `quay.io/minio/minio` are still
+  accepted, for anyone who has them cached or mirrored, and `pgsty/minio` images are
+  accepted without `asCompatibleSubstituteFor`.
+
 ## [0.7.12] - 2026-09-24
 
 ### Added

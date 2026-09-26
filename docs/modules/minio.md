@@ -8,27 +8,32 @@ credential pair.
 
 | | |
 |---|---|
-| Default image | `quay.io/minio/minio:latest` — this image's floating reference (see below) |
+| Default image | `pgsty/minio:latest` — this image's floating reference (see below) |
 | Exposed ports | `9000` (S3 API — what the helpers use), `9001` (console, exposed but not wrapped by a helper) |
 | Command | `server /data --console-address :9001` |
 | Env | `MINIO_ROOT_USER=testuser`, `MINIO_ROOT_PASSWORD=testpassword` |
 | Wait strategy | `Wait.forHttp("/minio/health/live").forPort(9000)` |
 
-With no image given, this module tracks upstream's `latest` tag rather than a version
-this library pins, so the version moves with MinIO's own releases instead of this
-library's release cycle. The facts below were verified against
-`minio/minio:RELEASE.2025-09-07T16-13-09Z` specifically — pass an image explicitly to
-pin it:
+With no image given, this module tracks the image's `latest` tag rather than a version
+this library pins, so the version moves with that image's releases instead of this
+library's release cycle. Pass an image explicitly to pin it:
 
 ```kotlin
-MinIOContainer("quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z")
+MinIOContainer("pgsty/minio:RELEASE.2026-08-04T00-00-00Z")
 ```
 
-**Why `quay.io`, not Docker Hub:** the default used to be the bare `minio/minio:latest`.
-MinIO pulled that repository from Docker Hub entirely (`docker pull minio/minio` now
-fails "repository does not exist"), so this module's floating default moved to MinIO's
-maintained mirror, `quay.io/minio/minio`. Compatibility checking (below) still accepts
-a bare `minio/minio:<tag>` override too — only the *default* moved, not what's accepted.
+**Why `pgsty/minio`:** MinIO no longer publishes public images. Docker Hub's
+`minio/minio` was removed, and as of September 2026 `quay.io/minio/minio`, this
+module's previous default, refuses anonymous pulls (HTTP 401). `pgsty/minio` is
+Pigsty's community build of MinIO from source, published on Docker Hub for
+linux/amd64 and linux/arm64 with upstream's image layout: the same entrypoint and env
+defaults, and the `mc` client bundled. Images from `quay.io/minio/minio` and
+`minio/minio` are still accepted (see [Compatibility checking](#compatibility-checking)).
+
+The backend notes below were verified against `minio/minio:RELEASE.2025-09-07T16-13-09Z`.
+Readiness, auth enforcement, and the `mc` round-trip were verified again by this
+module's integration test against `pgsty/minio:RELEASE.2026-08-04T00-00-00Z` (what
+`latest` pointed at) on msb 0.7.3; the memory spike was not repeated.
 
 ## Helpers
 
@@ -110,7 +115,7 @@ goroutines and exits non-zero or hangs outright, both observed directly, while
 against the S3 API returned `AccessDenied` rather than serving, confirming auth is
 actually enforced rather than merely configured.
 
-**Memory:** a verification spike ran this image at 1024 MB with no issues. Whether
+**Memory:** a verification spike ran `minio/minio` at 1024 MB with no issues. Whether
 any floor is needed at all under this backend's default allocation is not yet
 established, so this module sets no `withMemoryLimit` override; callers who hit
 memory pressure can call it themselves.
@@ -123,9 +128,11 @@ mismatched image fails fast with a typed `IncompatibleImageException` naming bot
 repositories, rather than degrading into a bare wait-strategy timeout. The check is
 registry-agnostic (the registry host, e.g. `quay.io`, is stripped before comparing), so
 both `quay.io/minio/minio:<tag>` and a bare `minio/minio:<tag>` are accepted
-identically — only a genuinely different repository is rejected. To use a
-differently-named image on purpose (a private mirror, a hardened rebuild), wrap it
-with the escape hatch:
+identically. `pgsty/minio` (any tag or digest) is accepted too, with no
+`asCompatibleSubstituteFor` call needed: it is this module's own default, so the module
+declares it a substitute for `minio/minio` itself. Only a genuinely different
+repository is rejected. To use a differently-named image on purpose (a
+private mirror, a hardened rebuild), wrap it with the escape hatch:
 
 ```kotlin
 MinIOContainer(

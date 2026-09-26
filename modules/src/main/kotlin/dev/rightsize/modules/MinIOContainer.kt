@@ -9,25 +9,32 @@ import dev.rightsize.core.wait.Wait
  * what [endpointUrl] wraps) and the console (port 9001, exposed but not wrapped by a helper, the
  * same "exposed but unwrapped" treatment [ClickHouseContainer] gives its native-protocol port).
  *
- * ### Defaults to `quay.io/minio/minio:latest` — this image's floating reference
+ * ### Defaults to `pgsty/minio:latest` — this image's floating reference
  *
- * With no image given, this module tracks upstream's `latest` tag rather than a version this
- * library pins, so the version moves with MinIO's own releases instead of this library's release
- * cycle. The facts below were verified against `minio/minio:RELEASE.2025-09-07T16-13-09Z`
- * specifically — pass an image explicitly to pin it:
- * `MinIOContainer("quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z")`.
+ * With no image given, this module tracks the image's `latest` tag rather than a version this
+ * library pins, so the version moves with that image's releases instead of this library's release
+ * cycle. Pass an image explicitly to pin it:
+ * `MinIOContainer("pgsty/minio:RELEASE.2026-08-04T00-00-00Z")`.
  *
- * ### Why `quay.io`, not Docker Hub
+ * The facts below were verified against `minio/minio:RELEASE.2025-09-07T16-13-09Z`. Readiness,
+ * auth enforcement, and the `mc` round-trip were verified again by this module's integration
+ * test against `pgsty/minio:RELEASE.2026-08-04T00-00-00Z` (what `latest` pointed at) on msb
+ * 0.7.3; the memory spike was not repeated.
  *
- * The default used to be the bare `minio/minio:latest` (Docker Hub). MinIO pulled that
- * repository from Docker Hub entirely — `docker pull minio/minio` now fails "repository does not
- * exist" — so this module's floating default moved to MinIO's maintained mirror,
- * `quay.io/minio/minio`. [EXPECTED_REPOSITORY] stays the bare `minio/minio`: repository
- * compatibility ([dev.rightsize.core.image.DockerImageName.assertCompatibleWith]) is checked
- * after stripping any registry host, so both the new `quay.io/minio/minio:<tag>` default and an
- * old-style `minio/minio:<tag>` override (still meaningful if you have that image cached, or a
- * private Docker Hub proxy in front of it) are accepted identically — only a genuinely different
- * repository (not just a different registry) is rejected.
+ * ### Why `pgsty/minio`
+ *
+ * MinIO no longer publishes public images. Docker Hub's `minio/minio` was removed, and as of
+ * September 2026 `quay.io/minio/minio`, this module's previous default, refuses anonymous pulls
+ * (HTTP 401). `pgsty/minio` is Pigsty's community build of MinIO from source, published on Docker
+ * Hub for linux/amd64 and linux/arm64 with upstream's image layout: the same entrypoint and env
+ * defaults, and the `mc` client bundled.
+ *
+ * [EXPECTED_REPOSITORY] stays `minio/minio`. Repository compatibility
+ * ([dev.rightsize.core.image.DockerImageName.assertCompatibleWith]) is checked after stripping any
+ * registry host, so `quay.io/minio/minio:<tag>` and a bare `minio/minio:<tag>` override (still
+ * useful behind a mirror, or with the image cached) are accepted as before, and this module
+ * accepts `pgsty/minio:<tag>` as a declared substitute for `minio/minio`. Any other repository is
+ * rejected.
  *
  * ### The default entrypoint does not serve — a command is required
  *
@@ -62,19 +69,26 @@ import dev.rightsize.core.wait.Wait
  *
  * ### Memory
  *
- * A verification spike ran this image at 1024 MB with no issues. Whether any floor is needed at
+ * A verification spike ran `minio/minio` at 1024 MB with no issues. Whether any floor is needed at
  * all under this backend's default allocation is not yet established, so this module sets no
  * [withMemoryLimit] override; callers who hit memory pressure can call it themselves.
  */
 class MinIOContainer(image: DockerImageName) : GenericContainer<MinIOContainer>(image.toString()) {
-    /** Defaults to `quay.io/minio/minio:latest` — this image's floating reference (see the class doc). */
-    constructor(image: String = "quay.io/minio/minio:latest") : this(DockerImageName.parse(image))
+    /** Defaults to `pgsty/minio:latest` — this image's floating reference (see the class doc). */
+    constructor(image: String = "pgsty/minio:latest") : this(DockerImageName.parse(image))
 
     private var usernameState = "testuser"
     private var passwordState = "testpassword"
 
     init {
-        image.assertCompatibleWith(EXPECTED_REPOSITORY)
+        // pgsty/minio is this module's own default (see "Why pgsty/minio" in the class doc), so
+        // it counts as a substitute for minio/minio without the caller declaring it.
+        val checkedImage = if (image.repository == PGSTY_REPOSITORY) {
+            image.asCompatibleSubstituteFor(EXPECTED_REPOSITORY)
+        } else {
+            image
+        }
+        checkedImage.assertCompatibleWith(EXPECTED_REPOSITORY)
         withExposedPorts(API_PORT, CONSOLE_PORT)
         withCommand("server", "/data", "--console-address", ":$CONSOLE_PORT")
         withEnv("MINIO_ROOT_USER", usernameState)
@@ -108,5 +122,6 @@ class MinIOContainer(image: DockerImageName) : GenericContainer<MinIOContainer>(
         const val API_PORT = 9000
         const val CONSOLE_PORT = 9001
         const val EXPECTED_REPOSITORY = "minio/minio"
+        const val PGSTY_REPOSITORY = "pgsty/minio"
     }
 }
