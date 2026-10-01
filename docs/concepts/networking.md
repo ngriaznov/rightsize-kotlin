@@ -84,11 +84,11 @@ papering over them with a "mostly works" story.
   container based on which siblings are *already running* at that moment — there's no
   retroactive wiring if a dependency starts after its consumer. In the example above,
   `server.start()` happens before `client.start()` for exactly this reason.
-- **One connection at a time, per tunnel.** The exec-tunnel relay serves a single TCP
-  connection, then respawns the in-guest listener for the next one. This is fine for
-  request/response patterns like a config-server fetch (the pattern above), but it
-  will not work for something that expects to hold a long-lived connection to a
-  sibling — a cross-container Kafka consumer, for instance.
+- **One connection at a time, per tunnel.** The in-guest listener is a single `nc -l -p`
+  that serves one TCP connection; the exec-tunnel relay then respawns it for the next
+  one. This is fine for request/response patterns like a config-server fetch (the
+  pattern above), but it will not work for something that expects to hold a long-lived
+  connection to a sibling — a cross-container Kafka consumer, for instance.
 - **The consumer image needs a raw-socket tool.** The in-guest side of the tunnel uses
   `nc` (or busybox's equivalent) to relay bytes. If the consumer's image doesn't have
   it, rightsize fails fast with an `UnsupportedByBackendException` naming the gap

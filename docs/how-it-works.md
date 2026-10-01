@@ -144,18 +144,25 @@ documented limits (start order, one connection per tunnel, the `nc` requirement)
 
 ### Why the tunnel serves one connection at a time
 
-msb's port-publish proxy never propagates the target side's TCP close back to
-the tunnel's host-side socket — a host client reading past the target's own
-`Connection: close` never observes a natural EOF. A pump written to wait for that EOF
-would simply hang forever after the first exchange. The tunnel instead infers "this
-exchange is over" from a read-timeout heuristic: a generous first-byte deadline before
-any target byte has arrived (so a slow-but-real response is never truncated),
-tightened to a short idle timeout once the first byte shows up (a gap that short,
-once data has started flowing, really does mean nothing more is coming — this
-tunnel's own client-speaks-first, single-exchange contract). That's the concrete
-reason "one connection at a time per tunnel" is a documented, permanent limit rather
-than a bug on the roadmap — see
+The in-guest side of a tunnel is a single `nc -l -p <port>`, which serves one
+connection. The host side relays that one exchange to the sibling's published port,
+and only once it's over spawns a fresh listener for the next. Until then nothing is
+listening for a second connection, and a client that dials in the gap between
+listeners can see "connection refused". Serving connections side by side would take a
+different design, not a tuning change, which is why "one connection at a time per
+tunnel" is a documented limit rather than a bug on the roadmap — see
 [Networking](concepts/networking.md#limits-on-the-microsandbox-backend).
+
+How the host side decides an exchange is over is a separate question. Since msb 0.7.5 a
+published TCP port passes the target's close on to the host-side client, so a target
+that closes after its response (`Connection: close`, HTTP/1.0, a server that answers and
+hangs up) ends the exchange on EOF at once; before 0.7.5 that close never arrived. A
+keep-alive target, such as any persistent HTTP/1.1 server, never closes, so the pump
+still infers "this exchange is over" from a read-timeout heuristic: a generous
+first-byte deadline before any target byte has arrived (so a slow-but-real response is
+never truncated), tightened to a short idle timeout once the first byte shows up (a gap
+that short, once data has started flowing, really does mean nothing more is coming —
+this tunnel's own client-speaks-first, single-exchange contract).
 
 ## One SPI, two backends, a shared referee
 

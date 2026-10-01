@@ -38,12 +38,12 @@ class MsbNetworkLinksIT {
         }
     }
 
-    // msb's port-publish proxy never propagates the target's own TCP close back to the
-    // tunnel's host-side socket - without the idle-timeout fix, the
-    // target->guest pump blocks forever after the FIRST exchange, serveOneConnection never
-    // returns, the in-guest `nc -l` listener is never respawned, and every connection after the
-    // first wedges. Proving this needs a SECOND sequential connection through the SAME tunnel
-    // link: two separate wget execs, back to back, against the same alias.
+    // The target->guest pump has to end the FIRST exchange for serveOneConnection to return and
+    // respawn the in-guest `nc -l` listener; if it never ends, every connection after the first
+    // wedges. python's http.server answers HTTP/1.0 and closes, so on msb 0.7.5+ the exchange
+    // ends on the target's EOF (before 0.7.5 the close never reached the tunnel and only the
+    // idle timeout ended it). Proving the respawn needs a SECOND sequential connection through
+    // the SAME tunnel link: two separate wget execs, back to back, against the same alias.
     @Test fun `second sequential connection through the same tunnel link succeeds`() {
         Network.newNetwork().use { net ->
             val server = GenericContainer("python:3.12-alpine")

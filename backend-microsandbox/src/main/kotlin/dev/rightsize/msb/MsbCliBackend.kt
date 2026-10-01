@@ -1722,8 +1722,10 @@ class MsbCliBackend private constructor(
 
     private fun invoke(args: List<String>, timeoutSec: Long): ExecResult {
         val proc = ProcessBuilder(listOf(msb.toString()) + args).start()
-        // `msb exec` forwards host stdin to the guest and blocks until stdin hits EOF;
-        // a ProcessBuilder pipe stays open forever, hanging the call. Signal EOF up front.
+        // `msb exec` forwards host stdin to the guest command while it runs, and exits when the
+        // command does (msb 0.7.5+; before that it read stdin to EOF first, so an open
+        // ProcessBuilder pipe hung the call). Signal EOF up front anyway: the guest command then
+        // sees EOF at once instead of waiting on input nobody sends.
         runCatching { proc.outputStream.close() }
         val stdout = StringBuilder(); val stderr = StringBuilder()
         val tOut = drain(proc.inputStream) { stdout.appendLine(it) }

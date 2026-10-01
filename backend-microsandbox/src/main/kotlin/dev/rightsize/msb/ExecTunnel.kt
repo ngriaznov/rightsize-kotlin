@@ -6,7 +6,8 @@ import java.nio.file.Path
 
 /**
  * One alias:guestPort route into a consumer sandbox, bridged over `msb exec --stream`.
- * Single connection at a time; the in-guest listener is respawned after each connection.
+ * Single connection at a time: the in-guest listener is one `nc -l -p <port>`, which serves one
+ * connection, and the worker thread serves one exchange at a time, then respawns the listener.
  * Client-speaks-first protocols only (HTTP). Confirmed empirically against the real msb
  * binary: host-side reads MUST be raw unbuffered streams, never buffered readers, or the
  * pump hangs.
@@ -25,13 +26,15 @@ internal class ExecTunnel(
         // broken pump) busy-spins `msb exec` in a tight loop. Same backoff on both respawn paths.
         const val RESPAWN_BACKOFF_MS = 200L
 
-        // msb's host-port-publish proxy never propagates the target's own TCP close back
-        // to this host-side socket (empirically confirmed against the real binary) - a plain
-        // `read() == 0` on the target->guest direction therefore never arrives,
-        // and serveOneConnection blocks forever after the first exchange, wedging the tunnel to
-        // exactly one connection for its whole lifetime. Fix: give the target socket a read
-        // timeout and treat a timeout as end-of-exchange, scoped in two phases so a slow-but-real
-        // response is never truncated:
+        // How the target->guest pump learns an exchange is over. From msb 0.7.5 on, a published
+        // TCP port passes the guest's close to this host-side socket, so a target that closes
+        // after its response (`Connection: close`, HTTP/1.0, a server that answers and hangs up)
+        // ends the read with EOF at once. Before 0.7.5 that close never arrived (confirmed against
+        // the real binary). A keep-alive target (any persistent HTTP/1.1 server) never closes even
+        // on the pinned msb, and without an end-of-exchange signal serveOneConnection would block
+        // forever after the first exchange, so the in-guest listener would never be respawned.
+        // So the target socket gets a read timeout and a timeout counts as end-of-exchange,
+        // scoped in two phases so a slow-but-real response is never truncated:
         //  - before any target byte arrives, tolerate silence up to FIRST_BYTE_DEADLINE_MS (a
         //    cold response taking this long must still come through whole);
         //  - once the first byte has arrived, tighten to IDLE_WINDOW_MS - a gap this short right
@@ -68,8 +71,9 @@ internal class ExecTunnel(
                     out.write(first); out.flush()
                     pump(p.inputStream, out)
                 }.apply { isDaemon = true; start() }
-                // target -> guest: relay the response back, ending on idle timeout since msb's
-                // proxy never delivers a real EOF here (see companion object comment above).
+                // target -> guest: relay the response back. Ends on the target's EOF (msb 0.7.5+,
+                // when the target closes) or on the idle timeout, which is the only end-of-exchange
+                // signal for a keep-alive target (see companion object comment above).
                 pumpWithIdleTimeout(sock, p.outputStream)
                 guestToTargetPump.join(2000)
             }
@@ -96,8 +100,9 @@ internal class ExecTunnel(
      * Same raw unbuffered relay as [pump], except [sock] carries a read timeout and a
      * [java.net.SocketTimeoutException] is treated exactly like a clean EOF - "no more data is
      * coming, this exchange is over" - rather than as a failure. Used specifically for the
-     * target-to-guest direction, where msb's port-publish proxy never delivers a real close
-     * (see companion object comment).
+     * target-to-guest direction, where a keep-alive target never closes its side, so the timeout
+     * is the only end-of-exchange signal. A target that does close ends the loop earlier, on
+     * EOF (msb 0.7.5+; see companion object comment).
      *
      * Scoped in two phases: [sock] arrives with its timeout already set to
      * [FIRST_BYTE_DEADLINE_MS] by the caller, tolerating a slow target that hasn't sent anything

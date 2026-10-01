@@ -29,12 +29,17 @@ directly outside of rightsize and hit this, drop `-d`.
 **Symptom:** Any `execInContainer(...)` call (or a raw `msb exec` invocation) never
 returns.
 
-**Cause:** `msb exec` blocks until its stdin hits EOF — a subprocess pipe left open
-(the default for most process-spawning APIs) keeps it waiting forever.
+**Cause:** Before msb 0.7.5, `msb exec` read its stdin to EOF before starting the
+command, so a subprocess pipe left open (the default for most process-spawning APIs)
+kept it waiting forever. The pinned msb forwards stdin while the command runs and exits
+when the command does, so an open pipe no longer hangs the call itself. A guest command
+that reads stdin (a bare `cat`, say) still waits for input that never comes.
 
 **Fix:** Handled inside rightsize — the backend closes the child's stdin immediately
-after spawning. If you're shelling out to `msb exec` yourself, make sure you close or
-redirect-from-`/dev/null` the child's stdin rather than leaving a pipe open.
+after spawning, so the guest command sees EOF at once. If you're shelling out to
+`msb exec` yourself, close or redirect-from-`/dev/null` the child's stdin rather than
+leaving a pipe open (required before msb 0.7.5, and still the way to keep a
+stdin-reading command from waiting).
 
 ## `followOutput`'s last line arrives after the container reports stopped
 
@@ -215,21 +220,23 @@ not a rightsize bug.
 alias works exactly once, then every subsequent connection from the same consumer
 hangs indefinitely.
 
-**Cause:** msb's port-publish proxy never propagates the target's own TCP close
-back to the tunnel's host-side socket — a host client reading a published port never
-observes EOF even after the guest workload closes its end. Naively pumping until a
-natural `read() == 0` therefore blocks forever after the first exchange, so the
-in-guest listener is never respawned for a second connection.
+**Cause:** A tunnel serves one connection at a time: its in-guest listener is a single
+`nc -l -p` that is only respawned once the current exchange has ended. If the host side
+never decides the exchange is over, the listener is never respawned and every later
+connection hangs. A target's close is one signal that it's over. Since msb 0.7.5 a
+published port passes the guest's close on to the host-side client, so a target that
+closes after its response (`Connection: close`, HTTP/1.0) ends the exchange at once;
+before 0.7.5 no close arrived. A keep-alive target (a persistent HTTP/1.1 server) never
+closes at all.
 
-**Fix:** Already handled — the exec-tunnel relay infers "this exchange is over" from a
-read-timeout heuristic instead of waiting for a natural close (a generous first-byte
-deadline before any data has arrived, tightened to a short idle timeout once data
-starts flowing). This is exactly why
-[Networking](concepts/networking.md#limits-on-the-microsandbox-backend) documents
-"one connection at a time per tunnel" as a hard limit rather than a bug to be fixed —
-it's the tunnel's designed contract, not an oversight. If your test needs a sustained,
-multi-request connection to a sibling, that's the case to run under
-`RIGHTSIZE_BACKEND=docker` instead.
+**Fix:** Already handled — the exec-tunnel relay also infers "this exchange is over" from
+a read-timeout heuristic (a generous first-byte deadline before any data has arrived,
+tightened to a short idle timeout once data starts flowing), which is the only signal a
+keep-alive target gives. "One connection at a time per tunnel" stays a documented limit
+([Networking](concepts/networking.md#limits-on-the-microsandbox-backend)): it comes from
+the tunnel's single in-guest listener, so it's the tunnel's designed contract, not an
+oversight. If your test needs a sustained, multi-request connection to a sibling, that's
+the case to run under `RIGHTSIZE_BACKEND=docker` instead.
 
 ## Readiness passes but the server isn't really answering yet (either backend)
 
