@@ -7,7 +7,19 @@ reaches its first tagged release.
 
 ## [Unreleased]
 
-Nothing yet.
+### Changed
+
+- **The pinned msb is now 0.7.6** (was 0.7.3). The CLI surface this library drives is
+  unchanged, and 0.7.6 adds no state-database migration, so it shares an `MSB_HOME` with
+  the msb 0.7.3 that rightsize 0.7.13 provisions. Two upstream changes from msb 0.7.5 are
+  visible through this library:
+
+  - A published TCP port now passes the guest's close on to the host client. An exchange
+    over a TCP network link whose target closes the connection after responding now ends
+    at once, instead of after the link's idle timeout. The idle timeout still ends
+    exchanges with targets that keep the connection open.
+  - The default listening-port wait counts a server that accepts a connection and closes
+    it straight away as not ready. It always meant to; msb used to hide that close.
 
 ## [0.7.13] - 2026-09-26
 
