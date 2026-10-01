@@ -189,6 +189,11 @@ object MsbCommands {
     fun followLogs(name: String) = listOf("logs", name, "-f")
     fun stop(name: String) = listOf("stop", name)
     fun rm(name: String) = listOf("rm", name)
+    /** `msb rm -f <name>` — removes the sandbox record and directory whatever state the row is
+     * in, including one msb left stuck in `Starting` after a failed boot, which plain [rm]
+     * refuses as "still running". Used between the two attempts of [MsbCliBackend]'s
+     * agent-relay retry; every other caller keeps plain [rm]. */
+    fun rmForce(name: String) = listOf("rm", "-f", name)
     fun ls() = listOf("ls", "--format", "json")
     /**
      * `msb snapshot create --from-sandbox <sandbox> <name>` requires [sandbox] STOPPED and

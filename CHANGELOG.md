@@ -21,6 +21,17 @@ reaches its first tagged release.
   - The default listening-port wait counts a server that accepts a connection and closes
     it straight away as not ready. It always meant to; msb used to hide that close.
 
+### Fixed
+
+- **A Windows msb boot race is retried once.** msb sometimes gives up on a sandbox with
+  "sandbox process exited (exit code: 0) before agent relay became available": the sandbox
+  process exits cleanly before its guest agent comes up and leaves no boot error behind.
+  It has only been seen on loaded Windows hosts, on ordinary boots and on checkpoint
+  restores. A boot or restore that fails this way is now removed with `msb rm -f` and tried
+  once more under the same name after a 2-second pause; if that also fails, the error
+  carries msb's output as before. The same message with a crash exit (a non-zero or hex
+  exit code, or a signal) is not retried.
+
 ## [0.7.13] - 2026-09-26
 
 ### Changed

@@ -229,6 +229,7 @@ class MsbCommandsTest {
             MsbCommands.logsSystem("rz-abc-1"))
         assertEquals(listOf("stop", "rz-abc-1"), MsbCommands.stop("rz-abc-1"))
         assertEquals(listOf("rm", "rz-abc-1"), MsbCommands.rm("rz-abc-1"))
+        assertEquals(listOf("rm", "-f", "rz-abc-1"), MsbCommands.rmForce("rz-abc-1"))
         assertEquals(listOf("ls", "--format", "json"), MsbCommands.ls())   // no `--json` flag on ls
         assertEquals(listOf("image", "remove", "floci/floci-az:0.8.0"),
             MsbCommands.imageRemove("floci/floci-az:0.8.0"))

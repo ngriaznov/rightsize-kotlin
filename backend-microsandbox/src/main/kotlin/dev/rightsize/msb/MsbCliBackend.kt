@@ -195,7 +195,12 @@ class MsbCliBackend private constructor(
      * cache entry and retried exactly once — see [spawnAndAwaitRunning]. The failed attempt
      * never reached Running, so [Handle.attached] and [startedNames] (both populated only
      * after [spawnAndAwaitRunning] returns) carry no state from it to double-register, and
-     * its child (when the boot had one) has already been reaped by [bootOnce].
+     * its child (when the boot had one) has already been reaped by [bootAttempt].
+     *
+     * A boot whose sandbox process exits cleanly before msb's agent relay comes up (see
+     * [isAgentRelayUnavailable]) is retried once as well, under the same name after an
+     * `msb rm -f` of the failed sandbox — see [bootOnce]. That retry sits under every boot path
+     * above, restores included.
      *
      * A `keepAlive` sandbox (container reuse, see docs/reuse.md) is never added to
      * [startedNames]: that set drives both the constructor shutdown hook and [close]'s
@@ -226,21 +231,22 @@ class MsbCliBackend private constructor(
     /**
      * Boots via [bootOnce], retrying two classified transient failures once each — the same
      * retry/heal wrapper around ordinary `run` boots AND `restore` boots alike (requirement:
-     * boot-transient classification applies to a restore's output the same way it does for
-     * run; only [bootOnce]'s internal supervision shape differs by boot kind). [spec] is
-     * ordinarily [Handle.spec] itself (from [start]), but [createCheckpoint]'s re-boot passes a
-     * copy with `checkpointRef` set instead — [handle] still supplies the identity (`id`) both
-     * callers boot under. A boot that hit msb's state-database error — usually the
+     * boot-transient classification applies to a restore's output the same way it does for run;
+     * only [bootAttempt]'s internal supervision shape differs by boot kind). Every boot below,
+     * retries included, goes through [bootOnce], which adds one more retry of its own for msb's
+     * agent-relay exit (see [isAgentRelayUnavailable]); none of the catches here handle that
+     * failure. [spec] is ordinarily [Handle.spec] itself (from [start]), but [createCheckpoint]'s
+     * re-boot passes a copy with `checkpointRef` set instead — [handle] still supplies the identity
+     * (`id`) both callers boot under. A boot that hit msb's state-database error — usually the
      * startup-migration race (see [isMsbStateDbError]) — is retried after a short delay with no
      * heal step; the race is transient by construction. On a first failure carrying msb's
      * image-cache-corruption signature, heals by removing just the affected image's cache entry
-     * (`msb image remove <image>`, result ignored — including "image not found", since the
-     * real signal is whether the retried boot succeeds, not whether removal reported
-     * success) and retries the boot exactly once. A second identical failure surfaces an
-     * error naming the image and the attempted heal instead of retrying further. The heal
-     * is scoped to the one image reference — never the whole cache directory, and never any
-     * sandbox state (`image remove` touches only the image cache's manifest and layer
-     * bookkeeping).
+     * (`msb image remove <image>`, result ignored — including "image not found", since the real
+     * signal is whether the retried boot succeeds, not whether removal reported success) and
+     * retries the boot exactly once. A second identical failure surfaces an error naming the image
+     * and the attempted heal instead of retrying further. The heal is scoped to the one image
+     * reference — never the whole cache directory, and never any sandbox state (`image remove`
+     * touches only the image cache's manifest and layer bookkeeping).
      *
      * Two corruption shapes were found empirically and the same one command heals both:
      * the failing image's manifest was never committed to msb's cache database (a
@@ -266,7 +272,7 @@ class MsbCliBackend private constructor(
      * [bootOnce] call this method itself makes — including its own internal retries (the
      * install-lock poll, the state-db one-shot retry) — so once a restore has escalated, EVERY
      * attempt launched from here, not just the fresh-name loop's own top-level one, goes through
-     * the broker; see [bootOnce]'s own doc for what that actually changes.
+     * the broker; see [bootAttempt]'s own doc for what that actually changes.
      *
      * A [RestoreAccessDeniedException] is never retried HERE, by either caller — see that catch's
      * own doc below for why this method always propagates it raw, unlike every other classified
@@ -342,6 +348,43 @@ class MsbCliBackend private constructor(
     }
 
     /**
+     * One boot step: a single [bootAttempt], plus one retry when that attempt dies with msb's
+     * agent-relay signature (see [isAgentRelayUnavailable]) — msb's sandbox process exited
+     * cleanly before the host's agent connection came up, a load-correlated Windows CI
+     * transient. Every boot path reaches this: [spawnAndAwaitRunning] makes all its boots here,
+     * including the retries of its own install-lock poll, state-database retry and image-cache
+     * heal, so an ordinary `run`, a keep-alive boot, a direct or brokered restore (and the
+     * brokered attempt's direct fallback) and [createCheckpoint]'s reboot all get it, and
+     * [restoreRetryingFreshName]'s access-denied walk gets it for each name it tries.
+     *
+     * Unlike the other boot transients, the failed attempt got as far as spawning a sandbox
+     * process, so msb leaves the sandbox's catalog row behind (Stopped, or stuck in `Starting`
+     * when its own rollback could not take the lifecycle lock). A plain same-name retry would
+     * not be a fresh boot: `msb run --name X` restarts that persisted config and ignores the new
+     * flags, and `msb restore --name X` refuses with "already exists". So this first runs a
+     * best-effort `msb rm -f` of the failed name (result ignored; `-f` is what clears a row stuck
+     * in `Starting`), waits [AGENT_RELAY_RETRY_DELAY_MS], and boots again under the SAME name,
+     * spec and launch mode ([useBroker] unchanged). The ledger entry and [startedNames] are keyed
+     * by that name, so no bookkeeping moves. A second relay failure is an error, not a third try.
+     */
+    private fun bootOnce(handle: Handle, spec: ContainerSpec, useBroker: Boolean = false): Process? {
+        try {
+            return bootAttempt(handle, spec, useBroker)
+        } catch (first: AgentRelayUnavailableException) {
+            runCatching { invoke(MsbCommands.rmForce(spec.name), STOP_TIMEOUT_SEC) }
+            Thread.sleep(AGENT_RELAY_RETRY_DELAY_MS)
+            try {
+                return bootAttempt(handle, spec, useBroker)
+            } catch (second: AgentRelayUnavailableException) {
+                error("msb ${if (spec.checkpointRef != null) "restore" else "run"} for sandbox ${spec.name}: " +
+                    "msb's sandbox process exited before its agent relay came up on both attempts (the " +
+                    "retry ran after `msb rm -f` of the failed sandbox and a short pause).\n" +
+                    "last attempt:\n${second.output}")
+            }
+        }
+    }
+
+    /**
      * One boot attempt, dispatched by `spec.checkpointRef`:
      * - unset: spawns the attached `msb run` child and waits for [handle] to reach Running via
      *   [awaitRunning] — unchanged from before restore got its own supervision. Returns the
@@ -370,7 +413,7 @@ class MsbCliBackend private constructor(
      * policy, never cleanup. [bootOnceBrokered] has no such live child of its own to reap: the
      * WMI-created process was never this JVM's child in the first place.
      */
-    private fun bootOnce(handle: Handle, spec: ContainerSpec, useBroker: Boolean = false): Process? {
+    private fun bootAttempt(handle: Handle, spec: ContainerSpec, useBroker: Boolean = false): Process? {
         if (spec.checkpointRef != null && useBroker) return bootOnceBrokered(handle, spec)
         val (proc, tail, drainer) = spawnAttachedRun(spec)   // ATTACHED run, or a detached restore launch
         try {
@@ -388,7 +431,7 @@ class MsbCliBackend private constructor(
     }
 
     /**
-     * The brokered counterpart of [bootOnce]'s direct restore path — POLICY v2's escalation (see
+     * The brokered counterpart of [bootAttempt]'s direct restore path — POLICY v2's escalation (see
      * [restoreRetryingFreshName]'s doc). Launches `msb restore ...` via [restoreBroker]
      * instead of a direct [spawnAttachedRun], then classifies/polls [handle] to Running exactly
      * like the direct path does, reusing the SAME predicates: [classifyRestoreExit] is the exact
@@ -405,7 +448,7 @@ class MsbCliBackend private constructor(
      * by this fallback, so the NEXT attempt (a fresh name, if this one also fails) tries the
      * broker again rather than giving up on it permanently over one infrastructure hiccup.
      *
-     * Ends in the exact same [spawnWorkloadExecChild] call [bootOnce]'s direct path ends in — see
+     * Ends in the exact same [spawnWorkloadExecChild] call [bootAttempt]'s direct path ends in — see
      * that method's own doc: this is what gives the brokered path the identical
      * handle/attached-state shape the direct restore path produces, never a bespoke shape of its
      * own. The brokered sandbox is DETACHED with no attached child in THIS JVM for the restore
@@ -472,9 +515,10 @@ class MsbCliBackend private constructor(
     /** Polls until [handle] reaches Running, or fails fast if the `msb run` child exits first.
      * An early exit is classified from the child's combined output: the image-cache-corruption
      * signature throws [ImageCacheCorruptionException] (the one failure [spawnAndAwaitRunning]
-     * heals and retries), a host-port bind conflict throws [PortBindConflictException], a clean
-     * exit 0 that passes [isCleanFastExit]'s post-mortem check returns normally (see that
-     * method's doc), and anything else surfaces the raw output. */
+     * heals and retries), msb's agent-relay exit throws [AgentRelayUnavailableException]
+     * ([bootOnce] retries it once), a host-port bind conflict throws [PortBindConflictException],
+     * a clean exit 0 that passes [isCleanFastExit]'s post-mortem check returns normally (see
+     * that method's doc), and anything else surfaces the raw output. */
     private fun awaitRunning(handle: Handle, proc: Process, tail: ConcurrentLinkedDeque<String>, drainer: Thread) {
         val deadline = System.currentTimeMillis() + FIRST_RUN_PULL_TIMEOUT_MS
         while (System.currentTimeMillis() < deadline) {
@@ -487,6 +531,7 @@ class MsbCliBackend private constructor(
                 if (isImageCacheCorruption(output)) throw ImageCacheCorruptionException(output)
                 if (isMsbStateDbError(output)) throw MsbStateDbException(output)
                 if (isMsbInstallLockActive(output)) throw MsbInstallLockException(output)
+                if (isAgentRelayUnavailable(output)) throw AgentRelayUnavailableException(output)
                 if (isPortBindConflict(output)) {
                     throw PortBindConflictException(
                         "msb run for sandbox ${handle.id} could not bind a host port: $output")
@@ -524,14 +569,14 @@ class MsbCliBackend private constructor(
      * value; see the class doc):
      *
      * 1. Wait for [proc] to exit. Non-exit within the deadline is itself a boot failure (the
-     *    caller, [bootOnce], force-kills it on any throw from here, same as an attached-run
+     *    caller, [bootAttempt], force-kills it on any throw from here, same as an attached-run
      *    readiness timeout). A nonzero exit is classified from the combined output through the
-     *    exact same boot-transient signatures [awaitRunning] uses — image-cache corruption,
-     *    msb's state-database race, its install lock, a host-port bind conflict, a name
-     *    collision — so [spawnAndAwaitRunning]'s retry/heal wrapper covers a restore boot
-     *    exactly like it always has an ordinary one (boot-transient classification applies to
-     *    the restore process's output the same way it does for `run`; only this method's
-     *    supervision shape differs). Anything else surfaces the raw output.
+     *    exact same boot-transient signatures [awaitRunning] uses — image-cache corruption, msb's
+     *    state-database race, its install lock, its agent-relay exit, a host-port bind conflict, a
+     *    name collision — so [spawnAndAwaitRunning]'s retry/heal wrapper covers a restore boot
+     *    exactly like it always has an ordinary one (boot-transient classification applies to the
+     *    restore process's output the same way it does for `run`; only this method's supervision
+     *    shape differs). Anything else surfaces the raw output.
      * 2. Once [proc] has exited 0, [handle] has no supervising child left AT ALL — activation
      *    succeeded, but the sandbox may still be `Starting` in the background. Poll `msb ls` on
      *    the remaining budget, same interval as [awaitRunning]'s own poll ([READINESS_POLL_MS]):
@@ -544,7 +589,7 @@ class MsbCliBackend private constructor(
      *    diagnostic shape as a crashed attached one.
      *
      * Never returns a [Process]: unlike [awaitRunning], by the time this returns successfully
-     * [proc] has already exited, so [bootOnce] hands [Handle.attached] `null` for this boot
+     * [proc] has already exited, so [bootAttempt] hands [Handle.attached] `null` for this boot
      * kind rather than a value from here.
      */
     private fun awaitRestoreRunning(
@@ -579,6 +624,7 @@ class MsbCliBackend private constructor(
         if (isMsbStateDbError(output)) throw MsbStateDbException(output)
         if (isMsbInstallLockActive(output)) throw MsbInstallLockException(output)
         if (isRestoreAccessDenied(output)) throw RestoreAccessDeniedException(output)
+        if (isAgentRelayUnavailable(output)) throw AgentRelayUnavailableException(output)
         if (isPortBindConflict(output)) {
             throw PortBindConflictException(
                 "msb restore for sandbox ${handle.id} could not bind a host port: $output")
@@ -665,7 +711,7 @@ class MsbCliBackend private constructor(
      * way back in.
      *
      * This process becomes the boot's new supervising attached child (the slot a plain restore
-     * left `null` before this existed — see [bootOnce]'s doc): its own stdout/stderr are what
+     * left `null` before this existed — see [bootAttempt]'s doc): its own stdout/stderr are what
      * msb's own log capture records for THIS sandbox from here on (confirmed empirically — an
      * exec session's output lands in `exec.log`, served by `msb logs`/`-f`), so unlike every
      * other process this backend spawns, its combined-output tail below is used ONLY for a quick
@@ -1766,6 +1812,10 @@ private const val STATE_DB_RETRY_DELAY_MS = 500L
 // loudly after it — a lock outliving this really is stuck.
 private const val INSTALL_LOCK_RETRY_BUDGET_MS = 30_000L
 private const val INSTALL_LOCK_RETRY_DELAY_MS = 2_000L
+// Between the two attempts of a boot whose sandbox process exited before msb's agent relay
+// came up (see [isAgentRelayUnavailable]): room for `msb rm -f` of the failed sandbox to finish
+// releasing its name on a loaded Windows host, still short next to the boot it repeats.
+private const val AGENT_RELAY_RETRY_DELAY_MS = 2_000L
 private const val EXEC_TIMEOUT_SEC = 120L
 // How long exec keeps retrying while the guest agent's endpoint has not appeared yet,
 // and how long it pauses between attempts — see [isAgentEndpointNotReady]. Zero cost on
@@ -1988,6 +2038,41 @@ internal class RestoreAccessDeniedException(val output: String) :
  */
 internal fun isRestoreAccessDenied(output: String): Boolean =
     "Access is denied" in output && ("io error" in output || "(os error 5)" in output)
+
+/** The boot failure [MsbCliBackend.bootOnce] retries once — msb's sandbox process exited
+ * cleanly before the host's agent relay came up (see [isAgentRelayUnavailable]). Internal to
+ * the boot path, like its siblings above; it never leaves [MsbCliBackend.bootOnce], which turns
+ * a repeat into a plain error. */
+internal class AgentRelayUnavailableException(val output: String) :
+    RuntimeException("msb sandbox process exited before its agent relay became available:\n$output")
+
+/**
+ * True if [output] (an `msb run` or `msb restore` invocation's combined stdout/stderr) says the
+ * sandbox process had already exited, with a clean exit status, by the time msb gave up waiting
+ * for the guest agent. msb prints it when the sandbox process is gone and left no
+ * `boot-error.json` behind:
+ *
+ * ```
+ * error: failed to start "rz-731fdcdc-8"
+ *   → other: sandbox process exited (exit code: 0) before agent relay became available
+ *   → run `msb logs --source system rz-731fdcdc-8` for full diagnostics
+ * ```
+ *
+ * Seen only on Windows CI hosts under load, on attached `run` boots and on restores, direct and
+ * brokered. The status inside the parentheses is Rust's `ExitStatus` Display: `exit code: N` on
+ * Windows (hex for high-bit codes, e.g. `0xc0000409`), `exit status: N` or `signal: N (SIGABRT)`
+ * on Unix. Only a clean exit is the transient. A crash (non-zero, hex or a signal) with the same
+ * sentence is a deterministic failure — the msb 0.6.x tab-in-env SIGABRT printed exactly that —
+ * so it must not be retried. The marker keeps its parentheses so `0xc0000409` and multi-digit
+ * codes cannot match `0`.
+ *
+ * The two substrings are matched independently: on Windows the capture reaches this backend
+ * through PowerShell, which decorates the output and mangles the `→` arrow, so nothing here
+ * depends on the arrow, the `other:` or `error:` prefix, line structure, or the platform.
+ */
+internal fun isAgentRelayUnavailable(output: String): Boolean =
+    "before agent relay became available" in output &&
+        ("(exit code: 0)" in output || "(exit status: 0)" in output)
 
 /**
  * POLICY v2's own broker seam ([MsbCliBackend.restoreBroker]) — launches `msb restore <argv>`
