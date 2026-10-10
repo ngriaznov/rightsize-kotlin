@@ -7,6 +7,10 @@ reaches its first tagged release.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.7.15] - 2026-10-10
+
 ### Changed
 
 - **The pinned msb is now 0.7.8** (was 0.7.6). The CLI surface this library drives is
@@ -1068,7 +1072,8 @@ Initial public release.
   exactly once; any other failure, or a second failure after the heal,
   propagates unchanged.
 
-[Unreleased]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.14...HEAD
+[Unreleased]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.15...HEAD
+[0.7.15]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.14...v0.7.15
 [0.7.14]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.13...v0.7.14
 [0.7.13]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.12...v0.7.13
 [0.7.12]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.11...v0.7.12
