@@ -466,6 +466,28 @@ class MsbRestoreBrokerScriptTest {
             "an embedded single quote must never survive un-doubled: $script")
     }
 
+    @Test fun `buildBrokerScript keeps a dollar sign and a backtick in a host path literal`() {
+        val volume = "C:\\Users\\me\\${'$'}proj\\a`b.conf:/etc/app.conf:rw,nodev"
+        val script = buildBrokerScript(
+            Path.of("C:\\tools\\msb.exe"),
+            listOf("restore", "C:\\snaps\\snap_0123", "--name", "rz-run1-3", "--volume", volume),
+            Path.of("C:\\temp\\rz-broker-1.out.txt"),
+            Path.of("C:\\temp\\rz-broker-1.ec.txt"),
+        )
+        val commandLine = script.lines().first { "CommandLine" in it }
+        assertTrue(powerShellDoubleQuotedEscape(powerShellSingleQuoted(volume)) in commandLine,
+            "the volume token must be escaped for the outer double-quoted literal: $commandLine")
+        assertFalse(Regex("(?<!`)\\${'$'}proj").containsMatchIn(commandLine),
+            "an unescaped dollar sign would be expanded by PowerShell: $commandLine")
+        assertTrue("a``b.conf" in commandLine, "a backtick must be doubled: $commandLine")
+    }
+
+    @Test fun `powerShellDoubleQuotedEscape escapes the backtick before the dollar sign`() {
+        assertEquals("`${'$'}x", powerShellDoubleQuotedEscape("${'$'}x"))
+        assertEquals("a````b", powerShellDoubleQuotedEscape("a``b"))
+        assertEquals("plain", powerShellDoubleQuotedEscape("plain"))
+    }
+
     @Test fun `buildBrokerScript handles an empty argv without producing malformed PowerShell spacing`() {
         val script = buildBrokerScript(Path.of("/usr/local/bin/msb"), emptyList(), Path.of("/tmp/o"), Path.of("/tmp/e"))
         assertTrue("Invoke-CimMethod" in script)

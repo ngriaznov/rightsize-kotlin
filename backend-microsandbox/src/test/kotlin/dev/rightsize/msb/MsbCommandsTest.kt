@@ -58,16 +58,19 @@ class MsbCommandsTest {
 
     // --- MsbCommands.restore: msb 0.7's dedicated restore command ---
 
-    @Test fun `restore command carries the ref, name, memory, and ports - never env, command, mounts, or --disk-only`() {
+    @Test fun `restore command carries the ref, name, memory, ports and mounts - never env, command, --mount-file, or --disk-only`() {
         val cmd = MsbCommands.restore(spec.copy(
             checkpointRef = "rz-ckpt-0123456789ab", memoryLimitMb = 1024))
         assertEquals(listOf("restore", "rz-ckpt-0123456789ab", "--name", "rz-abc-1",
-            "-m", "1024M", "-p", "12345:6379"), cmd)
+            "-m", "1024M", "-p", "12345:6379",
+            "--volume", "/tmp/f.conf:/etc/f.conf:rw,nodev"), cmd)
         assertFalse(cmd.contains("-e"), "restore has no -e/--env flag at all")
         assertFalse(cmd.contains("A=1"))
         assertFalse(cmd.contains("--"), "restore has no trailing-command flag at all")
         assertFalse(cmd.contains("redis-server"))
-        assertFalse(cmd.contains("--mount-file"), "restore has no --mount-file equivalent")
+        assertFalse(cmd.contains("--mount-file"), "restore takes a mount as --volume, never --mount-file")
+        assertFalse(cmd.contains("--allow-missing-resources"),
+            "a missing file must stop the restore, never come back empty")
         assertFalse(cmd.contains("redis:8.6-alpine"), "the ordinary image arg must not appear on a restore")
         assertFalse(cmd.contains("--disk-only"),
             "msb 0.7.1 rejects --disk-only for a disk-scope snapshot — restore must never emit it")
@@ -76,12 +79,13 @@ class MsbCommandsTest {
     @Test fun `restore command omits -m when memoryLimitMb is null`() {
         val cmd = MsbCommands.restore(spec.copy(checkpointRef = "rz-ckpt-0123456789ab", memoryLimitMb = null))
         assertEquals(listOf("restore", "rz-ckpt-0123456789ab", "--name", "rz-abc-1",
-            "-p", "12345:6379"), cmd)
+            "-p", "12345:6379", "--volume", "/tmp/f.conf:/etc/f.conf:rw,nodev"), cmd)
     }
 
     @Test fun `restore command omits -p when there are no ports`() {
         val cmd = MsbCommands.restore(spec.copy(checkpointRef = "rz-ckpt-0123456789ab", ports = emptyList()))
-        assertEquals(listOf("restore", "rz-ckpt-0123456789ab", "--name", "rz-abc-1"), cmd)
+        assertEquals(listOf("restore", "rz-ckpt-0123456789ab", "--name", "rz-abc-1",
+            "--volume", "/tmp/f.conf:/etc/f.conf:rw,nodev"), cmd)
     }
 
     @Test fun `restore command never emits --disk-only`() {
@@ -178,7 +182,8 @@ class MsbCommandsTest {
             ),
         ))
         assertEquals(listOf("restore", "rz-ckpt-0123456789ab", "--name", "rz-abc-1",
-            "-p", "12345:6379", "-p", "22345:53/udp"), cmd)
+            "-p", "12345:6379", "-p", "22345:53/udp",
+            "--volume", "/tmp/f.conf:/etc/f.conf:rw,nodev"), cmd)
     }
 
     // A checkpoint reboot / an ordinary fromCheckpoint(...).start() restore must re-publish a UDP
@@ -187,7 +192,65 @@ class MsbCommandsTest {
         val cmd = MsbCommands.restore(spec.copy(
             checkpointRef = "rz-ckpt-0123456789ab", ports = listOf(PortBinding(hostPort = 40000, guestPort = 53, protocol = PortProtocol.UDP)),
         ))
-        assertEquals(listOf("restore", "rz-ckpt-0123456789ab", "--name", "rz-abc-1", "-p", "40000:53/udp"), cmd)
+        assertEquals(listOf("restore", "rz-ckpt-0123456789ab", "--name", "rz-abc-1", "-p", "40000:53/udp",
+            "--volume", "/tmp/f.conf:/etc/f.conf:rw,nodev"), cmd)
+    }
+
+    // --- Copied files across a restore: one --volume per mount, spelled like run's --mount-file ---
+
+    private val ckpt = "rz-ckpt-0123456789ab"
+
+    @Test fun `restore command emits no --volume when there are no mounts`() {
+        val cmd = MsbCommands.restore(spec.copy(checkpointRef = ckpt, mounts = emptyList()))
+        assertEquals(listOf("restore", ckpt, "--name", "rz-abc-1", "-p", "12345:6379"), cmd)
+    }
+
+    @Test fun `restore command emits one --volume for a single mount, after -p`() {
+        val cmd = MsbCommands.restore(spec.copy(
+            checkpointRef = ckpt, memoryLimitMb = 512,
+            mounts = listOf(FileMount(Path.of("/srv/in/app.conf"), "/etc/app.conf"))))
+        assertEquals(listOf("restore", ckpt, "--name", "rz-abc-1", "-m", "512M",
+            "-p", "12345:6379", "--volume", "/srv/in/app.conf:/etc/app.conf:rw,nodev"), cmd)
+    }
+
+    @Test fun `restore command emits one --volume per mount in spec order, ro and rw spelled like run`() {
+        val mounts = listOf(
+            FileMount(Path.of("/tmp/b.conf"), "/etc/app/b.conf", readOnly = true),
+            FileMount(Path.of("/tmp/a.conf"), "/etc/app/a.conf"),
+        )
+        val cmd = MsbCommands.restore(spec.copy(checkpointRef = ckpt, mounts = mounts))
+        assertEquals(listOf("restore", ckpt, "--name", "rz-abc-1", "-p", "12345:6379",
+            "--volume", "/tmp/b.conf:/etc/app/b.conf:ro,nodev",
+            "--volume", "/tmp/a.conf:/etc/app/a.conf:rw,nodev"), cmd)
+    }
+
+    // run and restore share one spec string, so the two cannot drift: every --mount-file value
+    // in run's argv is exactly the --volume value restore emits for the same mount.
+    @Test fun `restore --volume values are exactly run's --mount-file values`() {
+        val mounts = listOf(
+            FileMount(Path.of("/tmp/b.conf"), "/etc/app/b.conf", readOnly = true),
+            FileMount(Path.of("/tmp/a.conf"), "/etc/app/a.conf"),
+        )
+        fun valuesAfter(argv: List<String>, flag: String) =
+            argv.withIndex().filter { it.value == flag }.map { argv[it.index + 1] }
+        val s = spec.copy(mounts = mounts, checkpointRef = ckpt)
+        assertEquals(valuesAfter(MsbCommands.run(s), "--mount-file"), valuesAfter(MsbCommands.restore(s), "--volume"))
+    }
+
+    // Host paths are passed through untouched, as run does: no drive-letter conversion, no
+    // quoting. The always-present option block is what keeps a Windows spec parseable by msb.
+    @Test fun `restore command passes a Windows-style host path through unchanged`() {
+        val win = "C:\\Users\\x\\f.txt"
+        val cmd = MsbCommands.restore(spec.copy(
+            checkpointRef = ckpt, mounts = listOf(FileMount(Path.of(win), "/etc/f.txt"))))
+        assertTrue(cmd.contains("$win:/etc/f.txt:rw,nodev"), "argv was $cmd")
+        assertTrue(MsbCommands.run(spec.copy(mounts = listOf(FileMount(Path.of(win), "/etc/f.txt"))))
+            .contains("$win:/etc/f.txt:rw,nodev"))
+    }
+
+    @Test fun `restore command puts --volume before the network policy`() {
+        val cmd = MsbCommands.restore(spec.copy(checkpointRef = ckpt, hostUdpEgressPorts = listOf(40000)))
+        assertTrue(cmd.indexOf("--volume") in 0 until cmd.indexOf("--net-default"), "argv was $cmd")
     }
 
     // --- UDP network links: run's --net-rule per port, restore's replacement policy ---
@@ -213,7 +276,7 @@ class MsbCommandsTest {
 
     @Test fun `restore command emits the full replacement policy, ports comma-joined in list order, when hostUdpEgressPorts is non-empty`() {
         val cmd = MsbCommands.restore(spec.copy(
-            checkpointRef = "rz-ckpt-0123456789ab", ports = emptyList(),
+            checkpointRef = "rz-ckpt-0123456789ab", ports = emptyList(), mounts = emptyList(),
             hostUdpEgressPorts = listOf(40000, 40001)))
         assertEquals(listOf("restore", "rz-ckpt-0123456789ab", "--name", "rz-abc-1",
             "--net-default", "deny",

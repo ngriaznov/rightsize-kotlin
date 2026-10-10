@@ -2,6 +2,7 @@ package dev.rightsize.msb
 
 import dev.rightsize.core.CheckpointMissingWorkloadCommandException
 import dev.rightsize.core.ContainerSpec
+import dev.rightsize.core.FileMount
 import dev.rightsize.core.checkpoint.CheckpointRegistry
 import org.junit.jupiter.api.Assumptions.assumeFalse
 import org.junit.jupiter.api.Test
@@ -276,5 +277,50 @@ class MsbCheckpointCaptureTest {
             secondBackend.stop(restoredHandle)
             secondBackend.remove(restoredHandle)
         }
+    }
+
+    // Reuse's adopt path: the adopting process only gets findRunning's minimal handle, which has no
+    // mounts. GenericContainer passes its own (part of the reuse identity), and the reboot must mount
+    // them again — otherwise msb 0.7.8 refuses the restore after the adopted sandbox is already gone.
+    @Test fun `createCheckpoint of a handle adopted with findRunning reboots with the adopter's mounts`(
+        @TempDir tmp: Path,
+    ) {
+        assumeFalse(Platform.current()?.isWindows == true, "POSIX-only fake binary; see doc comment")
+        val marker = Files.createTempFile("rz-adopt-marker-", "").also { Files.deleteIfExists(it) }
+        val callLog = Files.createTempFile("rz-adopt-calllog-", "")
+        val missFlag = Files.createTempFile("rz-adopt-missflag-", "").also { Files.deleteIfExists(it) }
+        val backend = MsbCliBackend.forHost(
+            fakeMsbCaptureLifecycle(marker, callLog, "serve\\0", missFlag),
+            windowsHost = false, checkpointRegistryDir = tmp,
+        )
+        val file = Files.writeString(tmp.resolve("app.conf"), "adopted")
+        val mounts = listOf(FileMount(file, "/etc/app.conf"))
+        val creator = backend.create(ContainerSpec(
+            name = "rz-adopt-test", image = "irrelevant", runId = "run1", keepAlive = true, mounts = mounts))
+        backend.start(creator)
+        val adopted = backend.findRunning("rz-adopt-test", mounts)
+        try {
+            assertNotNull(adopted, "a Running sandbox must be found")
+            assertEquals(mounts, adopted!!.spec.mounts)
+            assertEquals(emptyList<FileMount>(), backend.findRunning("rz-adopt-test")!!.spec.mounts,
+                "the one-argument findRunning keeps its minimal spec")
+            Files.writeString(callLog, "")
+
+            val effectiveRef = backend.createCheckpoint(adopted, "rz-ckpt-adopt")
+
+            val restore = nonPollingCalls(callLog).single { it.startsWith("restore ") }
+            assertEquals("restore $effectiveRef --name ${adopted.id} --volume $file:/etc/app.conf:rw,nodev", restore)
+        } finally {
+            adopted?.let { backend.stop(it); backend.remove(it) }
+        }
+    }
+
+    @Test fun `findRunning with mounts returns null for a name not Running`() {
+        assumeFalse(Platform.current()?.isWindows == true, "POSIX-only fake binary; see doc comment")
+        val marker = Files.createTempFile("rz-adopt-none-marker-", "").also { Files.deleteIfExists(it) }
+        val callLog = Files.createTempFile("rz-adopt-none-calllog-", "")
+        val missFlag = Files.createTempFile("rz-adopt-none-missflag-", "").also { Files.deleteIfExists(it) }
+        val backend = MsbCliBackend(fakeMsbCaptureLifecycle(marker, callLog, "", missFlag))
+        assertNull(backend.findRunning("rz-nobody", listOf(FileMount(Path.of("/tmp/x"), "/etc/x"))))
     }
 }

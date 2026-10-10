@@ -7,6 +7,7 @@ import dev.rightsize.RunId
 import dev.rightsize.core.Backends
 import dev.rightsize.core.CacheDir
 import dev.rightsize.core.Checkpoint
+import dev.rightsize.core.CheckpointMissingCopiedFilesException
 import dev.rightsize.core.CheckpointUnsupportedException
 import dev.rightsize.core.ContainerSpec
 import dev.rightsize.core.ExecResult
@@ -607,6 +608,66 @@ abstract class BackendContractTest {
             // not just a clean pass — Checkpoint.remove is itself idempotent either way.
             runCatching { original.stop() }
             Checkpoint.remove(name)
+        }
+    }
+
+    // A file added with withCopyFileToContainer is a start-time bind mount of a host file, not part of
+    // the filesystem a checkpoint captures, on either backend.
+    //  1. The source container still has the file after checkpoint(): Docker leaves the container
+    //     running, and microsandbox reboots it with the file mounted again from its host path.
+    //  2. microsandbox only: a container started from the checkpoint without the file is refused,
+    //     with the typed error naming the guest path, instead of coming up with the file empty.
+    //     (Docker starts it with the path left empty, and cannot tell.)
+    //  3. Adding the file again on the restored container brings its content back on both backends.
+    // The host file lives in a fresh temp dir that outlives the checkpoint and every container
+    // here (microsandbox's reboot and restore read it again), and is removed at the very end.
+    @Test fun `a copied file is kept by checkpoint and must be added again on a container restored from it`() {
+        val backend = Backends.active()
+        Assumptions.assumeTrue(backend.capabilities.checkpoint, "backend '${backend.name}' does not support checkpoint")
+        val isMsb = backend.name.equals("microsandbox", ignoreCase = true)
+        val dir = Files.createTempDirectory("rightsize-ckpt-copy-")
+        val payload = "copied-file-payload-${System.nanoTime()}\n"
+        val hostFile = dir.resolve("copied.txt")
+        Files.writeString(hostFile, payload)
+        // /srv, not /tmp: the microsandbox guest mounts /tmp as tmpfs.
+        val guestPath = "/srv/copied.txt"
+        val ready = { Wait.forLogMessage(".*", 0).withStartupTimeout(Duration.ofSeconds(30)) }
+        val source = GenericContainer("alpine:3.19")
+            .withCopyFileToContainer(MountableFile.forHostPath(hostFile.toString()), guestPath)
+            .withCommand("sh", "-c", "echo BOOT-MARKER; sleep 120")
+            .waitingFor(Wait.forLogMessage(".*BOOT-MARKER.*"))
+        var cp: Checkpoint? = null
+        try {
+            source.start()
+            cp = source.checkpoint()
+
+            val fromSource = source.execInContainer("cat", guestPath)
+            assertEquals(0, fromSource.exitCode, "reading the copied file after checkpoint() failed: ${fromSource.stderr}")
+            assertEquals(payload, fromSource.stdout, "the source container lost the copied file's content across checkpoint()")
+
+            if (isMsb) {
+                val bare = GenericContainer.fromCheckpoint(cp).waitingFor(ready())
+                try {
+                    val e = assertThrows(CheckpointMissingCopiedFilesException::class.java) { bare.start() }
+                    assertTrue(guestPath in e.message!!, "the error must name the missing guest path: ${e.message}")
+                    assertTrue("withCopyFileToContainer" in e.message!!, "the error must name the remedy: ${e.message}")
+                    assertFalse(bare.isRunning)
+                } finally { bare.stop() }
+            }
+
+            val restored = GenericContainer.fromCheckpoint(cp)
+                .withCopyFileToContainer(MountableFile.forHostPath(hostFile.toString()), guestPath)
+                .waitingFor(ready())
+            try {
+                restored.start()
+                val read = restored.execInContainer("cat", guestPath)
+                assertEquals(0, read.exitCode, "reading the re-added file failed: ${read.stderr}")
+                assertEquals(payload, read.stdout, "the re-added file's content is missing from the restored container")
+            } finally { restored.stop() }
+        } finally {
+            runCatching { source.stop() }
+            cp?.let { runCatching { backend.removeCheckpoint(it.ref) } }
+            runCatching { Files.deleteIfExists(hostFile); Files.deleteIfExists(dir) }
         }
     }
 

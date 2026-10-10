@@ -3,10 +3,13 @@ package dev.rightsize
 import dev.rightsize.core.BackendCapabilities
 import dev.rightsize.core.Checkpoint
 import dev.rightsize.core.CheckpointBackendMismatchException
+import dev.rightsize.core.CheckpointCopiedFileMissingException
+import dev.rightsize.core.CheckpointMissingCopiedFilesException
 import dev.rightsize.core.CheckpointRestoreOverrideUnsupportedException
 import dev.rightsize.core.CheckpointSpec
 import dev.rightsize.core.CheckpointUnsupportedException
 import dev.rightsize.core.ContainerSpec
+import dev.rightsize.core.FileMount
 import dev.rightsize.core.SandboxHandle
 import dev.rightsize.core.checkpoint.CheckpointRegistry
 import dev.rightsize.core.checkpoint.InvalidCheckpointNameException
@@ -758,5 +761,107 @@ class GenericContainerCheckpointTest {
             assertEquals("docker", record?.backend, "the entry must be rewritten to the new (active) backend")
             assertEquals(cp.ref, record?.ref)
         } finally { c.stop() }
+    }
+
+    // --- Files added with withCopyFileToContainer: bind mounts of host files, not part of a checkpoint ---
+
+    @Test fun `checkpoint hands the backend a handle whose spec holds the copied file`(@TempDir tmp: Path) {
+        val file = Files.writeString(tmp.resolve("app.conf"), "x")
+        val backend = object : CheckpointFakeBackend() {
+            var seenMounts: List<FileMount>? = null
+            override fun createCheckpoint(handle: SandboxHandle, ref: String): String {
+                seenMounts = handle.spec.mounts
+                return super.createCheckpoint(handle, ref)
+            }
+        }
+        val c = GenericContainer("alpine:3.19").withBackend(backend).waitingFor(CheckpointReady)
+            .withCopyFileToContainer(MountableFile.forHostPath(file.toString()), "/etc/app.conf")
+        c.start()
+        try {
+            c.checkpoint()
+            assertEquals(listOf(FileMount(file, "/etc/app.conf")), backend.seenMounts)
+        } finally { c.stop() }
+    }
+
+    @Test fun `on microsandbox checkpoint refuses a copied file whose host file is gone, before any backend call or replacement`(
+        @TempDir tmp: Path,
+    ) {
+        val file = Files.writeString(tmp.resolve("app.conf"), "x")
+        val backend = object : CheckpointFakeBackend() { override val name = "microsandbox" }
+        val c = GenericContainer("alpine:3.19").withBackend(backend).waitingFor(CheckpointReady)
+            .withCheckpointCacheDir(tmp).withCopyFileToContainer(MountableFile.forHostPath(file.toString()), "/etc/app.conf")
+        c.start()
+        try {
+            val first = c.checkpoint("seeded-db")
+            assertEquals(1, backend.committed.size)
+            Files.delete(file)
+
+            val e = assertThrows(CheckpointCopiedFileMissingException::class.java) { c.checkpoint("seeded-db") }
+
+            assertEquals("/etc/app.conf", e.guestPath)
+            assertEquals(file, e.hostPath)
+            assertTrue(e.message!!.contains("can't keep the copied file at /etc/app.conf"), "message: ${e.message}")
+            assertEquals(1, backend.committed.size, "no second createCheckpoint call reached the backend")
+            assertTrue(backend.removedRefs.isEmpty(), "the existing named checkpoint must not be removed first")
+            assertEquals(first.ref, CheckpointRegistry(tmp).read("seeded-db")?.ref,
+                "the existing named checkpoint's registry entry must be untouched")
+            assertTrue(backend.stopped.isEmpty(), "the source container must not be stopped")
+            assertTrue(c.isRunning)
+        } finally { c.stop() }
+    }
+
+    // Docker's checkpoint is a commit of the running container: it never reboots it and never reads
+    // the host file again, so a deleted host file is no reason to refuse.
+    @Test fun `on docker checkpoint does not check the copied file's host file`(@TempDir tmp: Path) {
+        val file = Files.writeString(tmp.resolve("app.conf"), "x")
+        val backend = object : CheckpointFakeBackend() { override val name = "docker" }
+        val c = GenericContainer("alpine:3.19").withBackend(backend).waitingFor(CheckpointReady)
+            .withCopyFileToContainer(MountableFile.forHostPath(file.toString()), "/etc/app.conf")
+        c.start()
+        try {
+            Files.delete(file)
+            assertDoesNotThrow { c.checkpoint() }
+            assertEquals(1, backend.committed.size)
+        } finally { c.stop() }
+    }
+
+    // The restore-override guard covers env/command/disk/tmpfs/network only. Re-adding a copied
+    // file is the remedy for a refused restore, so it must stay allowed on a backend that cannot
+    // override anything else, and the backend must see the mount.
+    @Test fun `fromCheckpoint accepts withCopyFileToContainer on a backend that cannot override a restore`(@TempDir tmp: Path) {
+        val file = Files.writeString(tmp.resolve("app.conf"), "x")
+        val backend = CheckpointFakeBackend(checkpointRestoreOverridable = false)
+        val cp = Checkpoint(
+            ref = "rz-ckpt-0123456789ab", backend = "fake",
+            spec = CheckpointSpec(env = emptyMap(), command = null, exposedPorts = emptyList(), memoryLimitMb = null),
+        )
+        val restored = GenericContainer.fromCheckpoint(cp).withBackend(backend).waitingFor(CheckpointReady)
+            .withCopyFileToContainer(MountableFile.forHostPath(file.toString()), "/etc/app.conf")
+        assertDoesNotThrow { restored.start() }
+        try {
+            assertEquals(listOf(FileMount(file, "/etc/app.conf")), backend.created.single().mounts)
+        } finally { restored.stop() }
+    }
+
+    // The backend's refusal reaches the caller of start() as the typed error, with its message,
+    // and the failed container is cleaned up like any other failed start. There is no wrapper in
+    // between that could say a sandbox was removed.
+    @Test fun `fromCheckpoint start surfaces the backend's typed missing-files error intact`() {
+        val typed = CheckpointMissingCopiedFilesException(
+            "rz-x-1", "rz-ckpt-0123456789ab", "error: invalid config: restore requires destination bindings for: mount /etc/app.conf")
+        val backend = object : CheckpointFakeBackend() {
+            override fun start(handle: SandboxHandle) { throw typed }
+        }
+        val cp = Checkpoint(
+            ref = "rz-ckpt-0123456789ab", backend = "fake",
+            spec = CheckpointSpec(env = emptyMap(), command = null, exposedPorts = emptyList(), memoryLimitMb = null),
+        )
+        val restored = GenericContainer.fromCheckpoint(cp).withBackend(backend).waitingFor(CheckpointReady)
+
+        val e = assertThrows(CheckpointMissingCopiedFilesException::class.java) { restored.start() }
+
+        assertSame(typed, e)
+        assertFalse(restored.isRunning)
+        assertFalse("was removed" in e.message!!, "message: ${e.message}")
     }
 }

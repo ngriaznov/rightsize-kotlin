@@ -87,6 +87,13 @@ private open class ReuseFakeBackend : FakeBackend() {
         runningNames -= name
     }
 
+    // The mounts the adopt path handed to findRunning(name, mounts), one entry per adoption.
+    val adoptedWithMounts = mutableListOf<List<FileMount>>()
+    override fun findRunning(name: String, mounts: List<FileMount>): SandboxHandle? {
+        adoptedWithMounts += mounts
+        return super.findRunning(name, mounts)
+    }
+
     override fun findRunning(name: String): SandboxHandle? {
         callOrder += "findRunning:$name"
         findRunningCalls += name
@@ -166,6 +173,26 @@ class GenericContainerReuseTest {
         assertEquals(name, backend.created.single().name)
         assertEquals(port, second.getMappedPort(6379))
         assertTrue(second.isRunning)
+        second.stop()
+    }
+
+    // A copied file is part of reuse identity (guest path + content hash), so the adopter's own
+    // mounts are the files the running sandbox was started with. The adopt path hands them to the
+    // backend, which a checkpoint() reboot of an adopted container needs to mount them again.
+    @Test fun `adopting passes this container's copied files to the backend`(@TempDir tmp: Path) {
+        val file = Files.writeString(tmp.resolve("app.conf"), "same content")
+        val backend = ReuseFakeBackend()
+        fun container() = reuseContainer(backend, tmp)
+            .withCopyFileToContainer(MountableFile.forHostPath(file.toString()), "/etc/app.conf")
+        val first = container()
+        first.start()
+        first.stop()   // leaves it running per reuse semantics
+
+        val second = container()
+        second.start()
+
+        assertEquals(1, backend.created.size, "the second instance must adopt, not create")
+        assertEquals(listOf(listOf(FileMount(file, "/etc/app.conf"))), backend.adoptedWithMounts)
         second.stop()
     }
 

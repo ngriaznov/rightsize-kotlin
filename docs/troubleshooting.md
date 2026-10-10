@@ -71,6 +71,21 @@ path, leave `readOnly` at its default; if the host copy must not be modified, th
 write block is exactly what the flag is for. See
 [Files & Memory](concepts/files-and-memory.md#read-only-mounts).
 
+## `fromCheckpoint(...).start()` fails with `CheckpointMissingCopiedFilesException`
+
+**Symptom:** Starting a container from a checkpoint on the microsandbox backend throws
+`CheckpointMissingCopiedFilesException`, and its message includes msb's
+`restore requires destination bindings for: mount /some/guest/path`.
+
+**Cause:** The container the checkpoint was taken from had files added with
+`withCopyFileToContainer`. Those are bind mounts of host files, not part of the checkpoint, and
+msb 0.7.8 refuses to restore without them. The guest paths are in the message.
+
+**Fix:** Add the same files again with `withCopyFileToContainer` on the container you start from
+the checkpoint, using the guest paths from the message. The host files can be different copies, but
+they have to exist. A checkpoint taken with an older release does not raise this; it restores with
+the file empty. See [Checkpoint / Restore](checkpoints.md#files-copied-in-at-start).
+
 ## `msb ls` output looks different than you expected
 
 **Symptom:** Code (or a script) parsing `msb ls` output breaks, or `--json` isn't

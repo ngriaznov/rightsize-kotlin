@@ -20,6 +20,9 @@ A checkpoint is a **filesystem** capture, not a memory snapshot:
 - **RAM-backed mounts are not on disk at all.** The microsandbox guest mounts `/tmp` as tmpfs,
   so files written there never enter a checkpoint — write anything you need restored to a
   rootfs path such as `/srv` or `/var`.
+- **Files added with `withCopyFileToContainer` are not part of a checkpoint.** They are bind
+  mounts of host files, not data in the guest's filesystem. See
+  [Files copied in at start](#files-copied-in-at-start).
 - Restoring is a normal, fresh container boot against a checkpoint reference — the same startup
   cost as any other container, just skipping whatever setup work is already baked into the
   filesystem.
@@ -43,8 +46,9 @@ microsandbox's `msb snapshot create` requires the sandbox stopped, so `checkpoin
 `msb stop` → `msb snapshot create --from-sandbox <sandbox> <name> --dest-dir <cache-dir>/checkpoints`
 → `msb rm <sandbox>` → `msb restore <ref> --name <freshName>` — a FRESHLY GENERATED sandbox name
 (`rz-<runId>-<n>`, the exact same generator/counter an ordinary boot already uses, not a second
-naming scheme), never the original sandbox's own name. Ports/memory limit carry over unchanged;
-the workload command re-ran from scratch to get there either way. The live handle's `id`/`spec`
+naming scheme), never the original sandbox's own name. Ports/memory limit carry over unchanged,
+and so do copied files, which the reboot mounts again from their host files (`--volume`); the
+workload command re-ran from scratch to get there either way. The live handle's `id`/`spec`
 are rewritten to the fresh name in place before the reboot is attempted, so every subsequent call
 against it — `exec`/`logs`/`stop`/`removeCheckpoint`'s later use — keeps working transparently
 without the caller ever seeing or needing to know the new name.
@@ -82,7 +86,9 @@ snapshot with checkpoint state`; an earlier msb pin of this library did pass it)
 command are never re-passed either way (`msb restore` has no `-e`/`--env` flag and no
 trailing-command flag at all, unlike `msb run`) — restore replays the sandbox's own captured
 configuration instead, which for this same-container reboot is exactly what was already running a
-moment earlier.
+moment earlier. The one exception is copied files: a snapshot does not hold their content, so the
+reboot passes each one back as `--volume HOST:GUEST:rw,nodev` (`ro,nodev` for a read-only mount),
+the same spelling `msb run` gets for `--mount-file`. `--allow-missing-resources` is never passed.
 
 The reaper's run ledger (see [reaping.md](reaping.md)) tracks EVERY name the reboot mints the same
 way it tracks an ordinary create — each one appended before its own restore attempt, including a
@@ -191,7 +197,10 @@ restored.start()   // fresh container, migrated schema and seed rows already on 
 - returns a `Checkpoint`: `ref` (backend-shaped, random per call — two checkpoints of the same
   container never collide), `backend` (the backend that created it — `"docker"`/`"microsandbox"`,
   matching `RIGHTSIZE_BACKEND`), and `spec` (the source container's env, command, exposed ports,
-  and memory limit);
+  and memory limit; not copied files, see below);
+- on microsandbox, throws `CheckpointCopiedFileMissingException` before it stops, snapshots,
+  removes or replaces anything if a file added with `withCopyFileToContainer` no longer exists
+  on the host;
 - optionally takes a `name` (`checkpoint("seeded-db")`) to make the checkpoint durable and
   rediscoverable from any later process, instead of living only in the returned `Checkpoint` — see
   [Reusing checkpoints across runs](#reusing-checkpoints-across-runs) below.
@@ -216,12 +225,40 @@ restored.start()   // fresh container, migrated schema and seed rows already on 
   of the three is ever part of `cp.spec` (a checkpoint never captures disk/network geometry), so
   unlike env/command there is no "re-supplying the same captured value" case that's allowed
   through; any use of them after `fromCheckpoint` on microsandbox is rejected;
+- needs files added with `withCopyFileToContainer` on the source container added again with
+  `withCopyFileToContainer` on the restored one, see below;
 - requires the active backend at `start()` time to match `cp.backend` — restoring an msb
   snapshot under the docker backend (or vice versa) throws `CheckpointBackendMismatchException`
   before any backend call, naming both backends and the `RIGHTSIZE_BACKEND=<creator>` remedy;
 - returns an **ordinary** container in every other respect: fresh host ports, a normal reaping
   ledger entry, normal `stop()`. Nothing about a restored container is special once it's
   running — it's indistinguishable from a container booted any other way.
+
+## Files copied in at start
+
+A file added with `withCopyFileToContainer` is a bind mount of a host file, set up when the
+container starts. A checkpoint keeps the guest's filesystem, not the content behind a mount, so
+copied files are not part of a checkpoint on either backend.
+
+- `checkpoint()` on microsandbox keeps them in the container it reboots, by mounting each one
+  again from its host file. Each host file has to still exist when you call `checkpoint()`; if
+  one is gone, `checkpoint()` throws `CheckpointCopiedFileMissingException` first, before the
+  source sandbox is stopped and before an existing named checkpoint is replaced. On Docker,
+  `checkpoint()` never reboots the container, so there is nothing to check.
+- A container started from a checkpoint has to add the files again, with the same guest paths:
+
+  ```kotlin
+  val restored = GenericContainer.fromCheckpoint(cp)
+      .withCopyFileToContainer(MountableFile.forHostPath("/path/to/app.conf"), "/etc/app.conf")
+      .waitingFor(Wait.forLogMessage(".*ready.*"))
+  restored.start()
+  ```
+
+  On microsandbox, a checkpoint taken by this release (msb 0.7.8) refuses to restore without
+  them: `start()` throws `CheckpointMissingCopiedFilesException`, whose message names the sandbox
+  and the checkpoint ref and includes msb's output listing the missing guest paths. It is not
+  retried. A checkpoint taken with an older release restores with the file empty instead, and
+  on Docker the path is left empty.
 
 ## The seeded-fixture pattern
 

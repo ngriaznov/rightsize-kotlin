@@ -27,6 +27,12 @@ data class PortBinding(val hostPort: Int, val guestPort: Int, val protocol: Port
  * it — the Docker backend binds the host path directly, the microsandbox backend hard-links it
  * into its staging directory — so a guest write reaches the host file itself. Pass `true` when
  * the host copy must not be modified.
+ *
+ * The content of a mounted file is not part of a checkpoint on either backend: a checkpoint
+ * keeps the guest filesystem, and this is a mount of a host file. On microsandbox,
+ * `GenericContainer.checkpoint()` mounts the file again from the same host path when it reboots
+ * the container, so that host file has to still exist; a container started from a checkpoint
+ * has to be given its files again.
  */
 data class FileMount(val hostPath: Path, val guestPath: String, val readOnly: Boolean = false)
 
@@ -149,6 +155,20 @@ class TmpfsRootCheckpointException : RuntimeException(
         "checkpointed — use withDiskLimit or the default root disk for checkpointable containers.")
 
 /**
+ * Thrown by `GenericContainer.checkpoint()` (and, as a second line of defense, the msb backend's
+ * `createCheckpoint`) before anything is stopped, snapshotted, removed or replaced, when a file
+ * added with `withCopyFileToContainer` no longer exists on the host. A copied file is a
+ * start-time bind mount of that host file, a snapshot does not capture its content, and the msb
+ * backend's `checkpoint()` reboots the container with the file mounted again from the same host
+ * path — so a missing host file would only be found after the source sandbox was already gone.
+ * msb only; Docker's checkpoint never reboots the container and needs no such check.
+ */
+class CheckpointCopiedFileMissingException(val guestPath: String, val hostPath: Path) : RuntimeException(
+    "checkpoint() can't keep the copied file at $guestPath: its host file $hostPath no longer " +
+        "exists. Copied files are not part of a checkpoint; on microsandbox, checkpoint() mounts " +
+        "them again from their host files when it reboots the container.")
+
+/**
  * Thrown by `GenericContainer.start()` when `withRequireIsolation()` was called but the active
  * backend's `capabilities.hardwareIsolated` is false — e.g. Docker, whose containers share the
  * host kernel rather than each getting its own microVM. Raised before any create/network work,
@@ -191,8 +211,10 @@ class PortBindConflictException(message: String, cause: Throwable? = null) : Run
  * narrower than the full spec (no name, no host ports, no `runId`, no `networkId`/`aliases`/
  * `mounts`): those describe how a *specific* container instance happened to run, not what a
  * restored container needs to boot an equivalent one from the checkpoint's image. Mounts are
- * intentionally excluded — the checkpoint's filesystem already carries whatever a mount would
- * have copied in.
+ * intentionally excluded, and so is their content: a file added with `withCopyFileToContainer`
+ * is a start-time bind mount of a host file, not part of the filesystem a checkpoint captures.
+ * `GenericContainer.fromCheckpoint(cp)` has to be given such files again; see
+ * [CheckpointMissingCopiedFilesException] and docs/checkpoints.md.
  */
 data class CheckpointSpec(
     val env: Map<String, String> = emptyMap(),
@@ -399,3 +421,28 @@ class CheckpointMissingWorkloadCommandException(ref: String) : RuntimeException(
         "(Running, but nothing serving any port or producing any log output). Re-checkpoint the " +
         "source container to retry the capture, or restore with an explicit command via " +
         "GenericContainer.fromCheckpoint(cp).withCommand(...).")
+
+/**
+ * Thrown by the msb backend when `msb restore` refuses a checkpoint because it needs host files
+ * that were not supplied again — the files the source container had copied in with
+ * `withCopyFileToContainer`. Those are start-time bind mounts of host files, not part of the
+ * filesystem a checkpoint captures, so a container started with
+ * `GenericContainer.fromCheckpoint(cp)` has to add them again with `withCopyFileToContainer`.
+ * msb 0.7.8 and later records which guest paths a snapshot it takes needs (the text of its refusal
+ * lists them, and [msbOutput] carries that text); a snapshot taken by an older msb does not, and
+ * restores with the file empty instead. Never retried: the same restore fails the same way under
+ * any sandbox name. [sandbox] and [checkpointRef] name the restore that was refused.
+ */
+class CheckpointMissingCopiedFilesException(
+    val sandbox: String,
+    val checkpointRef: String,
+    val msbOutput: String,
+) : RuntimeException(
+    "Can't restore checkpoint '$checkpointRef' into sandbox '$sandbox': it needs files that were " +
+        "copied into the container it was taken from, and microsandbox refused to restore it " +
+        "without them. Copied files (withCopyFileToContainer) are not part of a checkpoint. Add " +
+        "the same files again with withCopyFileToContainer on the container you start from the " +
+        "checkpoint, for example GenericContainer.fromCheckpoint(cp).withCopyFileToContainer(" +
+        "MountableFile.forHostPath(\"/path/to/file\"), \"/path/in/guest\"). The guest paths " +
+        "are in microsandbox's output below; its hints about its own command line flags do not " +
+        "apply, re-adding the files is the fix.\n$msbOutput")

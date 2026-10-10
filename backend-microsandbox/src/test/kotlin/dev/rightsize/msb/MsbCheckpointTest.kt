@@ -2,7 +2,9 @@ package dev.rightsize.msb
 
 import dev.rightsize.RunId
 import dev.rightsize.core.CacheDir
+import dev.rightsize.core.CheckpointCopiedFileMissingException
 import dev.rightsize.core.ContainerSpec
+import dev.rightsize.core.FileMount
 import dev.rightsize.core.PortBinding
 import dev.rightsize.core.TmpfsRootCheckpointException
 import org.junit.jupiter.api.Assumptions.assumeFalse
@@ -218,6 +220,111 @@ class MsbCheckpointTest {
             backend.stop(handle)
             backend.remove(handle)
         }
+    }
+
+    // Copied files are start-time bind mounts, which a snapshot does not capture. The reboot passes
+    // each one back as a --volume, from the same host path, so the file is there again.
+    @Test fun `createCheckpoint's re-boot mounts every copied file again with --volume, in spec order, after -p`(
+        @TempDir tmp: Path,
+    ) {
+        assumeFalse(Platform.current()?.isWindows == true, "POSIX-only fake binary; see doc comment")
+        val marker = Files.createTempFile("rz-marker-", "").also { Files.deleteIfExists(it) }
+        val callLog = Files.createTempFile("rz-calllog-", "")
+        val snapshotFailFlag = unsetFlag("rz-snapfail-")
+        val rebootFailFlag = unsetFlag("rz-rebootfail-")
+        val malformedFlag = unsetFlag("rz-malformed-")
+        val backend = MsbCliBackend(fakeMsbCheckpointLifecycle(marker, callLog, snapshotFailFlag, rebootFailFlag, malformedFlag))
+        val a = Files.writeString(tmp.resolve("a.conf"), "alpha")
+        val b = Files.writeString(tmp.resolve("b.conf"), "beta")
+        val spec = ContainerSpec(
+            name = "rz-ckpt-mounts-test", image = "irrelevant", runId = "run1", command = listOf("serve"),
+            ports = listOf(PortBinding(hostPort = 23457, guestPort = 80)),
+            mounts = listOf(
+                FileMount(a, "/etc/app/a.conf"),
+                FileMount(b, "/etc/app/b.conf", readOnly = true),
+            ),
+        )
+        val handle = backend.create(spec)
+        try {
+            backend.start(handle)
+            Files.writeString(callLog, "")
+
+            val effectiveRef = backend.createCheckpoint(handle, "rz-ckpt-0123456789ab")
+
+            val calls = nonPollingCalls(callLog)
+            assertEquals(5, calls.size, "no extra commands beyond stop/snapshot-create/rm/restore/exec-revival: $calls")
+            val reboot = calls[3]
+            assertEquals(
+                "restore $effectiveRef --name ${handle.id} -p 23457:80 " +
+                    "--volume $a:/etc/app/a.conf:rw,nodev --volume $b:/etc/app/b.conf:ro,nodev",
+                reboot)
+            assertFalse("--allow-missing-resources" in reboot, "a missing file must stop the restore: $reboot")
+            assertFalse("--mount-file" in reboot, "restore takes a mount as --volume: $reboot")
+            assertTrue(handle.id in backend.runningSandboxNames())
+        } finally {
+            backend.stop(handle)
+            backend.remove(handle)
+        }
+    }
+
+    // A reboot that is refused anyway (anything a --volume cannot fix) keeps its typed cause, so the
+    // refusal's type is not flattened into a message by the wrapper.
+    @Test fun `createCheckpoint's wrapper around a failed re-boot keeps the cause`() {
+        assumeFalse(Platform.current()?.isWindows == true, "POSIX-only fake binary; see doc comment")
+        val marker = Files.createTempFile("rz-marker-", "").also { Files.deleteIfExists(it) }
+        val callLog = Files.createTempFile("rz-calllog-", "")
+        val rebootFailFlag = Files.createTempFile("rz-rebootfail-", "")   // present => the restore re-boot fails
+        val backend = MsbCliBackend(fakeMsbCheckpointLifecycle(
+            marker, callLog, unsetFlag("rz-snapfail-"), rebootFailFlag, unsetFlag("rz-malformed-")))
+        val handle = backend.create(ContainerSpec(
+            name = "rz-ckpt-cause-test", image = "irrelevant", runId = "run1", command = listOf("serve")))
+        try {
+            backend.start(handle)
+            val e = assertThrows(IllegalStateException::class.java) {
+                backend.createCheckpoint(handle, "rz-ckpt-0123456789ab")
+            }
+            assertNotNull(e.cause, "the wrapper must chain the failure it wraps")
+            assertTrue(e.cause!!.message!!.contains("reboot from snapshot failed"), "cause was ${e.cause}")
+        } finally {
+            backend.stop(handle)
+            backend.remove(handle)
+        }
+    }
+
+    // The reboot reads each copied file's host path again, so a missing one is refused before the
+    // source sandbox is stopped, snapshotted or removed: no msb call at all reaches the fake.
+    @Test fun `createCheckpoint throws CheckpointCopiedFileMissingException before any msb call when a copied file's host file is gone`(
+        @TempDir tmp: Path,
+    ) {
+        assumeFalse(Platform.current()?.isWindows == true, "POSIX-only fake binary; see doc comment")
+        val callLog = Files.createTempFile("rz-mounts-guard-calllog-", "")
+        val script = Files.createTempFile("rz-fake-msb-mounts-guard", "").also {
+            Files.writeString(it, "#!/bin/sh\necho \"${'$'}*\" >> \"$callLog\"\nexit 0\n")
+            it.toFile().setExecutable(true)
+        }
+        val backend = MsbCliBackend(script)
+        val present = Files.writeString(tmp.resolve("present.conf"), "here")
+        val gone = tmp.resolve("gone.conf")   // never created
+        val spec = ContainerSpec(
+            name = "rz-ckpt-mounts-guard-test", image = "irrelevant", runId = "run1",
+            mounts = listOf(FileMount(present, "/etc/present.conf"), FileMount(gone, "/etc/gone.conf")),
+        )
+        val handle = backend.create(spec)
+
+        val e = assertThrows(CheckpointCopiedFileMissingException::class.java) {
+            backend.createCheckpoint(handle, "rz-ckpt-0123456789ab")
+        }
+
+        assertEquals("/etc/gone.conf", e.guestPath)
+        assertEquals(gone, e.hostPath)
+        assertEquals(
+            "checkpoint() can't keep the copied file at /etc/gone.conf: its host file $gone no longer " +
+                "exists. Copied files are not part of a checkpoint; on microsandbox, checkpoint() mounts " +
+                "them again from their host files when it reboots the container.",
+            e.message)
+        assertEquals(emptyList<String>(), Files.readAllLines(callLog).filter { it.isNotBlank() },
+            "no stop, snapshot, rm, restore or guest-capture exec may run before the guard fires")
+        assertEquals("rz-ckpt-mounts-guard-test", handle.id, "the handle must not be renamed")
     }
 
     @Test fun `checkpoint reboots under a fresh name different from the original, and a subsequent stop targets the new name`() {
@@ -618,6 +725,54 @@ class MsbCheckpointTest {
         assertFalse(isRestoreAccessDenied("Access is denied."), "the errno-suffix marker alone is missing")
         assertFalse(isRestoreAccessDenied("error: io error: something else entirely"), "the access-denied phrase is missing")
         assertFalse(isRestoreAccessDenied("error: permission denied"), "an unrelated denial must not match")
+    }
+
+    // --- isRestoreMissingBindings: pure, no binary needed ---
+
+    // msb 0.7.8, verbatim.
+    private val refusal078 = "error: invalid config: restore requires destination bindings for: " +
+        "mount /etc/app/b.conf; provide a destination mount for each path or explicitly allow " +
+        "missing resources\n  \u2192 map each path with -v SOURCE:GUEST or --mount-disk SOURCE:GUEST\n" +
+        "  \u2192 or pass --allow-missing-resources to start without them"
+
+    @Test fun `isRestoreMissingBindings matches msb 0_7_8's refusal verbatim`() {
+        assertTrue(isRestoreMissingBindings(refusal078))
+    }
+
+    @Test fun `isRestoreMissingBindings matches the sentence whatever follows it - the 0_7_6 tail, two paths, a disk entry`() {
+        assertTrue(isRestoreMissingBindings(
+            "restore requires destination bindings for: mount /srv/x; provide --volume mappings, select " +
+                "captured disks with --volume GUEST, or explicitly use --allow-missing-resources"))
+        assertTrue(isRestoreMissingBindings(
+            "error: invalid config: restore requires destination bindings for: mount /etc/app/a.conf, " +
+                "mount /etc/app/b.conf; provide a destination mount for each path or explicitly allow missing resources"))
+        assertTrue(isRestoreMissingBindings(
+            "invalid config: restore requires destination bindings for: disk /data; provide a destination " +
+                "mount or select a captured disk for each path, or explicitly allow missing resources"))
+    }
+
+    @Test fun `isRestoreMissingBindings does not depend on the prefix, the hint lines, or the arrow`() {
+        assertTrue(isRestoreMissingBindings("restore requires destination bindings for: mount /etc/a"))
+        assertTrue(isRestoreMissingBindings(
+            "msb.exe : error: invalid config: restore requires destination bindings for: mount /etc/app/b.conf; " +
+                "provide a destination mount for each path\nAt line:1 char:1\n+ & 'C:\\msb.exe' restore x --name y\n" +
+                "+ CategoryInfo          : NotSpecified: (error: invalid ...:String) [], RemoteException\n" +
+                "+ FullyQualifiedErrorId : NativeCommandError"))
+        // A console that wrapped the sentence at a space still matches.
+        assertTrue(isRestoreMissingBindings("error: invalid config: restore requires\ndestination bindings\n for: mount /etc/a"))
+    }
+
+    @Test fun `isRestoreMissingBindings is false for every other restore failure`() {
+        assertFalse(isRestoreMissingBindings(""))
+        assertFalse(isRestoreMissingBindings("error: io error: Access is denied. (os error 5)"))
+        assertFalse(isRestoreMissingBindings(
+            "error: failed to start \"rz-731fdcdc-8\"\n  \u2192 other: sandbox process exited (exit code: 0) before agent relay became available"))
+        assertFalse(isRestoreMissingBindings(
+            "error: sandbox already exists: sandbox 'x' already exists; remove it, start the stopped sandbox, or recreate with .replace()"))
+        assertFalse(isRestoreMissingBindings("error: snapshot not found: rz-ckpt-x"))
+        assertFalse(isRestoreMissingBindings("error: invalid config: disk_only requires a full snapshot with checkpoint state"))
+        assertFalse(isRestoreMissingBindings("restore requires a snapshot"))
+        assertFalse(isRestoreMissingBindings("destination bindings for: mount /etc/a"))
     }
 
     /**

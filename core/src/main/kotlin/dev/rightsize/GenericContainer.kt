@@ -136,6 +136,13 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
      * read-write ([dev.rightsize.core.FileMount.readOnly]'s default) and is a view of the host
      * file rather than a copy of it, so a guest write reaches the host file itself. A mount
      * constructed with `readOnly = true` is enforced on both backends as a guest-side write block.
+     *
+     * The file is not part of a [checkpoint] on either backend: a checkpoint keeps the guest
+     * filesystem, and this is a mount of a host file. On microsandbox, [checkpoint] mounts the file
+     * again from [file] when it reboots the container, so the host file has to still exist. A
+     * container started with [fromCheckpoint] has to be given it again here; microsandbox refuses
+     * to restore without it ([CheckpointMissingCopiedFilesException]), Docker starts the
+     * container with the path left empty.
      */
     fun withCopyFileToContainer(file: MountableFile, guestPath: String): SELF {
         mounts += FileMount(file.path, guestPath); return this as SELF
@@ -366,6 +373,14 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
      * [CheckpointUnsupportedException] and the backend is never reached. Requires this container
      * to be running; a never-started or already-stopped one throws [IllegalStateException].
      *
+     * Files added with [withCopyFileToContainer] are not part of the checkpoint on either backend
+     * (they are mounts of host files). On microsandbox this method keeps them in the container
+     * it reboots by mounting them again from their host files, and throws
+     * [CheckpointCopiedFileMissingException], before anything is stopped or replaced, if one of
+     * those host files no longer exists. Docker's checkpoint leaves the container running and
+     * doesn't read them again. Either way, a container started with [fromCheckpoint] has to add
+     * them again.
+     *
      * A backend whose `capabilities.checkpointRestartsWorkload` is true (microsandbox: its
      * disk-snapshot cycle stops, snapshots, then resumes the sandbox, restarting the workload)
      * gets this container's emulated network links (if any were installed at start) re-installed,
@@ -401,6 +416,15 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
         // defense in depth; this is the one that actually protects replaceExistingNamedCheckpoint.
         if (h.spec.tmpfsRootMb != null && canonicalBackendId(backend.name) == "msb") {
             throw TmpfsRootCheckpointException()
+        }
+        // Same reasoning for a copied file whose host file is gone: the msb backend reboots the
+        // container with each one mounted again from its host path (see MsbCliBackend.createCheckpoint),
+        // so this must fail before replaceExistingNamedCheckpoint or any backend call. Docker's
+        // checkpoint never reboots the container and doesn't read the host file again.
+        if (canonicalBackendId(backend.name) == "msb") {
+            h.spec.mounts.firstOrNull { !Files.exists(it.hostPath) }?.let {
+                throw CheckpointCopiedFileMissingException(it.guestPath, it.hostPath)
+            }
         }
         if (name != null) replaceExistingNamedCheckpoint(name)
         val refHint = if (name != null) mintCheckpointRef(name) else mintCheckpointRef()
@@ -836,7 +860,9 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
      * caller can fall back to a fresh create.
      */
     private fun tryAdopt(record: ReuseRecord): Boolean {
-        val h = runCatching { backend.findRunning(record.name) }.getOrNull() ?: return false
+        // The mounts ride along so a later checkpoint() of this adopted container can mount its
+        // copied files again; the identity hash already proved they match the running sandbox's.
+        val h = runCatching { backend.findRunning(record.name, mounts.toList()) }.getOrNull() ?: return false
         handle = h
         mappedPorts = record.ports
         // The adopted sandbox's host ports are already bound by that (possibly foreign) process —
@@ -999,6 +1025,12 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
          * reaping ledger entry, normal stop. Nothing about it is "special" once started, except
          * that [dev.rightsize.core.SandboxBackend.name] must match [Checkpoint.backend] at
          * `start()` (see [CheckpointBackendMismatchException]). See docs/checkpoints.md.
+         *
+         * Files the source container had added with [withCopyFileToContainer] are not part of the
+         * checkpoint, so add them again with [withCopyFileToContainer] on the returned container.
+         * On microsandbox a checkpoint taken by msb 0.7.8 or later refuses to restore without
+         * them, and `start()` throws [CheckpointMissingCopiedFilesException] naming the guest
+         * paths; an older checkpoint restores with the file empty. On Docker the path is left empty.
          */
         fun fromCheckpoint(checkpoint: Checkpoint): GenericContainer<*> {
             val c = invoke(checkpoint.ref).withCheckpointRef(

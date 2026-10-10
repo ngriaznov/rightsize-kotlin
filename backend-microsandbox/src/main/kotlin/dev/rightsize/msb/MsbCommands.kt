@@ -1,6 +1,7 @@
 package dev.rightsize.msb
 
 import dev.rightsize.core.ContainerSpec
+import dev.rightsize.core.FileMount
 import dev.rightsize.core.PortProtocol
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
@@ -46,21 +47,19 @@ object MsbCommands {
         // mount it is meaningless (no device nodes to block): this parity gap closed as of msb
         // 0.6.8, confirmed against a real binary — `rw,nodev` mounts `rw,nodev` and accepts an
         // in-guest write, `ro,nodev` rejects one with `Read-only file system`.
-        spec.mounts.forEach {
-            add("--mount-file")
-            add("${it.hostPath}:${it.guestPath}:${if (it.readOnly) "ro" else "rw"},nodev")
-        }
+        // The string itself comes from [mountSpec], shared with [restore]'s `--volume`.
+        spec.mounts.forEach { add("--mount-file"); add(mountSpec(it)) }
         add(spec.image)
         spec.command?.let { add("--"); addAll(it) }   // null => image default ENTRYPOINT/CMD runs
     }
 
     /**
-     * `msb restore <ref> --name <name> [-m <mem>M] [-p host:guest]...` — msb 0.7's dedicated
-     * restore command, the sole survivor of what `run --from-snapshot` used to do. msb 0.7
-     * removed `--from-snapshot` from `run` outright: clap now rejects it as an unrecognized
-     * flag, and `msb run` itself bails "snapshot sources require `msb restore SNAPSHOT --name
-     * NAME`" for a snapshot-shaped source (confirmed against msb's own source at tag v0.7.1 —
-     * crates/cli/lib/commands/{run,restore}.rs). [MsbCliBackend] routes here instead of [run]
+     * `msb restore <ref> --name <name> [-m <mem>M] [-p host:guest]... [--volume host:guest:opts]...`
+     * — msb 0.7's dedicated restore command, the sole survivor of what `run --from-snapshot` used
+     * to do. msb 0.7 removed `--from-snapshot` from `run` outright: clap now rejects it as an
+     * unrecognized flag, and `msb run` itself bails "snapshot sources require `msb restore SNAPSHOT
+     * --name NAME`" for a snapshot-shaped source (confirmed against msb's own source at tag v0.7.1
+     * — crates/cli/lib/commands/{run,restore}.rs). [MsbCliBackend] routes here instead of [run]
      * whenever [spec]'s `checkpointRef` is set — both [MsbCliBackend.createCheckpoint]'s own
      * re-boot and a `GenericContainer.fromCheckpoint(cp).start()` call reach this the same way.
      *
@@ -95,27 +94,40 @@ object MsbCommands {
      * all — that's rejected earlier, before any backend call, by
      * [dev.rightsize.core.CheckpointRestoreOverrideUnsupportedException].
      *
-     * [spec.mounts] and [spec.diskLimitMb]/[spec.tmpfsRootMb]/[spec.networkDisabled] are likewise
-     * never emitted: `restore`'s own resource/control flags (`--volume`, network-policy flags)
-     * don't line up with `run`'s (`--mount-file`, `--root-disk`, `--net private`), and neither
-     * this backend's tests nor `docs/checkpoints.md` promise either survives a restore today — a
-     * `tmpfsRootMb` container is refused before capture even happens (see
-     * [MsbCliBackend.createCheckpoint]'s `TmpfsRootCheckpointException` guard), and mounts are
-     * never part of `CheckpointSpec` in the first place (see its own doc comment: the checkpoint's
-     * filesystem already carries whatever a mount would have copied in). For
-     * [MsbCliBackend.createCheckpoint]'s own re-boot, whatever `diskLimitMb`/`networkDisabled` the
-     * live sandbox already had simply rides along unemitted, same as env/command — the
-     * restore boots the exact disk state that geometry was already baked into, so nothing
-     * observable changes. A caller reaching this via `GenericContainer.fromCheckpoint(cp)
-     * .withDiskLimit(...)`/`.withTmpfsRoot(...)`/`.withNetworkDisabled()` — asking for GENUINELY
-     * different disk/network geometry than the snapshot captured — never gets here at all: that's
-     * rejected earlier, before any backend call, by the same
-     * [dev.rightsize.core.CheckpointRestoreOverrideUnsupportedException] guard that covers
-     * env/command (see `GenericContainer.start`'s override check). [spec.ports] and
+     * [spec.diskLimitMb]/[spec.tmpfsRootMb]/[spec.networkDisabled] are likewise never emitted:
+     * `restore`'s own control flags (network-policy flags) don't line up with `run`'s
+     * (`--root-disk`, `--net private`), and neither this backend's tests nor
+     * `docs/checkpoints.md` promise either survives a restore today — a `tmpfsRootMb` container
+     * is refused before capture even happens (see [MsbCliBackend.createCheckpoint]'s
+     * `TmpfsRootCheckpointException` guard). For [MsbCliBackend.createCheckpoint]'s own re-boot,
+     * whatever `diskLimitMb`/`networkDisabled` the live sandbox already had simply rides along
+     * unemitted, same as env/command — the restore boots the exact disk state that geometry was
+     * already baked into, so nothing observable changes. A caller reaching this via
+     * `GenericContainer.fromCheckpoint(cp).withDiskLimit(...)`/`.withTmpfsRoot(...)`/
+     * `.withNetworkDisabled()` — asking for GENUINELY different disk/network geometry than the
+     * snapshot captured — never gets here at all: that's rejected earlier, before any backend
+     * call, by the same [dev.rightsize.core.CheckpointRestoreOverrideUnsupportedException] guard
+     * that covers env/command (see `GenericContainer.start`'s override check). [spec.ports] and
      * [spec.memoryLimitMb] DO carry over — `RestoreResourceArgs`/`RestoreControlArgs` both take
      * `-p`/`-m` for exactly this, sizing the fresh destination sandbox rather than describing
-     * what was captured. [spec.hostUdpEgressPorts] DOES carry over too, as the `--net-default`/
-     * `--net-rule` policy below — unlike env/command/mounts/disk/network-disabled, it was never
+     * what was captured.
+     *
+     * [spec.mounts] carry over too, as one `--volume HOST:GUEST:ro|rw,nodev` per mount in spec
+     * order, spelled by the same [mountSpec] [run] uses for `--mount-file` (verified against the
+     * real binary on msb 0.7.6 and 0.7.8). A file added with `withCopyFileToContainer` is a
+     * start-time bind mount of a host file, and a snapshot does NOT capture its content: restored
+     * without a `--volume` for it, 0.7.6 hands back the guest path EMPTY (0 bytes) and 0.7.8
+     * refuses with `restore requires destination bindings for: mount <guest path>` (see
+     * [isRestoreMissingBindings]). So [MsbCliBackend.createCheckpoint]'s own re-boot passes the
+     * container's mounts here to keep the files, and a `fromCheckpoint(cp)` container passes
+     * whatever it was given with `withCopyFileToContainer` — those are not recorded in the
+     * checkpoint, so the caller re-adds them. `--allow-missing-resources` is never emitted: a
+     * missing file must stop the restore, not come back empty. Only a snapshot taken by msb
+     * 0.7.8 or later records its mounts, so only those are refused; an older snapshot restores
+     * with the file empty whatever this emits.
+     *
+     * [spec.hostUdpEgressPorts] DOES carry over too, as the `--net-default`/
+     * `--net-rule` policy below — unlike env/command/disk/network-disabled, it was never
      * part of what the snapshot captured in the first place: it is per-run wiring the core
      * recomputes from this restore's own [dev.rightsize.core.NetworkLink]s before every start
      * (see `GenericContainer.start`'s own doc), so re-deriving it fresh for THIS restore is
@@ -127,6 +139,9 @@ object MsbCommands {
         add("--name"); add(spec.name)
         spec.memoryLimitMb?.let { add("-m"); add("${it}M") }
         spec.ports.forEach { add("-p"); add(portArg(it)) }
+        // Same option block and rationale as run()'s --mount-file (see the comment there); restore
+        // takes the file back through --volume instead. After -p, before the network policy.
+        spec.mounts.forEach { add("--volume"); add(mountSpec(it)) }
         // Three reasons this is a full replacement policy, not a single added rule like run()'s:
         // restore never carries a CLI-given policy into the restored sandbox at all (msb falls
         // back to its own default); restore's --net-rule only takes effect together with
@@ -148,6 +163,12 @@ object MsbCommands {
      * the original `run` did, never silently dropping back to TCP. */
     private fun portArg(binding: dev.rightsize.core.PortBinding): String =
         "${binding.hostPort}:${binding.guestPort}" + if (binding.protocol == PortProtocol.UDP) "/udp" else ""
+
+    /** `<host>:<guest>:ro|rw,nodev` — the one place both [run] (`--mount-file`) and [restore]
+     * (`--volume`) decide a file mount's spec string, so the two cannot drift apart. The always-
+     * present option block is explained at [run]'s `--mount-file` emission. */
+    private fun mountSpec(mount: FileMount): String =
+        "${mount.hostPath}:${mount.guestPath}:${if (mount.readOnly) "ro" else "rw"},nodev"
 
     fun exec(name: String, cmd: List<String>) = listOf("exec", name, "--") + cmd
     fun execStream(name: String, cmd: List<String>) = listOf("exec", "--stream", name, "--") + cmd

@@ -8,7 +8,9 @@ from `withCopyFileToContainer`'s start-time mount.
 
 `withCopyFileToContainer(file, guestPath)` is configured before `start()` and takes effect at
 boot: a host mount, read-write by default, present from the moment the container comes up. See
-[Files & Memory](concepts/files-and-memory.md).
+[Files & Memory](concepts/files-and-memory.md). It is not part of a
+[checkpoint](checkpoints.md#files-copied-in-at-start): a container restored from one has to add
+the file again.
 
 The three methods on this page are different: they act on a container that is already running,
 any time after `start()`. Reach for them when the file to copy doesn't exist yet at boot time —

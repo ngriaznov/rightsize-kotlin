@@ -127,6 +127,15 @@ interface SandboxBackend : AutoCloseable {
      * for backends that don't participate in reuse (e.g. test doubles).
      */
     fun findRunning(name: String): SandboxHandle? = null
+    /**
+     * [findRunning] for the reuse adopt path, which also knows the adopting container's own
+     * [mounts] (its `withCopyFileToContainer` files). A copied file is part of reuse identity —
+     * guest path and content hash — so those are the files the running sandbox was started with,
+     * and a backend whose `checkpoint()` has to supply them again can keep them on the handle's
+     * `spec` instead of the empty list [findRunning] leaves. Defaults to [findRunning], which
+     * suits every backend whose checkpoint never reads `spec.mounts`.
+     */
+    fun findRunning(name: String, mounts: List<FileMount>): SandboxHandle? = findRunning(name)
     /** See [WatchdogCommands]. Defaults to all-empty (no watchdog action) for backends that
      * don't participate in reaping. */
     val watchdogCommands: WatchdogCommands get() = WatchdogCommands()

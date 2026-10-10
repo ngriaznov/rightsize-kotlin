@@ -38,6 +38,15 @@ guest-side write block: an in-guest write fails with `Read-only file system`. Us
 whenever the host copy must not be modified — in particular when the container runs
 code you don't trust (see [Isolation](../isolation.md#untrusted-code-guidance)).
 
+### Copied files and checkpoints
+
+A copied file is a bind mount of a host file, so its content is not part of a
+[checkpoint](../checkpoints.md#files-copied-in-at-start) on either backend. On microsandbox,
+`checkpoint()` mounts the file again from its host file when it reboots the container, so the host
+file has to still exist. A container started with `fromCheckpoint` has to add the file again with
+`withCopyFileToContainer`; microsandbox refuses to restore without it, and Docker leaves the path
+empty.
+
 ## `withMemoryLimit(megabytes)`
 
 Caps a container's guest memory. Maps to msb's `-m <megabytes>M` flag on the

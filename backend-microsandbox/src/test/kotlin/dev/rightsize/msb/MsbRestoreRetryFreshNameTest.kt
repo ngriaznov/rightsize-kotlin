@@ -1,5 +1,6 @@
 package dev.rightsize.msb
 
+import dev.rightsize.core.CheckpointMissingCopiedFilesException
 import dev.rightsize.core.ContainerSpec
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.Assertions.*
@@ -84,6 +85,13 @@ class MsbRestoreRetryFreshNameTest {
     private val accessDenied = "error: io error: Access is denied. (os error 5)"
     private val alreadyExists = "error: sandbox already exists: sandbox 'x' already exists; remove it, " +
         "start the stopped sandbox, or recreate with .replace()"
+
+    // msb 0.7.8's refusal of a restore that lacks a destination for a copied file, verbatim
+    // (three lines: the error, then two hints).
+    private val missingBindings = "error: invalid config: restore requires destination bindings for: " +
+        "mount /etc/app/b.conf; provide a destination mount for each path or explicitly allow missing resources\n" +
+        "  \u2192 map each path with -v SOURCE:GUEST or --mount-disk SOURCE:GUEST\n" +
+        "  \u2192 or pass --allow-missing-resources to start without them"
 
     private fun restoreSpec(name: String) = ContainerSpec(
         name = name, image = "irrelevant", runId = "run1", command = listOf("serve"),
@@ -283,5 +291,88 @@ class MsbRestoreRetryFreshNameTest {
 
         assertFalse(winningName in backend.trackedNames(), "remove() must untrack the WINNING name")
         assertFalse(winningName in backend.runningSandboxNames())
+    }
+
+    // A refused restore is a definite answer about this snapshot: no fresh-name walk, no broker, no
+    // agent-relay or state-db retry, no readiness poll. One restore call, then the typed error.
+    @Test fun `msb's refusal of missing destination bindings ends in the typed error after exactly one restore call`() {
+        val marker = Files.createTempFile("rz-marker-", "").also { Files.deleteIfExists(it) }
+        val callLog = Files.createTempFile("rz-calllog-", "")
+        // Would keep failing the same way forever: any retry would show up as a second restore call.
+        val restoreFailCounter = Files.createTempFile("rz-failcnt-", "").also { Files.writeString(it, "999999") }
+        val originalName = "rz-ordinary-missing-bindings-test"
+        val fakeMsb = fakeMsbRestoreFailsThenSucceeds(marker, callLog, restoreFailCounter, missingBindings)
+        val stub = StubBroker(marker, listOf(BrokerOutcome.Completed(0, "")))
+        val backend = MsbCliBackend.forHost(fakeMsb, windowsHost = true, restoreBroker = stub.fn)
+        val handle = backend.create(restoreSpec(originalName))
+        try {
+            val e = assertThrows(CheckpointMissingCopiedFilesException::class.java) { backend.start(handle) }
+
+            assertEquals(originalName, e.sandbox)
+            assertEquals(restoreSpec(originalName).checkpointRef, e.checkpointRef)
+            val msg = e.message!!
+            assertTrue(originalName in msg, "message must name the sandbox: $msg")
+            assertTrue(e.checkpointRef in msg, "message must name the checkpoint ref: $msg")
+            assertTrue("withCopyFileToContainer" in msg, "message must name the remedy: $msg")
+            assertTrue("not part of a checkpoint" in msg, "message must say why: $msg")
+            assertTrue("/etc/app/b.conf" in msg, "message must carry msb's output, which lists the guest path: $msg")
+            assertFalse("was removed" in msg, "a plain restore never removed anything: $msg")
+            assertEquals(listOf(originalName), restoreNames(callLog), "exactly one restore call, no retry")
+            assertTrue(stub.calls.isEmpty(), "the broker must never be consulted: ${stub.calls}")
+            assertEquals(emptyList<String>(), rmNames(callLog), "no fresh-name walk, so no rm of a failed name")
+            assertFalse(Files.readAllLines(callLog).any { it.startsWith("ls ") }, "no readiness poll after a refusal")
+            assertNull((handle as MsbCliBackend.Handle).attached)
+            assertEquals(originalName, handle.id, "the handle must not be renamed")
+        } finally {
+            backend.stop(handle)
+            backend.remove(handle)
+        }
+    }
+
+    @Test fun `the refusal is not retried on a non-Windows host either`() {
+        val marker = Files.createTempFile("rz-marker-", "").also { Files.deleteIfExists(it) }
+        val callLog = Files.createTempFile("rz-calllog-", "")
+        val restoreFailCounter = Files.createTempFile("rz-failcnt-", "").also { Files.writeString(it, "999999") }
+        val originalName = "rz-ordinary-missing-bindings-posix-test"
+        val fakeMsb = fakeMsbRestoreFailsThenSucceeds(marker, callLog, restoreFailCounter, missingBindings)
+        val backend = MsbCliBackend.forHost(fakeMsb, windowsHost = false)
+        val handle = backend.create(restoreSpec(originalName))
+        try {
+            assertThrows(CheckpointMissingCopiedFilesException::class.java) { backend.start(handle) }
+            assertEquals(listOf(originalName), restoreNames(callLog))
+        } finally {
+            backend.stop(handle)
+            backend.remove(handle)
+        }
+    }
+
+    // The brokered site: attempt 1 is access-denied (which latches the broker on, on Windows), and
+    // the broker's own captured output for attempt 2 is the refusal, PowerShell-decorated.
+    @Test fun `a brokered restore's refusal is classified the same way, decorated by PowerShell`() {
+        val marker = Files.createTempFile("rz-marker-", "").also { Files.deleteIfExists(it) }
+        val callLog = Files.createTempFile("rz-calllog-", "")
+        val restoreFailCounter = Files.createTempFile("rz-failcnt-", "").also { Files.writeString(it, "1") }
+        val originalName = "rz-ordinary-missing-bindings-broker-test"
+        val fakeMsb = fakeMsbRestoreFailsThenSucceeds(marker, callLog, restoreFailCounter, accessDenied)
+        val decorated = "msb.exe : error: invalid config: restore requires destination bindings for: " +
+            "mount /etc/app/b.conf; provide a destination mount for each path or explicitly allow missing resources\n" +
+            "At line:1 char:1\n+ & 'C:\\msb.exe' restore --name rz-x\n" +
+            "+ CategoryInfo          : NotSpecified: (error: invalid ...:String) [], RemoteException\n" +
+            "+ FullyQualifiedErrorId : NativeCommandError"
+        val stub = StubBroker(marker, listOf(BrokerOutcome.Completed(1, decorated)))
+        val backend = MsbCliBackend.forHost(fakeMsb, windowsHost = true, restoreBroker = stub.fn)
+        val handle = backend.create(restoreSpec(originalName))
+        try {
+            val e = assertThrows(CheckpointMissingCopiedFilesException::class.java) { backend.start(handle) }
+
+            assertEquals(1, stub.calls.size, "the refusal must not be retried through the broker: ${stub.calls}")
+            assertEquals(stub.calls.single().name, e.sandbox)
+            assertTrue("/etc/app/b.conf" in e.message!!, "message must carry the decorated output: ${e.message}")
+            assertEquals(listOf(originalName), restoreNames(callLog),
+                "only the first, access-denied attempt was a direct restore call")
+        } finally {
+            backend.stop(handle)
+            backend.remove(handle)
+        }
     }
 }

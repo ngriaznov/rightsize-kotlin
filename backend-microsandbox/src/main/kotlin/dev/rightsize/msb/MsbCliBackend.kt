@@ -620,6 +620,12 @@ class MsbCliBackend private constructor(
      */
     private fun classifyRestoreExit(handle: Handle, exitCode: Int, output: String) {
         if (exitCode == 0) return
+        // First, and its own typed error: a definite refusal of this snapshot, not a transient.
+        // None of the retry layers above (fresh-name walk, agent-relay retry, state-db retry,
+        // image heal) catches it, so it reaches the caller after exactly one restore call.
+        if (isRestoreMissingBindings(output)) {
+            throw CheckpointMissingCopiedFilesException(handle.id, handle.spec.checkpointRef.orEmpty(), output)
+        }
         if (isImageCacheCorruption(output)) throw ImageCacheCorruptionException(output)
         if (isMsbStateDbError(output)) throw MsbStateDbException(output)
         if (isMsbInstallLockActive(output)) throw MsbInstallLockException(output)
@@ -835,6 +841,17 @@ class MsbCliBackend private constructor(
         return Handle(ContainerSpec(name = name, image = "", runId = RunId.value, keepAlive = true))
     }
 
+    /**
+     * [findRunning], with the adopting container's own [mounts] on the returned handle's spec.
+     * The adopting process never knew the creating spec, but a container's copied files are part
+     * of its reuse identity (guest path and content hash), so the adopter's builder holds the
+     * same files the running sandbox was started with. Without them on the handle,
+     * [createCheckpoint] would reboot the adopted sandbox with no `--volume`, and msb 0.7.8 would
+     * refuse the restore after the sandbox was already removed.
+     */
+    override fun findRunning(name: String, mounts: List<FileMount>): SandboxHandle? =
+        (findRunning(name) as Handle?)?.also { it.spec = it.spec.copy(mounts = mounts) }
+
     /** `msb stop`/`msb rm` by full binary path — the same subcommands [stop]/[remove] invoke,
      * argv-shaped for the reaper watchdog script (a plain OS process spawned before this JVM's
      * first sandbox, with no [MsbCliBackend] instance of its own to call). */
@@ -860,10 +877,10 @@ class MsbCliBackend private constructor(
      * retry ever clears it. `msb restore` (unlike `msb start`) passes no creation flags and
      * works everywhere, so the resume step here is instead: remove the stopped sandbox (its
      * disk state now lives entirely in the snapshot) and boot a fresh sandbox from that
-     * snapshot under a FRESH generated name, keeping the same ports/memory limit (NOT env —
-     * see [MsbCommands.restore]'s doc), via [spawnAndAwaitRunning] — the exact boot path [start]
-     * itself uses, just fed a COPY of [handle]'s own spec with `name` rewritten and
-     * `checkpointRef` set to the EFFECTIVE ref (`spawnAttachedRun` then routes to
+     * snapshot under a FRESH generated name, keeping the same ports/memory limit and the same
+     * copied files (NOT env — see [MsbCommands.restore]'s doc), via [spawnAndAwaitRunning] — the
+     * exact boot path [start] itself uses, just fed a COPY of [handle]'s own spec with `name`
+     * rewritten and `checkpointRef` set to the EFFECTIVE ref (`spawnAttachedRun` then routes to
      * `MsbCommands.restore`, emitting `restore <ref> --name <freshName>` in place of an ordinary
      * `run <image>` boot — never `--disk-only`, which msb 0.7.1 rejects for a disk-scope
      * snapshot; see that method's doc). [Handle.attached] ends up holding the revived workload's
@@ -944,6 +961,16 @@ class MsbCliBackend private constructor(
      * wait strategy before returning — now against a workload THIS re-boot has already revived,
      * not the idle sandbox upstream's restore alone would leave behind.
      *
+     * **Copied files.** A file added with `withCopyFileToContainer` is a start-time bind mount
+     * of a host file (`--mount-file`), and the snapshot does not capture its content. The reboot
+     * therefore passes every [ContainerSpec.mounts] entry back to `msb restore` as a `--volume`
+     * (see [MsbCommands.restore]'s doc), so the file is there again in the rebooted sandbox. That
+     * reads the host file a second time, so each mount's host path must still exist, and this
+     * method checks that before the stop (a [CheckpointCopiedFileMissingException]) instead of
+     * after the source sandbox is already gone. Without the `--volume`, msb 0.7.6 restores the
+     * file empty and msb 0.7.8 refuses the restore. For a handle adopted through reuse (see
+     * [findRunning]) the mounts come from the adopting container's own builder.
+     *
      * Failure handling has three distinct shapes:
      * - `snapshot create` fails: the sandbox is left STOPPED, never removed, and this throws
      *   naming the failed step and the by-hand remedy (`msb start <name>` — safe here, since a
@@ -981,6 +1008,11 @@ class MsbCliBackend private constructor(
     override fun createCheckpoint(handle: SandboxHandle, ref: String): String {
         handle as Handle
         if (handle.spec.tmpfsRootMb != null) throw TmpfsRootCheckpointException()
+        // The reboot below mounts every copied file again from its host path, so a host file that
+        // is gone would only be found after the stop, snapshot and rm. Refused here instead.
+        handle.spec.mounts.firstOrNull { !Files.exists(it.hostPath) }?.let {
+            throw CheckpointCopiedFileMissingException(it.guestPath, it.hostPath)
+        }
         // Guest-side capture, BEFORE stop — only when there's no explicit command to fall back
         // on; see captureWorkloadCmdline's/resolveWorkloadArgv's docs. A miss (null) is not an
         // error here: it just means nothing gets persisted below, and a later restore of this
@@ -1044,9 +1076,10 @@ class MsbCliBackend private constructor(
         try {
             handle.attached = restoreRetryingFreshName(handle, freshSpec)
         } catch (e: Exception) {
-            error("re-booting sandbox ${handle.id} from checkpoint $effectiveRef failed: ${e.message} — the " +
-                "sandbox was removed but its state is preserved in checkpoint $effectiveRef, restorable via " +
-                "GenericContainer.fromCheckpoint.")
+            throw IllegalStateException(
+                "re-booting sandbox ${handle.id} from checkpoint $effectiveRef failed: ${e.message} — the " +
+                    "sandbox was removed but its state is preserved in checkpoint $effectiveRef, restorable via " +
+                    "GenericContainer.fromCheckpoint.", e)
         }
         return effectiveRef
     }
@@ -2039,6 +2072,30 @@ internal class RestoreAccessDeniedException(val output: String) :
 internal fun isRestoreAccessDenied(output: String): Boolean =
     "Access is denied" in output && ("io error" in output || "(os error 5)" in output)
 
+/**
+ * True if [output] (an `msb restore` invocation's combined stdout/stderr) is msb's refusal to
+ * restore a snapshot without destination bindings for the host files its source sandbox had
+ * mounted at start — the files added with `withCopyFileToContainer`. msb 0.7.8, verbatim:
+ *
+ * ```
+ * error: invalid config: restore requires destination bindings for: mount /etc/app/b.conf; provide a destination mount for each path or explicitly allow missing resources
+ *   → map each path with -v SOURCE:GUEST or --mount-disk SOURCE:GUEST
+ *   → or pass --allow-missing-resources to start without them
+ * ```
+ *
+ * msb 0.7.6's binary carries the same sentence with a different tail (`; provide --volume
+ * mappings, select captured disks with --volume GUEST, or explicitly use
+ * --allow-missing-resources`), used for other restore shapes. Only the sentence itself is
+ * matched: not the `invalid config:` prefix, the tail, the hint lines or the arrow, because on
+ * Windows the capture reaches this backend through PowerShell, which decorates the output and
+ * mangles the arrow (same reasoning as [isAgentRelayUnavailable]). Whitespace between the words
+ * is matched loosely, so a capture that wrapped the sentence across lines still matches.
+ */
+internal fun isRestoreMissingBindings(output: String): Boolean =
+    RESTORE_MISSING_BINDINGS.containsMatchIn(output)
+
+private val RESTORE_MISSING_BINDINGS = Regex("restore\\s+requires\\s+destination\\s+bindings\\s+for")
+
 /** The boot failure [MsbCliBackend.bootOnce] retries once — msb's sandbox process exited
  * cleanly before the host's agent relay came up (see [isAgentRelayUnavailable]). Internal to
  * the boot path, like its siblings above; it never leaves [MsbCliBackend.bootOnce], which turns
@@ -2136,6 +2193,9 @@ internal sealed class BrokerOutcome {
  */
 internal fun powerShellSingleQuoted(s: String): String = "'" + s.replace("'", "''") + "'"
 
+/** Escapes a backtick and then `$` for text spliced into a PowerShell double-quoted string. */
+internal fun powerShellDoubleQuotedEscape(s: String): String = s.replace("`", "``").replace("$", "`$")
+
 /**
  * Builds the PowerShell script POLICY v2's broker escalation runs via `powershell -NoProfile -File
  * <script>` (see [defaultRestoreBroker], which writes this to a unique temp file and runs it, and
@@ -2171,9 +2231,13 @@ internal fun buildBrokerScript(msb: Path, argv: List<String>, outFile: Path, ecF
     val quotedArgv = argv.joinToString(" ") { powerShellSingleQuoted(it) }
     val quotedOut = powerShellSingleQuoted(outFile.toString())
     val quotedEc = powerShellSingleQuoted(ecFile.toString())
-    val innerCommand = "& $quotedMsb $quotedArgv *> $quotedOut"
+    // The inner command lands inside the outer double-quoted CommandLine literal, where PowerShell
+    // still expands `$name` and `$(...)` and reads a backtick as an escape, single-quoted tokens
+    // included. Escaping both keeps a host path such as C:\Users\me\$proj\app.conf literal.
+    val innerCommand = powerShellDoubleQuotedEscape("& $quotedMsb $quotedArgv *> $quotedOut")
+    val innerEc = powerShellDoubleQuotedEscape(quotedEc)
     return """
-        |${'$'}cimArgs = @{ CommandLine = "powershell.exe -NoProfile -Command `"$innerCommand; `${'$'}LASTEXITCODE | Out-File -FilePath $quotedEc -Encoding ascii -NoNewline`"" }
+        |${'$'}cimArgs = @{ CommandLine = "powershell.exe -NoProfile -Command `"$innerCommand; `${'$'}LASTEXITCODE | Out-File -FilePath $innerEc -Encoding ascii -NoNewline`"" }
         |${'$'}result = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments ${'$'}cimArgs
         |Write-Output "CIM_RETURN=${'$'}(${'$'}result.ReturnValue)"
         |Write-Output "CIM_PID=${'$'}(${'$'}result.ProcessId)"
