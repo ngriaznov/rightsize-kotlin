@@ -7,7 +7,20 @@ reaches its first tagged release.
 
 ## [Unreleased]
 
-Nothing yet.
+### Changed
+
+- **The pinned msb is now 0.7.8** (was 0.7.6). The CLI surface this library drives is
+  unchanged. Guests run a newer kernel (Linux 6.12.111) and no longer see the VMX/SVM
+  CPU flags, so nested virtualization inside a container is not available. On Linux and
+  macOS, a timed-out `exec` or file copy that this library kills in the middle of a
+  large transfer no longer stops the whole sandbox.
+
+  **0.7.8 migrates msb's shared state database under `MSB_HOME` on first use.** After
+  that, an older msb binary refuses the same home outright ("database schema is newer
+  than this msb binary"). That includes the msb 0.7.6 that rightsize 0.7.14 provisions:
+  on a machine that runs both this release and an older rightsize, give one of them its
+  own `MSB_HOME`, or upgrade the older one. The same applies to `MSB_PATH` pointed at a
+  binary older than 0.7.8.
 
 ## [0.7.14] - 2026-10-02
 
