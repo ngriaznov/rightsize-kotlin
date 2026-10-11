@@ -47,6 +47,44 @@ class ReuseRecordTest {
         assertEquals(mapOf(6379 to 32768), parsed!!.ports)
     }
 
+    @Test fun `udpPorts round-trips through toJson and parse`() {
+        val withUdp = record.copy(udpPorts = mapOf(53 to 40000, 5353 to 40001))
+        assertEquals(withUdp, ReuseRecord.parse(withUdp.toJson()))
+    }
+
+    // The registry is shared with the Node and Rust libraries, which write the same optional
+    // `udpPorts` object after `backend` and leave it out when there are no UDP ports.
+    @Test fun `udpPorts is written last under the key the other libraries use, and omitted when empty`() {
+        assertEquals(
+            "{\"name\":\"rz-reuse-799aad5a3338\",\"image\":\"redis:7-alpine\"," +
+                "\"ports\":{\"6379\":32768,\"6380\":32769},\"createdIso\":\"2026-07-11T12:00:00Z\"," +
+                "\"backend\":\"docker\",\"udpPorts\":{\"53\":40000}}",
+            record.copy(udpPorts = mapOf(53 to 40000)).toJson())
+        assertFalse("udpPorts" in record.toJson(), "a record with no UDP ports must not write the key")
+    }
+
+    @Test fun `a record with no udpPorts key parses with no UDP ports`() {
+        val tcpOnly = "{\"name\":\"rz-reuse-abc\",\"image\":\"redis\",\"ports\":{\"6379\":32768}," +
+            "\"createdIso\":\"2026-07-11T12:00:00Z\",\"backend\":\"docker\"}"
+        assertEquals(emptyMap<Int, Int>(), ReuseRecord.parse(tcpOnly)!!.udpPorts)
+    }
+
+    @Test fun `parse reads udpPorts from a record the Node library wrote`() {
+        // JSON.stringify of Node's ReuseRegistryEntry, key order as Node emits it.
+        val fromNode = "{\"name\":\"rz-reuse-abc\",\"image\":\"coredns/coredns:1.11.1\",\"ports\":{}," +
+            "\"createdIso\":\"2026-07-11T12:00:00.000Z\",\"backend\":\"microsandbox\",\"udpPorts\":{\"53\":40002}}"
+        val parsed = ReuseRecord.parse(fromNode)
+        assertNotNull(parsed)
+        assertEquals(emptyMap<Int, Int>(), parsed!!.ports)
+        assertEquals(mapOf(53 to 40002), parsed.udpPorts)
+    }
+
+    @Test fun `parse rejects a record whose udpPorts is not an object`() {
+        val malformed = "{\"name\":\"rz-reuse-abc\",\"image\":\"redis\",\"ports\":{}," +
+            "\"createdIso\":\"2026-07-11T12:00:00Z\",\"backend\":\"docker\",\"udpPorts\":[53]}"
+        assertNull(ReuseRecord.parse(malformed))
+    }
+
     @Test fun `name and image containing quotes, backslashes, and newlines round-trip through toJson and parse`() {
         val tricky = record.copy(
             name = "rz-reuse-799aad5a3338",

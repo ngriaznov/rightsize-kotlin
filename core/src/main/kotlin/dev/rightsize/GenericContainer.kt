@@ -769,6 +769,7 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
             // (there never was one; keepAlive specs are never appended in the first place).
             reuseActive = false
             mappedPorts = emptyMap()
+            mappedUdpPorts = emptyMap()
             return
         }
         runCatching { backend.stop(h) }
@@ -855,21 +856,33 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
     /**
      * Verifies [record]'s sandbox is actually running, then re-runs this container's own wait
      * strategy against its recorded ports (bounded by the normal startup budget) before trusting
-     * it as this instance's running container. Never throws: any disqualifier (not running, wait
-     * failure) leaves this instance exactly as it was before the call and returns `false`, so the
-     * caller can fall back to a fresh create.
+     * it as this instance's running container. Never throws: any disqualifier (a record without
+     * a host port for every exposed UDP port, not running, wait failure) leaves this instance
+     * exactly as it was before the call and returns `false`, so the caller can fall back to a
+     * fresh create.
      */
     private fun tryAdopt(record: ReuseRecord): Boolean {
-        // The mounts ride along so a later checkpoint() of this adopted container can mount its
-        // copied files again; the identity hash already proved they match the running sandbox's.
-        val h = runCatching { backend.findRunning(record.name, mounts.toList()) }.getOrNull() ?: return false
+        // No wait strategy looks at UDP ports, so nothing later would notice a record (written by
+        // an earlier release, which recorded none, or by hand) that doesn't say where one is
+        // published; the adopted container would hand out no mapping for it. Same rule as the
+        // Rust library's adopt path.
+        if (!exposedUdpPorts.all { it in record.udpPorts }) return false
+        // The spec this container would have created the sandbox with, with the registry's host
+        // ports: the identity hash already proved the running sandbox was started from an
+        // equivalent one, and a later checkpoint() of this adopted container reboots it from the
+        // handle's spec (published ports, memory limit, copied files, env, command). A spec that
+        // can't be built (a record missing a port customizeSpec maps) is a record this container
+        // can't adopt.
+        val spec = runCatching { buildReuseSpec(record.name, record.ports, record.udpPorts) }.getOrNull() ?: return false
+        val h = runCatching { backend.findRunning(spec) }.getOrNull() ?: return false
         handle = h
         mappedPorts = record.ports
+        mappedUdpPorts = record.udpPorts
         // The adopted sandbox's host ports are already bound by that (possibly foreign) process —
         // register them with this process's own allocator so it never hands the same host port to
         // an unrelated sibling container started later in this run. Never released: the ports stay
         // genuinely occupied by the still-running sandbox for as long as it lives.
-        record.ports.values.forEach(FreePorts::reserve)
+        (record.ports.values + record.udpPorts.values).forEach(FreePorts::reserve)
         reuseActive = true
         return try {
             waitStrategy.waitUntilReady(waitTarget())
@@ -877,7 +890,7 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
             LiveContainers.register(h, backend, host)
             true
         } catch (e: Exception) {
-            handle = null; mappedPorts = emptyMap(); reuseActive = false
+            handle = null; mappedPorts = emptyMap(); mappedUdpPorts = emptyMap(); reuseActive = false
             false
         }
     }
@@ -901,26 +914,7 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
         try {
         repeat(PORT_BIND_ATTEMPTS) {
             allocatePorts()
-            // No networkId/aliases, and hostUdpEgressPorts stays at its empty default: startReuse
-            // already rejected withNetwork() before ever reaching this method (see
-            // ReuseNetworkConflictException), so a reuse sandbox never has links to compute one from.
-            var spec = ContainerSpec(
-                name = name,
-                image = image,
-                env = env.toMap(),
-                command = command,
-                ports = mappedPorts.map { (g, h) -> PortBinding(hostPort = h, guestPort = g) } +
-                    mappedUdpPorts.map { (g, h) -> PortBinding(hostPort = h, guestPort = g, protocol = PortProtocol.UDP) },
-                mounts = mounts.toList(),
-                runId = RunId.value,
-                memoryLimitMb = memoryLimitMb,
-                keepAlive = true,
-                diskLimitMb = diskLimitMb,
-                tmpfsRootMb = tmpfsRootMb,
-                networkDisabled = networkDisabled,
-            )
-            spec = customizeSpec(spec) { guest -> mappedPorts.getValue(guest) }
-            validateSpecConflicts(spec.diskLimitMb, spec.tmpfsRootMb, spec.memoryLimitMb, spec.networkDisabled, spec.networkId)
+            val spec = buildReuseSpec(name, mappedPorts, mappedUdpPorts)
             val h = try {
                 backend.create(spec)
             } catch (e: Exception) {
@@ -959,7 +953,8 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
             LiveContainers.register(h, backend, host)
             registry.write(hash, ReuseRecord(
                 name = name, image = image, ports = mappedPorts,
-                createdIso = Instant.now().toString(), backend = canonicalBackendId(backend.name)))
+                createdIso = Instant.now().toString(), backend = canonicalBackendId(backend.name),
+                udpPorts = mappedUdpPorts))
             return
         }
         throw IllegalStateException(
@@ -969,6 +964,37 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
         } finally {
             conflicted.forEach { FreePorts.release(it) }
         }
+    }
+
+    /**
+     * The spec a reuse sandbox named [name] is created with, given its host ports ([tcpPorts]/
+     * [udpPorts], guest port to host port): [createReuseFresh] builds it from freshly allocated
+     * ports, [tryAdopt] from the registry's, so an adopted handle carries the spec the sandbox was
+     * created with. Every builder field it reads is part of [buildIdentitySpec], or derived from
+     * those and the host ports (through [customizeSpec]), so two containers that hash alike build
+     * the same spec for the same ports. No networkId/aliases, and hostUdpEgressPorts stays at its
+     * empty default: [startReuse] rejects withNetwork() before either caller runs (see
+     * ReuseNetworkConflictException), so a reuse sandbox never has links to compute one from.
+     */
+    private fun buildReuseSpec(name: String, tcpPorts: Map<Int, Int>, udpPorts: Map<Int, Int>): ContainerSpec {
+        var spec = ContainerSpec(
+            name = name,
+            image = image,
+            env = env.toMap(),
+            command = command,
+            ports = tcpPorts.map { (g, h) -> PortBinding(hostPort = h, guestPort = g) } +
+                udpPorts.map { (g, h) -> PortBinding(hostPort = h, guestPort = g, protocol = PortProtocol.UDP) },
+            mounts = mounts.toList(),
+            runId = RunId.value,
+            memoryLimitMb = memoryLimitMb,
+            keepAlive = true,
+            diskLimitMb = diskLimitMb,
+            tmpfsRootMb = tmpfsRootMb,
+            networkDisabled = networkDisabled,
+        )
+        spec = customizeSpec(spec) { guest -> tcpPorts.getValue(guest) }
+        validateSpecConflicts(spec.diskLimitMb, spec.tmpfsRootMb, spec.memoryLimitMb, spec.networkDisabled, spec.networkId)
+        return spec
     }
 
     /**

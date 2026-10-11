@@ -830,27 +830,32 @@ class MsbCliBackend private constructor(
     override fun removeByName(name: String) = silently(name)
 
     /**
-     * Reuse's adopt path (see docs/reuse.md): [name] is Running iff it's in [runningSandboxNames]
-     * — the same primitive [awaitRunning] itself polls. The returned handle's `spec` is a
-     * minimal reconstruction: an adopting process never knew the original creating spec, and
-     * nothing downstream of adopt (exec/logs/stop, which key off `Handle.id == spec.name`
-     * here) needs more than the name.
+     * [name] is Running iff it's in [runningSandboxNames] — the same primitive [awaitRunning]
+     * itself polls. The returned handle's `spec` is a minimal reconstruction: exec/logs/stop key
+     * off `Handle.id == spec.name` here and need nothing more, but [createCheckpoint] reboots the
+     * sandbox from the spec, so reuse's adopt path calls the [ContainerSpec] overload instead.
      */
-    override fun findRunning(name: String): SandboxHandle? {
-        if (name !in runningSandboxNames()) return null
-        return Handle(ContainerSpec(name = name, image = "", runId = RunId.value, keepAlive = true))
-    }
+    override fun findRunning(name: String): SandboxHandle? =
+        findRunning(ContainerSpec(name = name, image = "", runId = RunId.value, keepAlive = true))
 
     /**
-     * [findRunning], with the adopting container's own [mounts] on the returned handle's spec.
-     * The adopting process never knew the creating spec, but a container's copied files are part
-     * of its reuse identity (guest path and content hash), so the adopter's builder holds the
-     * same files the running sandbox was started with. Without them on the handle,
-     * [createCheckpoint] would reboot the adopted sandbox with no `--volume`, and msb 0.7.8 would
-     * refuse the restore after the sandbox was already removed.
+     * Reuse's adopt path (see docs/reuse.md): the same Running check as [findRunning], with the
+     * adopting container's own [spec] on the returned handle. The adopting process never saw the
+     * creating spec, but reuse identity says the running sandbox was started from an equivalent
+     * one, so [spec] holds its published ports, memory limit, copied files, env and command.
+     * [createCheckpoint] reboots the sandbox from it: without the ports and memory limit the
+     * restore would publish nothing and boot with msb's default memory, without the mounts msb
+     * 0.7.8 would refuse the restore after the sandbox was already removed, and the revived
+     * workload takes its env and command from it.
      */
+    override fun findRunning(spec: ContainerSpec): SandboxHandle? =
+        if (spec.name in runningSandboxNames()) Handle(spec) else null
+
+    /** The 0.7.15 adopt path: [findRunning] with the adopter's [mounts] on the minimal spec. */
+    @Deprecated("The reuse adopt path calls findRunning(spec), which carries the adopting " +
+        "container's whole spec (ports, memory limit, env, command), not only its mounts.")
     override fun findRunning(name: String, mounts: List<FileMount>): SandboxHandle? =
-        (findRunning(name) as Handle?)?.also { it.spec = it.spec.copy(mounts = mounts) }
+        findRunning(ContainerSpec(name = name, image = "", runId = RunId.value, keepAlive = true, mounts = mounts))
 
     /** `msb stop`/`msb rm` by full binary path — the same subcommands [stop]/[remove] invoke,
      * argv-shaped for the reaper watchdog script (a plain OS process spawned before this JVM's
@@ -935,7 +940,10 @@ class MsbCliBackend private constructor(
      * own (its sandbox, if any, is already best-effort `rm`'d before the next attempt even starts)
      * while an UNCLASSIFIED failure (e.g. [CheckpointMissingWorkloadCommandException] after a
      * restore that itself succeeded) leaves its attempt's name tracked there regardless, for this
-     * backend's own shutdown-hook/[close] cleanup net to reap a genuinely live orphan.
+     * backend's own shutdown-hook/[close] cleanup net to reap a genuinely live orphan. A keepAlive
+     * (reuse) sandbox's attempts are never tracked, the same exclusion [start] applies, so its
+     * reboot outlives the process like any reuse sandbox — under the fresh name, which the reuse
+     * registry doesn't know (the Node and Rust libraries do the same).
      *
      * The OLD (pre-checkpoint) name's ledger entry is deliberately left as-is throughout: it is
      * never removed here (this reboot bypasses the public [remove] the ledger's
@@ -968,8 +976,12 @@ class MsbCliBackend private constructor(
      * reads the host file a second time, so each mount's host path must still exist, and this
      * method checks that before the stop (a [CheckpointCopiedFileMissingException]) instead of
      * after the source sandbox is already gone. Without the `--volume`, msb 0.7.6 restores the
-     * file empty and msb 0.7.8 refuses the restore. For a handle adopted through reuse (see
-     * [findRunning]) the mounts come from the adopting container's own builder.
+     * file empty and msb 0.7.8 refuses the restore.
+     *
+     * **Adopted handles.** A handle adopted through reuse carries the adopting container's own
+     * spec (see [findRunning]'s [ContainerSpec] overload), so its reboot keeps the same ports,
+     * memory limit and copied files, and revives the workload with the same env and command, as a
+     * handle from [create] does.
      *
      * Failure handling has three distinct shapes:
      * - `snapshot create` fails: the sandbox is left STOPPED, never removed, and this throws
@@ -1070,9 +1082,10 @@ class MsbCliBackend private constructor(
         // method's own doc for why an unclassified failure (e.g. spawnWorkloadExecChild throwing
         // after a genuinely successful restore) needs this. oldName drops out in the same breath:
         // its sandbox was already `rm`'d above (see [invoke]'s call a few lines up), regardless of
-        // how the reboot below turns out.
+        // how the reboot below turns out. A keepAlive (reuse) sandbox is never tracked, the same
+        // exclusion [start] applies, so close() and the shutdown hook leave its reboot running.
         startedNames -= oldName
-        startedNames += freshName
+        if (!freshSpec.keepAlive) startedNames += freshName
         try {
             handle.attached = restoreRetryingFreshName(handle, freshSpec)
         } catch (e: Exception) {
@@ -1263,7 +1276,7 @@ class MsbCliBackend private constructor(
                 attemptSpec = attemptSpec.copy(name = nextName)
                 Reaper.beforeCreate(this, attemptSpec)
                 handle.spec = attemptSpec
-                startedNames += nextName
+                if (!attemptSpec.keepAlive) startedNames += nextName
             }
         }
     }

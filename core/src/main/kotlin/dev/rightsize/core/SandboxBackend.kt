@@ -123,18 +123,32 @@ interface SandboxBackend : AutoCloseable {
      * treats both identically (fall back to a fresh create), so this never needs to distinguish
      * them. The returned handle's `spec` is a minimal reconstruction (just enough to satisfy the
      * [SandboxHandle] contract — name, image if cheaply available, `keepAlive = true`), not the
-     * original creating spec, which no backend can recover from a bare name. Defaults to `null`
-     * for backends that don't participate in reuse (e.g. test doubles).
+     * original creating spec, which no backend can recover from a bare name; the adopt path
+     * itself calls the [ContainerSpec] overload, which supplies one. Defaults to `null` for
+     * backends that don't participate in reuse (e.g. test doubles).
      */
     fun findRunning(name: String): SandboxHandle? = null
     /**
-     * [findRunning] for the reuse adopt path, which also knows the adopting container's own
-     * [mounts] (its `withCopyFileToContainer` files). A copied file is part of reuse identity —
-     * guest path and content hash — so those are the files the running sandbox was started with,
-     * and a backend whose `checkpoint()` has to supply them again can keep them on the handle's
-     * `spec` instead of the empty list [findRunning] leaves. Defaults to [findRunning], which
-     * suits every backend whose checkpoint never reads `spec.mounts`.
+     * [findRunning] for the reuse adopt path, given the spec the adopting container would create
+     * the sandbox named [ContainerSpec.name] with, its host ports taken from the reuse registry
+     * entry. Reuse identity (image, env, command, exposed ports, memory and disk settings, copied
+     * files, network-disabled) is what led the adopter to this name, so the running sandbox was
+     * started from an equivalent spec, and a backend should put [spec] itself on the returned
+     * handle rather than a minimal reconstruction: a `checkpoint()` that reboots the sandbox
+     * (microsandbox) reads the published ports, memory limit, copied files, env and command back
+     * from the handle. Matches on [ContainerSpec.name] alone. Defaults to the deprecated
+     * `findRunning(name, mounts)`, whose own default is [findRunning], so a backend that
+     * overrides only either of those keeps working unchanged.
      */
+    @Suppress("DEPRECATION")
+    fun findRunning(spec: ContainerSpec): SandboxHandle? = findRunning(spec.name, spec.mounts)
+    /**
+     * The 0.7.15 form of the [ContainerSpec] overload, which carried only the adopting
+     * container's copied files. Still called by that overload's default, so a backend that
+     * overrides it keeps working. Defaults to [findRunning].
+     */
+    @Deprecated("The reuse adopt path calls findRunning(spec), which carries the adopting " +
+        "container's whole spec (ports, memory limit, env, command), not only its mounts.")
     fun findRunning(name: String, mounts: List<FileMount>): SandboxHandle? = findRunning(name)
     /** See [WatchdogCommands]. Defaults to all-empty (no watchdog action) for backends that
      * don't participate in reaping. */

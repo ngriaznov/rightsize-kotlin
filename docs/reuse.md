@@ -75,13 +75,21 @@ identity, name, and mapped ports are written to `<cache-dir>/reuse/<hash>.json` 
  "createdIso":"2026-07-11T12:00:00Z","backend":"docker"}
 ```
 
+`ports` holds the TCP mappings. A container with `withExposedUdpPorts` also gets a
+`udpPorts` object of the same shape after `backend`; the key is left out when there are none.
+All three libraries read and write this format.
+
 A later `start()` of an equivalent container:
 
 1. **Registry file exists** — verify the sandbox is actually running (a real backend query,
    not trusting the file blindly), then re-run the container's own wait strategy against the
    recorded host ports (bounded by the normal startup budget). Success: adopt — mapped ports
-   come straight from the registry, no create call, `isRunning` is true immediately. Failure
-   (not running, or the wait fails, or the registry file is unparseable): best-effort remove
+   come straight from the registry, no create call, `isRunning` is true immediately. The
+   backend is handed the spec this container would have created the sandbox with (its own
+   configuration plus the recorded host ports), so a later `checkpoint()`, which reboots the
+   sandbox on microsandbox, keeps its published ports, memory limit and copied files. Failure
+   (not running, or the wait fails, or the registry file is unparseable, or it has no host
+   port for one of the container's UDP ports): best-effort remove
    the stale sandbox and registry entry, then fall through to a fresh create as if there had
    never been a registry hit.
 2. **No registry file** — allocate host ports normally, create under the reuse name, wait,
@@ -153,6 +161,17 @@ ordinary operations against a running sandbox. They are **not** part of reuse id
 copy mutates the shared sandbox's state, and that mutation is invisible to the identity hash, so
 two "equivalent" containers that differ only in what one of them copied in at runtime still adopt
 the same sandbox.
+
+## Checkpointing a reuse container
+
+`checkpoint()` works on a reuse-active container. On Docker it commits the running container
+and leaves the container and its name as they were. On microsandbox it stops the sandbox,
+snapshots it and boots it again under a new `rz-<run id>-<n>` name. The registry entry still
+names the `rz-reuse-<hash>` sandbox, which no longer exists, so the next equivalent container
+creates a fresh sandbox instead of adopting the checkpointed one. The rebooted sandbox is still
+a reuse sandbox: it keeps running after the process exits, and nothing removes it. Find it with
+`msb ls` and remove it with `msb stop <name> && msb rm <name>`. The Node and Rust libraries
+behave the same way.
 
 ## Interaction with reaping
 

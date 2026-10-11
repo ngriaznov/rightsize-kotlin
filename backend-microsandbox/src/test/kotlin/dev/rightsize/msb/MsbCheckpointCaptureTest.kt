@@ -3,6 +3,7 @@ package dev.rightsize.msb
 import dev.rightsize.core.CheckpointMissingWorkloadCommandException
 import dev.rightsize.core.ContainerSpec
 import dev.rightsize.core.FileMount
+import dev.rightsize.core.PortBinding
 import dev.rightsize.core.checkpoint.CheckpointRegistry
 import org.junit.jupiter.api.Assumptions.assumeFalse
 import org.junit.jupiter.api.Test
@@ -279,10 +280,105 @@ class MsbCheckpointCaptureTest {
         }
     }
 
-    // Reuse's adopt path: the adopting process only gets findRunning's minimal handle, which has no
-    // mounts. GenericContainer passes its own (part of the reuse identity), and the reboot must mount
-    // them again — otherwise msb 0.7.8 refuses the restore after the adopted sandbox is already gone.
-    @Test fun `createCheckpoint of a handle adopted with findRunning reboots with the adopter's mounts`(
+    // Reuse's adopt path: GenericContainer hands findRunning the spec it would have created the
+    // sandbox with (reuse identity says the running one was started from an equivalent spec), and
+    // the returned handle keeps it. checkpoint() of the adopted container reboots from that spec, so
+    // the restore publishes the same ports, applies the same memory limit and mounts the same files,
+    // and the revived workload gets the spec's env and command.
+    @Test fun `createCheckpoint of a handle adopted with findRunning(spec) reboots with its ports, memory limit and mounts`(
+        @TempDir tmp: Path,
+    ) {
+        assumeFalse(Platform.current()?.isWindows == true, "POSIX-only fake binary; see doc comment")
+        val marker = Files.createTempFile("rz-adoptspec-marker-", "").also { Files.deleteIfExists(it) }
+        val callLog = Files.createTempFile("rz-adoptspec-calllog-", "")
+        val missFlag = Files.createTempFile("rz-adoptspec-missflag-", "").also { Files.deleteIfExists(it) }
+        val backend = MsbCliBackend.forHost(
+            fakeMsbCaptureLifecycle(marker, callLog, "serve\\0", missFlag),
+            windowsHost = false, checkpointRegistryDir = tmp,
+        )
+        val file = Files.writeString(tmp.resolve("app.conf"), "adopted")
+        val creatorSpec = ContainerSpec(
+            name = "rz-adoptspec-test", image = "redis:8.6-alpine", runId = "run1", keepAlive = true,
+            env = mapOf("SEED" to "1"), command = listOf("redis-server", "--appendonly", "yes"),
+            ports = listOf(PortBinding(hostPort = 41234, guestPort = 6379)),
+            mounts = listOf(FileMount(file, "/etc/app.conf")), memoryLimitMb = 256,
+        )
+        val creator = backend.create(creatorSpec)
+        backend.start(creator)
+        // A different process adopts it: same spec, its own run id.
+        val adopterSpec = creatorSpec.copy(runId = "run2")
+        val adopted = backend.findRunning(adopterSpec)
+        try {
+            assertNotNull(adopted, "a Running sandbox must be found")
+            assertEquals(adopterSpec, adopted!!.spec, "the adopted handle must carry the adopter's spec")
+            Files.writeString(callLog, "")
+
+            val effectiveRef = backend.createCheckpoint(adopted, "rz-ckpt-adoptspec")
+
+            val calls = nonPollingCalls(callLog)
+            assertEquals(
+                "restore $effectiveRef --name ${adopted.id} -m 256M -p 41234:6379 " +
+                    "--volume $file:/etc/app.conf:rw,nodev",
+                calls.single { it.startsWith("restore ") })
+            assertEquals("exec -e SEED=1 ${adopted.id} -- redis-server --appendonly yes",
+                calls.single { it.startsWith("exec ") },
+                "the revived workload must get the spec's env and command, with no guest cmdline capture")
+        } finally {
+            adopted?.let { backend.stop(it); backend.remove(it) }
+        }
+    }
+
+    // A reuse sandbox (keepAlive) stays out of this backend's own-run cleanup at start(), and its
+    // checkpoint reboot, which still comes up under a fresh name, has to stay out of it too:
+    // otherwise close() and the shutdown hook remove it when the process exits. Node and Rust
+    // behave the same way.
+    @Test fun `createCheckpoint of a keepAlive sandbox leaves the rebooted sandbox out of own-run cleanup`(
+        @TempDir tmp: Path,
+    ) {
+        assumeFalse(Platform.current()?.isWindows == true, "POSIX-only fake binary; see doc comment")
+        val marker = Files.createTempFile("rz-keepalive-marker-", "").also { Files.deleteIfExists(it) }
+        val callLog = Files.createTempFile("rz-keepalive-calllog-", "")
+        val missFlag = Files.createTempFile("rz-keepalive-missflag-", "").also { Files.deleteIfExists(it) }
+        val backend = MsbCliBackend.forHost(
+            fakeMsbCaptureLifecycle(marker, callLog, "serve\\0", missFlag),
+            windowsHost = false, checkpointRegistryDir = tmp,
+        )
+        val handle = backend.create(ContainerSpec(
+            name = "rz-reuse-0123456789ab", image = "redis:8.6-alpine", runId = "run1", keepAlive = true,
+            command = listOf("redis-server"), ports = listOf(PortBinding(hostPort = 41500, guestPort = 6379))))
+        backend.start(handle)
+        try {
+            backend.createCheckpoint(handle, "rz-ckpt-keepalive")
+            assertNotEquals("rz-reuse-0123456789ab", handle.id, "the reboot still comes up under a fresh name")
+            assertTrue(handle.id in backend.runningSandboxNames())
+            assertTrue(backend.trackedNames().isEmpty(),
+                "a keepAlive sandbox's reboot must not be tracked for own-run cleanup: ${backend.trackedNames()}")
+
+            Files.writeString(callLog, "")
+            backend.close()
+            assertEquals(emptyList<String>(), nonPollingCalls(callLog),
+                "close() must leave the rebooted keepAlive sandbox alone")
+        } finally {
+            backend.stop(handle)
+            backend.remove(handle)
+        }
+    }
+
+    @Test fun `findRunning with a spec returns null for a name not Running`() {
+        assumeFalse(Platform.current()?.isWindows == true, "POSIX-only fake binary; see doc comment")
+        val marker = Files.createTempFile("rz-adoptspec-none-marker-", "").also { Files.deleteIfExists(it) }
+        val callLog = Files.createTempFile("rz-adoptspec-none-calllog-", "")
+        val missFlag = Files.createTempFile("rz-adoptspec-none-missflag-", "").also { Files.deleteIfExists(it) }
+        val backend = MsbCliBackend(fakeMsbCaptureLifecycle(marker, callLog, "", missFlag))
+        assertNull(backend.findRunning(ContainerSpec(
+            name = "rz-nobody", image = "redis:8.6-alpine", runId = "run2", keepAlive = true,
+            ports = listOf(PortBinding(hostPort = 41234, guestPort = 6379)))))
+    }
+
+    // The deprecated 0.7.15 overload, which carried only the adopter's mounts, still keeps them on
+    // the handle for a caller that uses it directly.
+    @Suppress("DEPRECATION")
+    @Test fun `createCheckpoint of a handle adopted with findRunning(name, mounts) reboots with the adopter's mounts`(
         @TempDir tmp: Path,
     ) {
         assumeFalse(Platform.current()?.isWindows == true, "POSIX-only fake binary; see doc comment")
@@ -315,6 +411,7 @@ class MsbCheckpointCaptureTest {
         }
     }
 
+    @Suppress("DEPRECATION")
     @Test fun `findRunning with mounts returns null for a name not Running`() {
         assumeFalse(Platform.current()?.isWindows == true, "POSIX-only fake binary; see doc comment")
         val marker = Files.createTempFile("rz-adopt-none-marker-", "").also { Files.deleteIfExists(it) }
