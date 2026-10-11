@@ -80,7 +80,10 @@ A later `start()` of an equivalent container:
 1. **Registry file exists** — verify the sandbox is actually running (a real backend query,
    not trusting the file blindly), then re-run the container's own wait strategy against the
    recorded host ports (bounded by the normal startup budget). Success: adopt — mapped ports
-   come straight from the registry, no create call, `isRunning` is true immediately. Failure
+   come straight from the registry, no create call, `isRunning` is true immediately. The
+   backend is handed the spec this container would have created the sandbox with (its own
+   configuration plus the recorded host ports), so a later `checkpoint()`, which reboots the
+   sandbox on microsandbox, keeps its published ports, memory limit and copied files. Failure
    (not running, or the wait fails, or the registry file is unparseable): best-effort remove
    the stale sandbox and registry entry, then fall through to a fresh create as if there had
    never been a registry hit.

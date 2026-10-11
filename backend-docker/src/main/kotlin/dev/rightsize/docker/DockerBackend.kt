@@ -160,22 +160,33 @@ class DockerBackend : SandboxBackend {
     }
 
     /**
-     * Reuse's adopt path (see docs/reuse.md): resolves [name] to a live daemon id via a name
-     * filter (docker-java's default `listContainersCmd` already excludes stopped containers, so
-     * a hit here is necessarily running), narrowed to an exact name match — the filter itself is
-     * substring/regex, not equality, same caveat [removeByName] already documents. The returned
-     * handle's `spec` is a minimal reconstruction: the original creating spec is not recoverable
-     * from a bare name/id, and nothing downstream of adopt (exec/logs/stop) needs more than the
-     * daemon id this handle carries.
+     * Resolves [name] to a live daemon id (see [runningContainerNamed]). The returned handle's
+     * `spec` is a minimal reconstruction: the original creating spec is not recoverable from a
+     * bare name/id, and exec/logs/stop need no more than the daemon id this handle carries.
      */
     override fun findRunning(name: String): SandboxHandle? {
-        val c = runCatching {
-            client.listContainersCmd().withNameFilter(listOf(name)).exec()
-                .firstOrNull { it.names?.any { n -> n.trimStart('/') == name } == true }
-        }.getOrNull() ?: return null
+        val c = runningContainerNamed(name) ?: return null
         val spec = ContainerSpec(name = name, image = c.image ?: "", runId = RunId.value, keepAlive = true)
         return Handle(c.id, spec)
     }
+
+    /**
+     * Reuse's adopt path (see docs/reuse.md): the same lookup as [findRunning], with the adopting
+     * container's own [spec] on the returned handle. A checkpoint here commits the running
+     * container and never reads the spec back, but diagnostics report the handle's image and
+     * ports, which the minimal reconstruction lacks.
+     */
+    override fun findRunning(spec: ContainerSpec): SandboxHandle? =
+        runningContainerNamed(spec.name)?.let { Handle(it.id, spec) }
+
+    /** The running container named exactly [name], via a name filter (docker-java's default
+     * `listContainersCmd` already excludes stopped containers, so a hit here is necessarily
+     * running) narrowed to an exact match — the filter itself is substring/regex, not equality,
+     * same caveat [removeByName] already documents. `null` when there is none or the query fails. */
+    private fun runningContainerNamed(name: String) = runCatching {
+        client.listContainersCmd().withNameFilter(listOf(name)).exec()
+            .firstOrNull { it.names?.any { n -> n.trimStart('/') == name } == true }
+    }.getOrNull()
 
     override fun start(handle: SandboxHandle) {
         try {

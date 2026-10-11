@@ -860,9 +860,14 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
      * caller can fall back to a fresh create.
      */
     private fun tryAdopt(record: ReuseRecord): Boolean {
-        // The mounts ride along so a later checkpoint() of this adopted container can mount its
-        // copied files again; the identity hash already proved they match the running sandbox's.
-        val h = runCatching { backend.findRunning(record.name, mounts.toList()) }.getOrNull() ?: return false
+        // The spec this container would have created the sandbox with, with the registry's host
+        // ports: the identity hash already proved the running sandbox was started from an
+        // equivalent one, and a later checkpoint() of this adopted container reboots it from the
+        // handle's spec (published ports, memory limit, copied files, env, command). The registry
+        // records no UDP host ports, so none are on it. A spec that can't be built (a record
+        // missing a port customizeSpec maps) is a record this container can't adopt.
+        val spec = runCatching { buildReuseSpec(record.name, record.ports, emptyMap()) }.getOrNull() ?: return false
+        val h = runCatching { backend.findRunning(spec) }.getOrNull() ?: return false
         handle = h
         mappedPorts = record.ports
         // The adopted sandbox's host ports are already bound by that (possibly foreign) process —
@@ -901,26 +906,7 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
         try {
         repeat(PORT_BIND_ATTEMPTS) {
             allocatePorts()
-            // No networkId/aliases, and hostUdpEgressPorts stays at its empty default: startReuse
-            // already rejected withNetwork() before ever reaching this method (see
-            // ReuseNetworkConflictException), so a reuse sandbox never has links to compute one from.
-            var spec = ContainerSpec(
-                name = name,
-                image = image,
-                env = env.toMap(),
-                command = command,
-                ports = mappedPorts.map { (g, h) -> PortBinding(hostPort = h, guestPort = g) } +
-                    mappedUdpPorts.map { (g, h) -> PortBinding(hostPort = h, guestPort = g, protocol = PortProtocol.UDP) },
-                mounts = mounts.toList(),
-                runId = RunId.value,
-                memoryLimitMb = memoryLimitMb,
-                keepAlive = true,
-                diskLimitMb = diskLimitMb,
-                tmpfsRootMb = tmpfsRootMb,
-                networkDisabled = networkDisabled,
-            )
-            spec = customizeSpec(spec) { guest -> mappedPorts.getValue(guest) }
-            validateSpecConflicts(spec.diskLimitMb, spec.tmpfsRootMb, spec.memoryLimitMb, spec.networkDisabled, spec.networkId)
+            val spec = buildReuseSpec(name, mappedPorts, mappedUdpPorts)
             val h = try {
                 backend.create(spec)
             } catch (e: Exception) {
@@ -969,6 +955,37 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
         } finally {
             conflicted.forEach { FreePorts.release(it) }
         }
+    }
+
+    /**
+     * The spec a reuse sandbox named [name] is created with, given its host ports ([tcpPorts]/
+     * [udpPorts], guest port to host port): [createReuseFresh] builds it from freshly allocated
+     * ports, [tryAdopt] from the registry's, so an adopted handle carries the spec the sandbox was
+     * created with. Every builder field it reads is part of [buildIdentitySpec], or derived from
+     * those and the host ports (through [customizeSpec]), so two containers that hash alike build
+     * the same spec for the same ports. No networkId/aliases, and hostUdpEgressPorts stays at its
+     * empty default: [startReuse] rejects withNetwork() before either caller runs (see
+     * ReuseNetworkConflictException), so a reuse sandbox never has links to compute one from.
+     */
+    private fun buildReuseSpec(name: String, tcpPorts: Map<Int, Int>, udpPorts: Map<Int, Int>): ContainerSpec {
+        var spec = ContainerSpec(
+            name = name,
+            image = image,
+            env = env.toMap(),
+            command = command,
+            ports = tcpPorts.map { (g, h) -> PortBinding(hostPort = h, guestPort = g) } +
+                udpPorts.map { (g, h) -> PortBinding(hostPort = h, guestPort = g, protocol = PortProtocol.UDP) },
+            mounts = mounts.toList(),
+            runId = RunId.value,
+            memoryLimitMb = memoryLimitMb,
+            keepAlive = true,
+            diskLimitMb = diskLimitMb,
+            tmpfsRootMb = tmpfsRootMb,
+            networkDisabled = networkDisabled,
+        )
+        spec = customizeSpec(spec) { guest -> tcpPorts.getValue(guest) }
+        validateSpecConflicts(spec.diskLimitMb, spec.tmpfsRootMb, spec.memoryLimitMb, spec.networkDisabled, spec.networkId)
+        return spec
     }
 
     /**

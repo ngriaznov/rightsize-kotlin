@@ -7,7 +7,25 @@ reaches its first tagged release.
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- **`SandboxBackend.findRunning(spec)`**, an SPI overload that reuse's adopt path now
+  calls with the spec the adopting container would have created the sandbox with. A
+  backend should put that spec on the handle it returns. It defaults to the older
+  overloads, so existing backends keep working unchanged. `findRunning(name, mounts)`,
+  added in 0.7.15 for the copied files alone, is deprecated in its favor.
+
+### Fixed
+
+- **`checkpoint()` of an adopted reuse container keeps its ports and memory limit.** On
+  microsandbox, `checkpoint()` reboots the container from its spec, and a container that
+  adopted a running reuse sandbox had only a minimal one (its name and copied files). The
+  reboot published no ports, ran with msb's default memory, and revived the workload
+  without the container's env or command, so a port-based wait or a connection to a
+  mapped port failed afterwards. The adopted container now carries its own configuration
+  with the host ports from the reuse registry, the same spec the sandbox was created
+  with. Failure diagnostics now list an adopted container's ports too, and on
+  microsandbox its image.
 
 ## [0.7.15] - 2026-10-10
 
