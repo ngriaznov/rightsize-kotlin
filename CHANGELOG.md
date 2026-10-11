@@ -15,6 +15,17 @@ reaches its first tagged release.
   overloads, so existing backends keep working unchanged. `findRunning(name, mounts)`,
   added in 0.7.15 for the copied files alone, is deprecated in its favor.
 
+### Changed
+
+- **On microsandbox, `checkpoint()` of a reuse container no longer removes the rebooted
+  sandbox when the process exits.** `checkpoint()` reboots the sandbox under a new
+  `rz-<run id>-<n>` name, and this library tracked that name for removal at exit, although
+  it never tracks a reuse sandbox otherwise. It now leaves it running, as the Node and Rust
+  libraries do. The reuse registry still names the sandbox from before the checkpoint, so
+  the next equivalent container creates a fresh one, and the rebooted sandbox has to be
+  removed by hand; see [Container
+  Reuse](https://ngriaznov.github.io/rightsize-kotlin/reuse/#checkpointing-a-reuse-container).
+
 ### Fixed
 
 - **`checkpoint()` of an adopted reuse container keeps its ports and memory limit.** On

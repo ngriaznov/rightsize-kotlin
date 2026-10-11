@@ -328,6 +328,42 @@ class MsbCheckpointCaptureTest {
         }
     }
 
+    // A reuse sandbox (keepAlive) stays out of this backend's own-run cleanup at start(), and its
+    // checkpoint reboot, which still comes up under a fresh name, has to stay out of it too:
+    // otherwise close() and the shutdown hook remove it when the process exits. Node and Rust
+    // behave the same way.
+    @Test fun `createCheckpoint of a keepAlive sandbox leaves the rebooted sandbox out of own-run cleanup`(
+        @TempDir tmp: Path,
+    ) {
+        assumeFalse(Platform.current()?.isWindows == true, "POSIX-only fake binary; see doc comment")
+        val marker = Files.createTempFile("rz-keepalive-marker-", "").also { Files.deleteIfExists(it) }
+        val callLog = Files.createTempFile("rz-keepalive-calllog-", "")
+        val missFlag = Files.createTempFile("rz-keepalive-missflag-", "").also { Files.deleteIfExists(it) }
+        val backend = MsbCliBackend.forHost(
+            fakeMsbCaptureLifecycle(marker, callLog, "serve\\0", missFlag),
+            windowsHost = false, checkpointRegistryDir = tmp,
+        )
+        val handle = backend.create(ContainerSpec(
+            name = "rz-reuse-0123456789ab", image = "redis:8.6-alpine", runId = "run1", keepAlive = true,
+            command = listOf("redis-server"), ports = listOf(PortBinding(hostPort = 41500, guestPort = 6379))))
+        backend.start(handle)
+        try {
+            backend.createCheckpoint(handle, "rz-ckpt-keepalive")
+            assertNotEquals("rz-reuse-0123456789ab", handle.id, "the reboot still comes up under a fresh name")
+            assertTrue(handle.id in backend.runningSandboxNames())
+            assertTrue(backend.trackedNames().isEmpty(),
+                "a keepAlive sandbox's reboot must not be tracked for own-run cleanup: ${backend.trackedNames()}")
+
+            Files.writeString(callLog, "")
+            backend.close()
+            assertEquals(emptyList<String>(), nonPollingCalls(callLog),
+                "close() must leave the rebooted keepAlive sandbox alone")
+        } finally {
+            backend.stop(handle)
+            backend.remove(handle)
+        }
+    }
+
     @Test fun `findRunning with a spec returns null for a name not Running`() {
         assumeFalse(Platform.current()?.isWindows == true, "POSIX-only fake binary; see doc comment")
         val marker = Files.createTempFile("rz-adoptspec-none-marker-", "").also { Files.deleteIfExists(it) }

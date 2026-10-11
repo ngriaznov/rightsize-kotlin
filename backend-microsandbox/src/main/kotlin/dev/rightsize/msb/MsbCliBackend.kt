@@ -940,7 +940,10 @@ class MsbCliBackend private constructor(
      * own (its sandbox, if any, is already best-effort `rm`'d before the next attempt even starts)
      * while an UNCLASSIFIED failure (e.g. [CheckpointMissingWorkloadCommandException] after a
      * restore that itself succeeded) leaves its attempt's name tracked there regardless, for this
-     * backend's own shutdown-hook/[close] cleanup net to reap a genuinely live orphan.
+     * backend's own shutdown-hook/[close] cleanup net to reap a genuinely live orphan. A keepAlive
+     * (reuse) sandbox's attempts are never tracked, the same exclusion [start] applies, so its
+     * reboot outlives the process like any reuse sandbox — under the fresh name, which the reuse
+     * registry doesn't know (the Node and Rust libraries do the same).
      *
      * The OLD (pre-checkpoint) name's ledger entry is deliberately left as-is throughout: it is
      * never removed here (this reboot bypasses the public [remove] the ledger's
@@ -1079,9 +1082,10 @@ class MsbCliBackend private constructor(
         // method's own doc for why an unclassified failure (e.g. spawnWorkloadExecChild throwing
         // after a genuinely successful restore) needs this. oldName drops out in the same breath:
         // its sandbox was already `rm`'d above (see [invoke]'s call a few lines up), regardless of
-        // how the reboot below turns out.
+        // how the reboot below turns out. A keepAlive (reuse) sandbox is never tracked, the same
+        // exclusion [start] applies, so close() and the shutdown hook leave its reboot running.
         startedNames -= oldName
-        startedNames += freshName
+        if (!freshSpec.keepAlive) startedNames += freshName
         try {
             handle.attached = restoreRetryingFreshName(handle, freshSpec)
         } catch (e: Exception) {
@@ -1272,7 +1276,7 @@ class MsbCliBackend private constructor(
                 attemptSpec = attemptSpec.copy(name = nextName)
                 Reaper.beforeCreate(this, attemptSpec)
                 handle.spec = attemptSpec
-                startedNames += nextName
+                if (!attemptSpec.keepAlive) startedNames += nextName
             }
         }
     }

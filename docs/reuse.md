@@ -162,6 +162,17 @@ copy mutates the shared sandbox's state, and that mutation is invisible to the i
 two "equivalent" containers that differ only in what one of them copied in at runtime still adopt
 the same sandbox.
 
+## Checkpointing a reuse container
+
+`checkpoint()` works on a reuse-active container. On Docker it commits the running container
+and leaves the container and its name as they were. On microsandbox it stops the sandbox,
+snapshots it and boots it again under a new `rz-<run id>-<n>` name. The registry entry still
+names the `rz-reuse-<hash>` sandbox, which no longer exists, so the next equivalent container
+creates a fresh sandbox instead of adopting the checkpointed one. The rebooted sandbox is still
+a reuse sandbox: it keeps running after the process exits, and nothing removes it. Find it with
+`msb ls` and remove it with `msb stop <name> && msb rm <name>`. The Node and Rust libraries
+behave the same way.
+
 ## Interaction with reaping
 
 `withReuse()` sets `keepAlive = true` on the underlying spec, which is exactly the flag

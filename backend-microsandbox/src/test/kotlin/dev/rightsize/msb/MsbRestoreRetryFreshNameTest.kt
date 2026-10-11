@@ -293,6 +293,29 @@ class MsbRestoreRetryFreshNameTest {
         assertFalse(winningName in backend.runningSandboxNames())
     }
 
+    // The retry walk tracks each fresh name it tries, and a keepAlive (reuse) sandbox must stay out
+    // of own-run cleanup on that path too, the same as on start()'s own first attempt.
+    @Test fun `a keepAlive restore that wins under a fresh name is not tracked for own-run cleanup`() {
+        val marker = Files.createTempFile("rz-marker-", "").also { Files.deleteIfExists(it) }
+        val callLog = Files.createTempFile("rz-calllog-", "")
+        val restoreFailCounter = Files.createTempFile("rz-failcnt-", "").also { Files.writeString(it, "1") }
+        val originalName = "rz-reuse-keepaliveretry"
+        val fakeMsb = fakeMsbRestoreFailsThenSucceeds(marker, callLog, restoreFailCounter, alreadyExists)
+        val backend = MsbCliBackend.forHost(fakeMsb, windowsHost = false)
+        val handle = backend.create(restoreSpec(originalName).copy(keepAlive = true))
+        try {
+            backend.start(handle)
+
+            assertNotEquals(originalName, handle.id, "the already-exists refusal must advance to a fresh name")
+            assertTrue(handle.id in backend.runningSandboxNames())
+            assertTrue(backend.trackedNames().isEmpty(),
+                "neither the failed nor the winning name may be tracked for a keepAlive sandbox: ${backend.trackedNames()}")
+        } finally {
+            backend.stop(handle)
+            backend.remove(handle)
+        }
+    }
+
     // A refused restore is a definite answer about this snapshot: no fresh-name walk, no broker, no
     // agent-relay or state-db retry, no readiness poll. One restore call, then the typed error.
     @Test fun `msb's refusal of missing destination bindings ends in the typed error after exactly one restore call`() {
