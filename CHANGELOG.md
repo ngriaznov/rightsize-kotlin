@@ -27,6 +27,16 @@ reaches its first tagged release.
   with. Failure diagnostics now list an adopted container's ports too, and on
   microsandbox its image.
 
+- **Reuse keeps a container's UDP ports.** The reuse registry entry recorded only TCP
+  host ports, so a container with `withExposedUdpPorts` that adopted a running sandbox
+  had no UDP mapping: `getMappedUdpPort` failed, and a `checkpoint()` reboot on
+  microsandbox did not publish the UDP ports again. The entry now records them under
+  `udpPorts`, the key the Node and Rust libraries already write and read, and an adopted
+  container maps and reserves them. A UDP-exposing reuse sandbox started by an earlier
+  release has no such entry, so the first start after upgrading replaces it with a fresh
+  one. `getMappedUdpPort` on a stopped reuse container now fails the way
+  `getMappedPort` does, instead of returning the old port.
+
 ## [0.7.15] - 2026-10-10
 
 ### Changed

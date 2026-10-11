@@ -285,6 +285,89 @@ class GenericContainerReuseTest {
         } finally { c.stop() }
     }
 
+    // --- UDP ports (withExposedUdpPorts) ---
+
+    @Test fun `a fresh reuse container records its UDP host ports in the registry`(@TempDir tmp: Path) {
+        val backend = ReuseFakeBackend()
+        val c = reuseContainer(backend, tmp).withExposedUdpPorts(5353)
+        c.start()
+        val identity = ReuseIdentitySpec("redis:8.6-alpine", emptyMap(), emptyList(), listOf(6379), null,
+            emptyList(), exposedUdpPorts = listOf(5353))
+        val record = ReuseRegistry(tmp).read(ReuseIdentity.hash(identity))
+        assertNotNull(record, "the fresh create must write a registry entry")
+        assertEquals(mapOf(5353 to c.getMappedUdpPort(5353)), record!!.udpPorts)
+        c.stop()
+    }
+
+    @Test fun `an adopted container maps, reserves and hands the backend the registry's UDP host ports`(@TempDir tmp: Path) {
+        val backend = ReuseFakeBackend()
+        val identity = ReuseIdentitySpec("redis:8.6-alpine", emptyMap(), emptyList(), listOf(6379), null,
+            emptyList(), exposedUdpPorts = listOf(5353))
+        val hash = ReuseIdentity.hash(identity)
+        val name = ReuseIdentity.name(hash)
+        backend.runningNames += name
+        ReuseRegistry(tmp).write(hash, ReuseRecord(name, "redis:8.6-alpine", mapOf(6379 to 45202),
+            java.time.Instant.now().toString(), "fake", udpPorts = mapOf(5353 to 45203)))
+
+        val c = reuseContainer(backend, tmp).withExposedUdpPorts(5353)
+        c.start()
+        try {
+            assertTrue(backend.created.isEmpty(), "must adopt, not create a fresh sandbox")
+            assertEquals(45203, c.getMappedUdpPort(5353))
+            assertTrue(45203 in FreePorts.issuedView(),
+                "an adopted sandbox's UDP host port must be reserved so this process never re-issues it")
+            assertTrue(PortBinding(hostPort = 45203, guestPort = 5353, protocol = PortProtocol.UDP) in
+                backend.adoptSpecs.single().ports, "the adopted spec must publish the UDP port too")
+        } finally { c.stop() }
+    }
+
+    @Test fun `a second equivalent UDP-exposing instance adopts with the spec the first created`(@TempDir tmp: Path) {
+        val backend = ReuseFakeBackend()
+        val first = reuseContainer(backend, tmp).withExposedUdpPorts(5353)
+        first.start()
+        val udpPort = first.getMappedUdpPort(5353)
+        first.stop()   // leaves it running per reuse semantics
+
+        val second = reuseContainer(backend, tmp).withExposedUdpPorts(5353)
+        second.start()
+
+        assertEquals(1, backend.created.size, "the second instance must adopt, not create")
+        assertEquals(udpPort, second.getMappedUdpPort(5353))
+        assertEquals(backend.created.single(), backend.adoptSpecs.single())
+        second.stop()
+    }
+
+    // No wait strategy looks at UDP ports, so a record that doesn't say where an exposed UDP port is
+    // published (one written by an earlier release, or by hand) would adopt a sandbox this container
+    // can't reach over UDP. It is treated like any other unusable record: replaced by a fresh sandbox.
+    @Test fun `a record missing an exposed UDP port is not adopted - the sandbox is replaced`(@TempDir tmp: Path) {
+        val backend = ReuseFakeBackend()
+        val identity = ReuseIdentitySpec("redis:8.6-alpine", emptyMap(), emptyList(), listOf(6379), null,
+            emptyList(), exposedUdpPorts = listOf(5353))
+        val hash = ReuseIdentity.hash(identity)
+        val name = ReuseIdentity.name(hash)
+        backend.runningNames += name
+        ReuseRegistry(tmp).write(hash, ReuseRecord(name, "redis:8.6-alpine", mapOf(6379 to 45204),
+            java.time.Instant.now().toString(), "fake"))
+
+        val c = reuseContainer(backend, tmp).withExposedUdpPorts(5353)
+        c.start()
+        try {
+            assertEquals(listOf(name), backend.removedByName, "the unusable sandbox must be removed first")
+            assertEquals(name, backend.created.single().name, "a fresh sandbox must be created under the same name")
+            assertEquals(mapOf(5353 to c.getMappedUdpPort(5353)), ReuseRegistry(tmp).read(hash)!!.udpPorts)
+        } finally { c.stop() }
+    }
+
+    @Test fun `stop on a reuse container clears its UDP mapping too`(@TempDir tmp: Path) {
+        val backend = ReuseFakeBackend()
+        val c = reuseContainer(backend, tmp).withExposedUdpPorts(5353)
+        c.start()
+        c.stop()
+        val e = assertThrows(IllegalStateException::class.java) { c.getMappedUdpPort(5353) }
+        assertTrue(e.message!!.contains("not running"), "should report the not-running error: ${e.message}")
+    }
+
     // A backend written against 0.7.15 overrides findRunning(name, mounts), not findRunning(spec).
     // The spec overload's default still reaches it, with the adopter's mounts.
     @Test fun `a backend that only overrides the deprecated findRunning(name, mounts) still adopts with the mounts`(@TempDir tmp: Path) {

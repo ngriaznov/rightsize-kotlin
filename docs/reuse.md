@@ -75,6 +75,10 @@ identity, name, and mapped ports are written to `<cache-dir>/reuse/<hash>.json` 
  "createdIso":"2026-07-11T12:00:00Z","backend":"docker"}
 ```
 
+`ports` holds the TCP mappings. A container with `withExposedUdpPorts` also gets a
+`udpPorts` object of the same shape after `backend`; the key is left out when there are none.
+All three libraries read and write this format.
+
 A later `start()` of an equivalent container:
 
 1. **Registry file exists** — verify the sandbox is actually running (a real backend query,
@@ -84,7 +88,8 @@ A later `start()` of an equivalent container:
    backend is handed the spec this container would have created the sandbox with (its own
    configuration plus the recorded host ports), so a later `checkpoint()`, which reboots the
    sandbox on microsandbox, keeps its published ports, memory limit and copied files. Failure
-   (not running, or the wait fails, or the registry file is unparseable): best-effort remove
+   (not running, or the wait fails, or the registry file is unparseable, or it has no host
+   port for one of the container's UDP ports): best-effort remove
    the stale sandbox and registry entry, then fall through to a fresh create as if there had
    never been a registry hit.
 2. **No registry file** — allocate host ports normally, create under the reuse name, wait,

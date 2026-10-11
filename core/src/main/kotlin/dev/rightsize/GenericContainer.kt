@@ -769,6 +769,7 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
             // (there never was one; keepAlive specs are never appended in the first place).
             reuseActive = false
             mappedPorts = emptyMap()
+            mappedUdpPorts = emptyMap()
             return
         }
         runCatching { backend.stop(h) }
@@ -855,26 +856,33 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
     /**
      * Verifies [record]'s sandbox is actually running, then re-runs this container's own wait
      * strategy against its recorded ports (bounded by the normal startup budget) before trusting
-     * it as this instance's running container. Never throws: any disqualifier (not running, wait
-     * failure) leaves this instance exactly as it was before the call and returns `false`, so the
-     * caller can fall back to a fresh create.
+     * it as this instance's running container. Never throws: any disqualifier (a record without
+     * a host port for every exposed UDP port, not running, wait failure) leaves this instance
+     * exactly as it was before the call and returns `false`, so the caller can fall back to a
+     * fresh create.
      */
     private fun tryAdopt(record: ReuseRecord): Boolean {
+        // No wait strategy looks at UDP ports, so nothing later would notice a record (written by
+        // an earlier release, which recorded none, or by hand) that doesn't say where one is
+        // published; the adopted container would hand out no mapping for it. Same rule as the
+        // Rust library's adopt path.
+        if (!exposedUdpPorts.all { it in record.udpPorts }) return false
         // The spec this container would have created the sandbox with, with the registry's host
         // ports: the identity hash already proved the running sandbox was started from an
         // equivalent one, and a later checkpoint() of this adopted container reboots it from the
-        // handle's spec (published ports, memory limit, copied files, env, command). The registry
-        // records no UDP host ports, so none are on it. A spec that can't be built (a record
-        // missing a port customizeSpec maps) is a record this container can't adopt.
-        val spec = runCatching { buildReuseSpec(record.name, record.ports, emptyMap()) }.getOrNull() ?: return false
+        // handle's spec (published ports, memory limit, copied files, env, command). A spec that
+        // can't be built (a record missing a port customizeSpec maps) is a record this container
+        // can't adopt.
+        val spec = runCatching { buildReuseSpec(record.name, record.ports, record.udpPorts) }.getOrNull() ?: return false
         val h = runCatching { backend.findRunning(spec) }.getOrNull() ?: return false
         handle = h
         mappedPorts = record.ports
+        mappedUdpPorts = record.udpPorts
         // The adopted sandbox's host ports are already bound by that (possibly foreign) process —
         // register them with this process's own allocator so it never hands the same host port to
         // an unrelated sibling container started later in this run. Never released: the ports stay
         // genuinely occupied by the still-running sandbox for as long as it lives.
-        record.ports.values.forEach(FreePorts::reserve)
+        (record.ports.values + record.udpPorts.values).forEach(FreePorts::reserve)
         reuseActive = true
         return try {
             waitStrategy.waitUntilReady(waitTarget())
@@ -882,7 +890,7 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
             LiveContainers.register(h, backend, host)
             true
         } catch (e: Exception) {
-            handle = null; mappedPorts = emptyMap(); reuseActive = false
+            handle = null; mappedPorts = emptyMap(); mappedUdpPorts = emptyMap(); reuseActive = false
             false
         }
     }
@@ -945,7 +953,8 @@ open class GenericContainer<SELF : GenericContainer<SELF>>(private val image: St
             LiveContainers.register(h, backend, host)
             registry.write(hash, ReuseRecord(
                 name = name, image = image, ports = mappedPorts,
-                createdIso = Instant.now().toString(), backend = canonicalBackendId(backend.name)))
+                createdIso = Instant.now().toString(), backend = canonicalBackendId(backend.name),
+                udpPorts = mappedUdpPorts))
             return
         }
         throw IllegalStateException(
