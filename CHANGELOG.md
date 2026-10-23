@@ -7,6 +7,10 @@ reaches its first tagged release.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.7.16] - 2026-10-23
+
 ### Added
 
 - **`SandboxBackend.findRunning(spec)`**, an SPI overload that reuse's adopt path now
@@ -1126,7 +1130,8 @@ Initial public release.
   exactly once; any other failure, or a second failure after the heal,
   propagates unchanged.
 
-[Unreleased]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.15...HEAD
+[Unreleased]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.16...HEAD
+[0.7.16]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.15...v0.7.16
 [0.7.15]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.14...v0.7.15
 [0.7.14]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.13...v0.7.14
 [0.7.13]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.12...v0.7.13
