@@ -254,7 +254,7 @@ copied files are not part of a checkpoint on either backend.
   restored.start()
   ```
 
-  On microsandbox, a checkpoint taken by this release (msb 0.7.8) refuses to restore without
+  On microsandbox, a checkpoint taken by msb 0.7.8 or later refuses to restore without
   them: `start()` throws `CheckpointMissingCopiedFilesException`, whose message names the sandbox
   and the checkpoint ref and includes msb's output listing the missing guest paths. It is not
   retried. A checkpoint taken with an older release restores with the file empty instead, and

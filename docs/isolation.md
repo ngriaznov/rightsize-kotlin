@@ -84,7 +84,9 @@ What this does and doesn't cover:
 
 - **msb-only.** On the microsandbox backend, `withNetworkDisabled()` emits `--net private`.
   Published ports keep serving, and links to siblings on a private `Network` keep working —
-  only outbound connections to the public internet fail.
+  only outbound connections to the public internet are blocked. Most fail outright; a plain
+  HTTP request on port 80 instead gets an HTTP 403 with a JSON body, answered by microsandbox
+  itself (msb 0.7.9 and later). Nothing leaves the sandbox either way.
 - **Docker ignores it entirely.** `withNetworkDisabled()` on the Docker backend is a no-op: the
   container runs with normal networking, egress and all. There's no portable way to block
   egress on Docker while still keeping published ports reachable, so the flag is silently

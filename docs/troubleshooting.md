@@ -79,7 +79,7 @@ write block is exactly what the flag is for. See
 
 **Cause:** The container the checkpoint was taken from had files added with
 `withCopyFileToContainer`. Those are bind mounts of host files, not part of the checkpoint, and
-msb 0.7.8 refuses to restore without them. The guest paths are in the message.
+msb 0.7.8 and later refuse to restore without them. The guest paths are in the message.
 
 **Fix:** Add the same files again with `withCopyFileToContainer` on the container you start from
 the checkpoint, using the guest paths from the message. The host files can be different copies, but

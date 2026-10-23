@@ -17,6 +17,21 @@ reaches its first tagged release.
 
 ### Changed
 
+- **The pinned msb is now 0.7.9** (was 0.7.8). The CLI surface this library drives is
+  unchanged, and 0.7.9 adds no state-database migration, so it shares an `MSB_HOME` with
+  the msb 0.7.8 that rightsize 0.7.15 provisions. Guests run Linux 6.12.113. Two msb
+  changes are visible through this library:
+
+  - A plain HTTP request on port 80 that a container's network policy blocks (for
+    example the public internet from a container with `withNetworkDisabled()`) now gets an
+    HTTP 403 with a JSON body, answered by msb itself, instead of a reset connection.
+    Other blocked connections still fail outright, and nothing leaves the sandbox either
+    way.
+  - The msb CLI now includes msb's cloud backend. On a machine where an msb cloud
+    profile is selected (`MSB_BACKEND=cloud`, `MSB_PROFILE`, or an active profile in
+    `~/.microsandbox/config.json`), this library's sandboxes would run there instead of
+    failing; clear that selection, or set `MSB_BACKEND=local`, to keep them local.
+
 - **On microsandbox, `checkpoint()` of a reuse container no longer removes the rebooted
   sandbox when the process exits.** `checkpoint()` reboots the sandbox under a new
   `rz-<run id>-<n>` name, and this library tracked that name for removal at exit, although
