@@ -7,7 +7,14 @@ reaches its first tagged release.
 
 ## [Unreleased]
 
-Nothing yet.
+### Changed
+
+- **The pinned msb is now 0.7.10** (was 0.7.9). The CLI surface this library drives is
+  unchanged, and 0.7.10 adds no state-database migration, so it shares an `MSB_HOME` with
+  the msb 0.7.9 that rightsize 0.7.16 provisions. On Linux and macOS, msb no longer leaves
+  a small directory in the system temp directory for every sandbox it boots: it now keeps
+  it in the sandbox's own directory and removes it when the sandbox exits. Directories
+  left by earlier msb versions are not cleaned up.
 
 ## [0.7.16] - 2026-10-23
 
