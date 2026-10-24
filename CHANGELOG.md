@@ -29,7 +29,7 @@ Nothing yet.
   in the stream, or a daemon 5xx, now gets one retry after 2 seconds; a 4xx (for example,
   a repository that does not exist) fails at once. The final error names the image,
   carries Docker's own message (also when the stream sends only `errorDetail`, which
-  docker-java reported as `null`), and says whether the pull was retried. A failed pull
+  docker-java reported as `null`), and says so when the pull was retried. A failed pull
   now surfaces as `IllegalStateException` with the docker-java exception as its cause;
   before, it was the docker-java exception itself.
 
