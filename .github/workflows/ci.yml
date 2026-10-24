@@ -73,6 +73,19 @@ jobs:
             echo "image-cache corruption detected — purging before save"
             rm -rf ~/.microsandbox/cache
           fi
+      # How often the backend's one retry of an msb boot whose sandbox process exited before the
+      # agent relay came up fired in this job, and how it ended. The backend writes those lines to
+      # stderr, which Gradle keeps in the XML test reports rather than on the console, so they are
+      # read from there. Always emits the annotation, zeros included, and never fails the job.
+      - name: Count agent-relay retries
+        if: always()
+        shell: bash
+        run: |
+          lines=$(grep -h "agent-relay retry:" */build/test-results/integrationTest/*.xml 2>/dev/null || true)
+          fired=$(echo "$lines" | grep -c "(attempt 1 of 2)" || true)
+          booted=$(echo "$lines" | grep -c "booted on attempt 2" || true)
+          gaveup=$(echo "$lines" | grep -c "(attempt 2 of 2); giving up" || true)
+          echo "::notice title=agent-relay retry::fired $fired, booted on attempt 2 $booted, gave up $gaveup"
       - uses: actions/cache/save@v4
         if: always()
         with:
@@ -133,6 +146,19 @@ jobs:
             echo "image-cache corruption detected — purging before save"
             rm -rf ~/.microsandbox/cache
           fi
+      # How often the backend's one retry of an msb boot whose sandbox process exited before the
+      # agent relay came up fired in this job, and how it ended. The backend writes those lines to
+      # stderr, which Gradle keeps in the XML test reports rather than on the console, so they are
+      # read from there. Always emits the annotation, zeros included, and never fails the job.
+      - name: Count agent-relay retries
+        if: always()
+        shell: bash
+        run: |
+          lines=$(grep -h "agent-relay retry:" */build/test-results/integrationTest/*.xml 2>/dev/null || true)
+          fired=$(echo "$lines" | grep -c "(attempt 1 of 2)" || true)
+          booted=$(echo "$lines" | grep -c "booted on attempt 2" || true)
+          gaveup=$(echo "$lines" | grep -c "(attempt 2 of 2); giving up" || true)
+          echo "::notice title=agent-relay retry::fired $fired, booted on attempt 2 $booted, gave up $gaveup"
       - uses: actions/cache/save@v4
         if: always()
         with:

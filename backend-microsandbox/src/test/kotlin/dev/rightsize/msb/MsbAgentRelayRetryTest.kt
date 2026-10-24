@@ -15,8 +15,10 @@ import java.nio.file.StandardOpenOption
  * restore, brokered restores (stubbed [RestoreBroker]) with and without the broker's direct
  * fallback, and [MsbCliBackend.createCheckpoint]'s reboot. Each retry must `msb rm -f` the failed
  * name and boot again under the SAME name; a second failure is an error, not a third try; a
- * crash exit with the same sentence is never retried. The retry's 2s delay is not injectable, so
- * the tests that retry really wait for it.
+ * crash exit with the same sentence is never retried. The first tests go through the public
+ * constructor, so they really wait the retry's 2s delay; the diagnostics tests at the end shrink
+ * it, read back the notes the retry writes to stderr, and check what the fake saw of
+ * `msb logs --source system`.
  */
 class MsbAgentRelayRetryTest {
 
@@ -29,6 +31,9 @@ class MsbAgentRelayRetryTest {
      * only works if the backend removed the failed sandbox first. `run` writes the marker and
      * blocks while it exists (attached mode), `restore` writes it and exits, `exec` blocks on it,
      * `ls` reports the marked name Running, `stop` clears it. Every call is appended to a log.
+     * `logs` is numbered like boots: capture N prints `syslog-N.txt` (nothing when absent), exits
+     * with `logs-exit-N` after an error line, or hangs when `logs-hang-N` exists; `rm -f` exits
+     * with `rmf-exit` when that exists (after clearing the row, as msb's failures leave it).
      *
      * The script text uses `§` where the shell needs `$`, since a raw string would otherwise
      * read `$x` as a Kotlin template.
@@ -39,6 +44,7 @@ class MsbAgentRelayRetryTest {
         private val marker = dir.resolve("marker")
         private val callLog = dir.resolve("calls.log")
         private val boots = dir.resolve("boots")
+        private val logCaptures = dir.resolve("logs-count")
 
         init {
             Files.writeString(callLog, "")
@@ -90,9 +96,26 @@ class MsbAgentRelayRetryTest {
                 |    ;;
                 |  stop) rm -f "$marker"; exit 0 ;;
                 |  rm)
+                |    force=0
                 |    for a in "§@"; do
-                |      case "§a" in -*) ;; *) rm -f "$dir/row-§a" ;; esac
+                |      case "§a" in -f) force=1 ;; -*) ;; *) rm -f "$dir/row-§a" ;; esac
                 |    done
+                |    if [ "§force" = 1 ] && [ -f "$dir/rmf-exit" ]; then
+                |      echo "error: rm failed" 1>&2
+                |      exit §(cat "$dir/rmf-exit")
+                |    fi
+                |    exit 0
+                |    ;;
+                |  logs)
+                |    k=§(cat "$logCaptures" 2>/dev/null || echo 0)
+                |    k=§((k + 1))
+                |    echo "§k" > "$logCaptures"
+                |    if [ -f "$dir/logs-hang-§k" ]; then exec sleep 30; fi
+                |    if [ -f "$dir/logs-exit-§k" ]; then
+                |      echo "error: sandbox not found: §1" 1>&2
+                |      exit §(cat "$dir/logs-exit-§k")
+                |    fi
+                |    if [ -f "$dir/syslog-§k.txt" ]; then cat "$dir/syslog-§k.txt"; fi
                 |    exit 0
                 |    ;;
                 |  snapshot)
@@ -118,6 +141,29 @@ class MsbAgentRelayRetryTest {
             Files.writeString(dir.resolve("fail-$n.txt"), output + "\n")
         }
 
+        /** The system log capture number [n] (1-based) prints. */
+        fun systemLog(n: Int, text: String) {
+            Files.writeString(dir.resolve("syslog-$n.txt"), text + "\n")
+        }
+
+        /** Capture number [n] fails with exit code [code]. */
+        fun failLogs(n: Int, code: Int) {
+            Files.writeString(dir.resolve("logs-exit-$n"), "$code\n")
+        }
+
+        /** Capture number [n] never finishes. */
+        fun hangLogs(n: Int) {
+            Files.writeString(dir.resolve("logs-hang-$n"), "")
+        }
+
+        /** `msb rm -f` exits with [code] (and still clears the row). */
+        fun failRmForce(code: Int) {
+            Files.writeString(dir.resolve("rmf-exit"), "$code\n")
+        }
+
+        /** How many `msb logs` captures the fake served. */
+        fun logCaptureCount(): Int = runCatching { Files.readString(logCaptures).trim().toInt() }.getOrDefault(0)
+
         /** Lets a test stub record its own calls in the same ordered log. */
         fun log(line: String) {
             Files.writeString(callLog, line + "\n", StandardOpenOption.APPEND)
@@ -126,12 +172,14 @@ class MsbAgentRelayRetryTest {
         fun bootCount(): Int = runCatching { Files.readString(boots).trim().toInt() }.getOrDefault(0)
 
         /** The calls that matter for ordering, as `run NAME`, `restore NAME`, `rm NAME`,
-         * `rm -f NAME` or a stub's own `broker NAME`; `ls`/`exec`/`stop`/... are left out. */
-        fun events(): List<String> = Files.readAllLines(callLog).mapNotNull { line ->
+         * `rm -f NAME` or a stub's own `broker NAME`; `ls`/`exec`/`stop`/... are left out, and
+         * `logs NAME` only when [includeLogs] is set. */
+        fun events(includeLogs: Boolean = false): List<String> = Files.readAllLines(callLog).mapNotNull { line ->
             val parts = line.trim().split(" ")
             when (parts.firstOrNull()) {
                 "run", "restore" -> "${parts[0]} ${parts[parts.indexOf("--name") + 1]}"
                 "rm", "broker" -> line.trim()
+                "logs" -> if (includeLogs) "logs ${parts[1]}" else null
                 else -> null
             }
         }
@@ -148,6 +196,20 @@ class MsbAgentRelayRetryTest {
     )
 
     private val accessDenied = "error: io error: Access is denied. (os error 5)"
+
+    /** Runs [block] with `System.err` swapped for a buffer, and returns its result with what was written. */
+    private fun <T> captureStderr(block: () -> T): Pair<T, String> {
+        val real = System.err
+        val buffer = java.io.ByteArrayOutputStream()
+        System.setErr(java.io.PrintStream(buffer, true, "UTF-8"))
+        try {
+            val result = block()
+            System.err.flush()
+            return result to buffer.toString("UTF-8")
+        } finally {
+            System.setErr(real)
+        }
+    }
 
     /** Stops and removes [handle], tolerating whatever state a failed start left behind. */
     private fun cleanUp(backend: MsbCliBackend, handle: SandboxHandle) {
@@ -185,14 +247,22 @@ class MsbAgentRelayRetryTest {
         val backend = MsbCliBackend(fake.msb)
         val handle = backend.create(runSpec(name))
         try {
-            val e = assertThrows(IllegalStateException::class.java) { backend.start(handle) }
+            // The only test that reads the production stderr writer (the public constructor's
+            // default): every other test injects its own.
+            val (e, stderr) = captureStderr {
+                assertThrows(IllegalStateException::class.java) { backend.start(handle) }
+            }
 
+            assertTrue("${note}msb run for sandbox $name exited before its agent relay came up (attempt 1 of 2); " in stderr,
+                "the real stderr must carry the attempt-1 line: $stderr")
+            assertTrue("${note}msb run for sandbox $name exited before its agent relay came up again " +
+                "(attempt 2 of 2); giving up" in stderr, "the real stderr must carry the giving-up line: $stderr")
             val message = e.message!!
             assertTrue(name in message, "must name the sandbox: $message")
             assertTrue("agent relay came up" in message && "both attempts" in message,
                 "must say the sandbox process exited before its agent relay on both attempts: $message")
-            assertTrue("(exit status: 0) before agent relay became available" in message,
-                "must carry the last attempt's output: $message")
+            assertTrue("first attempt:\n${AgentRelayCaptures.attachedRun}\nafter retry:\n${AgentRelayCaptures.unixCleanExit}"
+                in message, "must carry both attempts' output, first then retry: $message")
             assertEquals(listOf("run $name", "rm -f $name", "run $name"), fake.events(),
                 "exactly two boots and one rm -f, no third attempt")
             assertEquals(2, fake.bootCount())
@@ -405,6 +475,419 @@ class MsbAgentRelayRetryTest {
             backend.start(handle)
 
             assertEquals(listOf("run $name", "run $name", "rm -f $name", "run $name"), fake.events())
+            assertTrue(name in backend.runningSandboxNames())
+        } finally {
+            cleanUp(backend, handle)
+        }
+    }
+
+    // The notes the retry writes to stderr (see MsbCliBackend.bootOnce): the failed attempt's
+    // `msb logs --source system` and the retry's outcome. Every test below injects the writer and
+    // a shrunk delay, so nothing waits the real 2s or reaches the real stderr.
+
+    private class Notes {
+        val writes = mutableListOf<String>()
+        val writer: (String) -> Unit = { writes += it }
+    }
+
+    private fun diagnosticBackend(
+        fake: FakeMsb, notes: Notes, windowsHost: Boolean = false, delayMs: Long = 50, logTimeoutSec: Long = 10,
+    ) = MsbCliBackend.forHost(
+        fake.msb, windowsHost = windowsHost, agentRelayRetryDelayMs = delayMs,
+        agentRelayLogTimeoutSec = logTimeoutSec, stderrWriter = notes.writer)
+
+    private val note = "rightsize: agent-relay retry: "
+
+    /** The attempt-1 line and the log block that follows it, as one write. */
+    private fun attempt1Note(command: String, name: String, rm: String, delay: String, logBlock: String) =
+        "${note}msb $command for sandbox $name exited before its agent relay came up (attempt 1 of 2); " +
+            "'msb rm -f $name' exited $rm; retrying in $delay\n" +
+            "${note}'msb logs $name --source system' after attempt 1 $logBlock"
+
+    @Test fun `a retry that works writes the failed attempt's system log, read before rm -f, then the outcome`() {
+        posixOnly()
+        val fake = FakeMsb()
+        fake.failBoot(1, AgentRelayCaptures.attachedRun)
+        fake.systemLog(1, "kernel: booting\nruntime: spawned the sandbox process\nruntime: sandbox process exited")
+        val name = "rz-relay-diag-run"
+        val notes = Notes()
+        val backend = diagnosticBackend(fake, notes)
+        val handle = backend.create(runSpec(name))
+        try {
+            backend.start(handle)
+
+            assertEquals(listOf("run $name", "logs $name", "rm -f $name", "run $name"), fake.events(includeLogs = true),
+                "the system log is read once, before the rm -f that deletes it")
+            assertEquals(1, fake.logCaptureCount())
+            assertEquals(
+                listOf(
+                    attempt1Note("run", name, "0", "50 ms",
+                        "(last 3 of 3 lines):\n" +
+                            "  kernel: booting\n" +
+                            "  runtime: spawned the sandbox process\n" +
+                            "  runtime: sandbox process exited\n"),
+                    "${note}msb run for sandbox $name booted on attempt 2\n",
+                ),
+                notes.writes,
+                "one write for the attempt-1 line with its log block, one for the outcome, nothing else")
+            assertTrue(name in backend.runningSandboxNames())
+        } finally {
+            cleanUp(backend, handle)
+        }
+    }
+
+    @Test fun `a restore retry names restore in its notes`() {
+        posixOnly()
+        val fake = FakeMsb()
+        fake.failBoot(1, AgentRelayCaptures.powerShellDecorated)
+        fake.systemLog(1, "runtime: restore child exited")
+        val name = "rz-relay-diag-restore"
+        val notes = Notes()
+        val backend = diagnosticBackend(fake, notes)
+        val handle = backend.create(restoreSpec(name))
+        try {
+            backend.start(handle)
+
+            assertEquals(listOf("restore $name", "logs $name", "rm -f $name", "restore $name"),
+                fake.events(includeLogs = true))
+            assertEquals(
+                listOf(
+                    attempt1Note("restore", name, "0", "50 ms", "(last 1 of 1 lines):\n  runtime: restore child exited\n"),
+                    "${note}msb restore for sandbox $name booted on attempt 2\n",
+                ),
+                notes.writes)
+        } finally {
+            cleanUp(backend, handle)
+        }
+    }
+
+    @Test fun `two relay failures write both system logs, and the final error carries both attempts' output but no log text`() {
+        posixOnly()
+        val fake = FakeMsb()
+        fake.failBoot(1, AgentRelayCaptures.attachedRun)
+        fake.failBoot(2, AgentRelayCaptures.unixCleanExit)
+        // Words GenericContainer's classifiers match on: if they reached an exception message, a
+        // guest log line would start its port-rename loop.
+        fake.systemLog(1, "guest: first boot\nguest: listen tcp :8080: bind: address already in use")
+        fake.systemLog(2, "guest: second boot\nguest: port 5432 already allocated\nguest: sandbox already exists")
+        val name = "rz-relay-diag-twice"
+        val notes = Notes()
+        val backend = diagnosticBackend(fake, notes)
+        val handle = backend.create(runSpec(name))
+        try {
+            val e = assertThrows(IllegalStateException::class.java) { backend.start(handle) }
+
+            assertEquals(listOf("run $name", "logs $name", "rm -f $name", "run $name", "logs $name"),
+                fake.events(includeLogs = true), "one capture before rm -f, one after attempt 2, no third boot")
+            assertEquals(2, fake.logCaptureCount())
+            assertEquals(
+                listOf(
+                    attempt1Note("run", name, "0", "50 ms",
+                        "(last 2 of 2 lines):\n  guest: first boot\n  guest: listen tcp :8080: bind: address already in use\n"),
+                    "${note}msb run for sandbox $name exited before its agent relay came up again " +
+                        "(attempt 2 of 2); giving up\n" +
+                        "${note}'msb logs $name --source system' after attempt 2 (last 3 of 3 lines):\n" +
+                        "  guest: second boot\n  guest: port 5432 already allocated\n  guest: sandbox already exists\n",
+                ),
+                notes.writes)
+            assertEquals(
+                "msb run for sandbox $name: msb's sandbox process exited before its agent relay came up on " +
+                    "both attempts (the retry ran after `msb rm -f` of the failed sandbox and a short pause). " +
+                    "msb's system log for each attempt was written to stderr.\n" +
+                    "first attempt:\n${AgentRelayCaptures.attachedRun}\n" +
+                    "after retry:\n${AgentRelayCaptures.unixCleanExit}",
+                e.message)
+            generateSequence<Throwable>(e) { it.cause }.forEach { t ->
+                for (phrase in listOf("address already in use", "already allocated", "already exists", "guest:")) {
+                    assertFalse(phrase in t.message.orEmpty(), "system log text leaked into ${t.javaClass}: ${t.message}")
+                }
+            }
+        } finally {
+            cleanUp(backend, handle)
+        }
+    }
+
+    @Test fun `a capture that exits non-zero is reported as unreadable and the retry still happens`() {
+        posixOnly()
+        val fake = FakeMsb()
+        fake.failBoot(1, AgentRelayCaptures.attachedRun)
+        fake.failLogs(1, 1)
+        val name = "rz-relay-diag-logs-fail"
+        val notes = Notes()
+        val backend = diagnosticBackend(fake, notes)
+        val handle = backend.create(runSpec(name))
+        try {
+            backend.start(handle)
+
+            assertEquals(listOf("run $name", "logs $name", "rm -f $name", "run $name"), fake.events(includeLogs = true))
+            assertEquals(
+                listOf(
+                    attempt1Note("run", name, "0", "50 ms",
+                        "could not be read (exit code 1: error: sandbox not found: $name)\n"),
+                    "${note}msb run for sandbox $name booted on attempt 2\n",
+                ),
+                notes.writes)
+            assertTrue(name in backend.runningSandboxNames())
+        } finally {
+            cleanUp(backend, handle)
+        }
+    }
+
+    @Test fun `a capture that times out is reported as unreadable and the retry still happens`() {
+        posixOnly()
+        val fake = FakeMsb()
+        fake.failBoot(1, AgentRelayCaptures.attachedRun)
+        fake.hangLogs(1)
+        val name = "rz-relay-diag-logs-hang"
+        val notes = Notes()
+        val backend = diagnosticBackend(fake, notes, logTimeoutSec = 1)
+        val handle = backend.create(runSpec(name))
+        try {
+            backend.start(handle)
+
+            assertEquals(listOf("run $name", "logs $name", "rm -f $name", "run $name"), fake.events(includeLogs = true))
+            assertEquals(2, notes.writes.size)
+            val header = "${note}'msb logs $name --source system' after attempt 1 could not be read (" +
+                "msb logs $name --source system --tail 1000 timed out after 1s and was force-killed"
+            assertTrue(header in notes.writes[0], "the timeout is named: ${notes.writes[0]}")
+            assertEquals("${note}msb run for sandbox $name booted on attempt 2\n", notes.writes[1])
+            assertTrue(name in backend.runningSandboxNames())
+        } finally {
+            cleanUp(backend, handle)
+        }
+    }
+
+    @Test fun `a capture with no output is a one-line header and the retry still happens`() {
+        posixOnly()
+        val fake = FakeMsb()
+        fake.failBoot(1, AgentRelayCaptures.attachedRun)
+        val name = "rz-relay-diag-logs-empty"
+        val notes = Notes()
+        val backend = diagnosticBackend(fake, notes)
+        val handle = backend.create(runSpec(name))
+        try {
+            backend.start(handle)
+
+            assertEquals(listOf("run $name", "logs $name", "rm -f $name", "run $name"), fake.events(includeLogs = true))
+            assertEquals(
+                listOf(
+                    attempt1Note("run", name, "0", "50 ms", "produced no output\n"),
+                    "${note}msb run for sandbox $name booted on attempt 2\n",
+                ),
+                notes.writes)
+        } finally {
+            cleanUp(backend, handle)
+        }
+    }
+
+    @Test fun `a failed capture after attempt 2 still ends in the final error`() {
+        posixOnly()
+        val fake = FakeMsb()
+        fake.failBoot(1, AgentRelayCaptures.attachedRun)
+        fake.failBoot(2, AgentRelayCaptures.attachedRun)
+        fake.failLogs(2, 7)
+        val name = "rz-relay-diag-twice-logs-fail"
+        val notes = Notes()
+        val backend = diagnosticBackend(fake, notes)
+        val handle = backend.create(runSpec(name))
+        try {
+            val e = assertThrows(IllegalStateException::class.java) { backend.start(handle) }
+
+            assertTrue("first attempt:\n" in e.message!! && "after retry:\n" in e.message!!, e.message)
+            assertEquals(
+                "${note}msb run for sandbox $name exited before its agent relay came up again " +
+                    "(attempt 2 of 2); giving up\n" +
+                    "${note}'msb logs $name --source system' after attempt 2 " +
+                    "could not be read (exit code 7: error: sandbox not found: $name)\n",
+                notes.writes[1])
+        } finally {
+            cleanUp(backend, handle)
+        }
+    }
+
+    @Test fun `a long system log is cut to its last 200 lines`() {
+        posixOnly()
+        val fake = FakeMsb()
+        fake.failBoot(1, AgentRelayCaptures.attachedRun)
+        fake.systemLog(1, (1..250).joinToString("\n") { "log line $it" })
+        val name = "rz-relay-diag-tail"
+        val notes = Notes()
+        val backend = diagnosticBackend(fake, notes)
+        val handle = backend.create(runSpec(name))
+        try {
+            backend.start(handle)
+
+            val lines = notes.writes[0].lines().dropLastWhile { it.isEmpty() }
+            assertEquals("${note}'msb logs $name --source system' after attempt 1 (last 200 of 250 lines):", lines[1])
+            assertEquals(2 + 200, lines.size, "the attempt-1 line, the header and 200 log lines")
+            assertEquals("  log line 51", lines[2], "the first shown line is the 51st")
+            assertEquals("  log line 250", lines.last())
+            assertFalse("log line 50\n" in notes.writes[0], "line 50 is cut")
+        } finally {
+            cleanUp(backend, handle)
+        }
+    }
+
+    @Test fun `a non-zero exit of rm -f is named in the attempt-1 line and does not stop the retry`() {
+        posixOnly()
+        val fake = FakeMsb()
+        fake.failBoot(1, AgentRelayCaptures.attachedRun)
+        fake.failRmForce(3)
+        val name = "rz-relay-diag-rm"
+        val notes = Notes()
+        val backend = diagnosticBackend(fake, notes)
+        val handle = backend.create(runSpec(name))
+        try {
+            backend.start(handle)
+
+            assertEquals(
+                listOf(
+                    attempt1Note("run", name, "3", "50 ms", "produced no output\n"),
+                    "${note}msb run for sandbox $name booted on attempt 2\n",
+                ),
+                notes.writes)
+            assertTrue(name in backend.runningSandboxNames())
+        } finally {
+            cleanUp(backend, handle)
+        }
+    }
+
+    @Test fun `a different error on attempt 2 is noted and propagates unchanged`() {
+        posixOnly()
+        val fake = FakeMsb()
+        fake.failBoot(1, AgentRelayCaptures.attachedRun)
+        fake.failBoot(2, "error: something else broke")
+        fake.systemLog(1, "runtime: child exited")
+        val name = "rz-relay-diag-other"
+        val notes = Notes()
+        val backend = diagnosticBackend(fake, notes)
+        val handle = backend.create(runSpec(name))
+        try {
+            val e = assertThrows(IllegalStateException::class.java) { backend.start(handle) }
+
+            assertEquals(
+                "msb run for sandbox $name exited (code 1) before reaching Running — check the image " +
+                    "entrypoint and `msb run` output below:\nerror: something else broke",
+                e.message, "the error is the one a plain failed boot produces")
+            assertSame(IllegalStateException::class.java, e.javaClass, "not wrapped in, or replaced by, another type")
+            assertNull(e.cause, "no cause added")
+            assertEquals(
+                listOf(
+                    attempt1Note("run", name, "0", "50 ms", "(last 1 of 1 lines):\n  runtime: child exited\n"),
+                    "${note}msb run for sandbox $name failed on attempt 2 with a different error\n",
+                ),
+                notes.writes)
+            assertEquals(1, fake.logCaptureCount(), "no capture after a different error")
+        } finally {
+            cleanUp(backend, handle)
+        }
+    }
+
+    // A typed failure on attempt 2 must reach spawnAndAwaitRunning as the same type: its catches
+    // are by class, and each one heals or retries with one more boot. If bootOnce re-threw a
+    // generic error instead, start() would fail here with only two boots.
+
+    private val stateDbFailure = "error: database error: no such table: sandbox"
+    private val imageCacheFailure =
+        "error: image error: cache error at /cache/layers/sha256_ab.tar.gz: No such file or directory (os error 2)"
+
+    @Test fun `a state-database error on attempt 2 reaches the state-database retry as the same type`() {
+        posixOnly()
+        val fake = FakeMsb()
+        fake.failBoot(1, AgentRelayCaptures.attachedRun)
+        fake.failBoot(2, stateDbFailure)
+        fake.systemLog(1, "runtime: child exited")
+        val name = "rz-relay-diag-statedb"
+        val notes = Notes()
+        val backend = diagnosticBackend(fake, notes)
+        val handle = backend.create(runSpec(name))
+        try {
+            backend.start(handle)
+
+            assertEquals(listOf("run $name", "rm -f $name", "run $name", "run $name"), fake.events(),
+                "the state-database retry boots a third time under the same name")
+            assertEquals(3, fake.bootCount())
+            assertEquals(
+                listOf(
+                    attempt1Note("run", name, "0", "50 ms", "(last 1 of 1 lines):\n  runtime: child exited\n"),
+                    "${note}msb run for sandbox $name failed on attempt 2 with a different error\n",
+                ),
+                notes.writes, "the relay retry's own notes end at attempt 2; the third boot is not its business")
+            assertEquals(1, fake.logCaptureCount(), "no capture after a different error")
+            assertTrue(name in backend.runningSandboxNames())
+        } finally {
+            cleanUp(backend, handle)
+        }
+    }
+
+    @Test fun `an image-cache error on attempt 2 reaches the image-cache heal as the same type`() {
+        posixOnly()
+        val fake = FakeMsb()
+        fake.failBoot(1, AgentRelayCaptures.attachedRun)
+        fake.failBoot(2, imageCacheFailure)
+        fake.systemLog(1, "runtime: child exited")
+        val name = "rz-relay-diag-imgcache"
+        val notes = Notes()
+        val backend = diagnosticBackend(fake, notes)
+        val handle = backend.create(runSpec(name))
+        try {
+            backend.start(handle)
+
+            assertEquals(listOf("run $name", "rm -f $name", "run $name", "run $name"), fake.events(),
+                "the image-cache heal boots a third time under the same name")
+            assertEquals(3, fake.bootCount())
+            assertEquals(
+                listOf(
+                    attempt1Note("run", name, "0", "50 ms", "(last 1 of 1 lines):\n  runtime: child exited\n"),
+                    "${note}msb run for sandbox $name failed on attempt 2 with a different error\n",
+                ),
+                notes.writes)
+            assertTrue(name in backend.runningSandboxNames())
+        } finally {
+            cleanUp(backend, handle)
+        }
+    }
+
+    @Test fun `a first attempt that succeeds or fails another way writes nothing and never reads the system log`() {
+        posixOnly()
+        val shapes = mapOf(
+            "succeeds" to null,
+            "crash exit" to AgentRelayCaptures.withStatus("exit code: 0xc0000409"),
+            "other error" to "error: something else broke",
+            "port conflict" to "error: failed to bind host port: address already in use",
+        )
+        for ((label, failure) in shapes) {
+            val fake = FakeMsb()
+            if (failure != null) fake.failBoot(1, failure)
+            val name = "rz-relay-diag-quiet"
+            val notes = Notes()
+            val backend = diagnosticBackend(fake, notes)
+            val handle = backend.create(runSpec(name))
+            try {
+                if (failure == null) backend.start(handle) else assertThrows(Exception::class.java) { backend.start(handle) }
+
+                assertEquals(emptyList<String>(), notes.writes, "[$label] no stderr output")
+                assertEquals(listOf("run $name"), fake.events(includeLogs = true), "[$label] one boot, no logs, no rm -f")
+                assertEquals(0, fake.logCaptureCount(), "[$label]")
+            } finally {
+                cleanUp(backend, handle)
+            }
+        }
+    }
+
+    @Test fun `a writer that throws does not change the retry`() {
+        posixOnly()
+        val fake = FakeMsb()
+        fake.failBoot(1, AgentRelayCaptures.attachedRun)
+        val name = "rz-relay-diag-bad-writer"
+        val backend = MsbCliBackend.forHost(
+            fake.msb, windowsHost = false, agentRelayRetryDelayMs = 50,
+            stderrWriter = { throw java.io.IOException("stderr closed") })
+        val handle = backend.create(runSpec(name))
+        try {
+            backend.start(handle)
+
+            assertEquals(listOf("run $name", "rm -f $name", "run $name"), fake.events())
             assertTrue(name in backend.runningSandboxNames())
         } finally {
             cleanUp(backend, handle)

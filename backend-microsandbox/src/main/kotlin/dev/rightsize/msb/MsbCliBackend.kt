@@ -95,6 +95,13 @@ import java.util.concurrent.atomic.AtomicBoolean
  * process tree, not of which caller happened to trigger the restore.
  * [defaultRestoreBroker] is the production implementation; see its own doc and [BrokerOutcome]'s
  * for the mechanics.
+ *
+ * [agentRelayRetryDelayMs], [agentRelayLogTimeoutSec] and [stderrWriter] are the seams of
+ * [bootOnce]'s agent-relay retry, defaulted to the real [AGENT_RELAY_RETRY_DELAY_MS],
+ * [AGENT_RELAY_LOG_TIMEOUT_SEC] and the process's stderr, so production behavior is unchanged.
+ * Without them the tests that retry would wait the real two seconds each, a timed-out log capture
+ * would take the real ten, and the notes the retry writes could not be read back. Tests reach
+ * all three via [forHost].
  */
 class MsbCliBackend private constructor(
     internal val msb: Path,
@@ -103,6 +110,9 @@ class MsbCliBackend private constructor(
     private val checkpointRegistryDir: Path = CacheDir.resolve(),
     private val checkpointRebootAlreadyExistsBudgetMs: Long = CHECKPOINT_REBOOT_ALREADY_EXISTS_RETRY_BUDGET_MS,
     private val restoreBroker: RestoreBroker = ::defaultRestoreBroker,
+    private val agentRelayRetryDelayMs: Long = AGENT_RELAY_RETRY_DELAY_MS,
+    private val agentRelayLogTimeoutSec: Long = AGENT_RELAY_LOG_TIMEOUT_SEC,
+    private val stderrWriter: (String) -> Unit = ::writeStderr,
 ) : SandboxBackend {
     constructor(msb: Path) : this(msb, Platform.current()?.isWindows == true)
 
@@ -152,9 +162,13 @@ class MsbCliBackend private constructor(
             checkpointRegistryDir: Path = CacheDir.resolve(),
             checkpointRebootAlreadyExistsBudgetMs: Long = CHECKPOINT_REBOOT_ALREADY_EXISTS_RETRY_BUDGET_MS,
             restoreBroker: RestoreBroker = ::defaultRestoreBroker,
+            agentRelayRetryDelayMs: Long = AGENT_RELAY_RETRY_DELAY_MS,
+            agentRelayLogTimeoutSec: Long = AGENT_RELAY_LOG_TIMEOUT_SEC,
+            stderrWriter: (String) -> Unit = ::writeStderr,
         ) = MsbCliBackend(
             msb, windowsHost, restoreReadinessBudgetMs, checkpointRegistryDir,
-            checkpointRebootAlreadyExistsBudgetMs, restoreBroker)
+            checkpointRebootAlreadyExistsBudgetMs, restoreBroker,
+            agentRelayRetryDelayMs, agentRelayLogTimeoutSec, stderrWriter)
     }
 
     private val startedNames = ConcurrentHashMap.newKeySet<String>()
@@ -362,27 +376,75 @@ class MsbCliBackend private constructor(
      * when its own rollback could not take the lifecycle lock). A plain same-name retry would
      * not be a fresh boot: `msb run --name X` restarts that persisted config and ignores the new
      * flags, and `msb restore --name X` refuses with "already exists". So this first runs a
-     * best-effort `msb rm -f` of the failed name (result ignored; `-f` is what clears a row stuck
-     * in `Starting`), waits [AGENT_RELAY_RETRY_DELAY_MS], and boots again under the SAME name,
-     * spec and launch mode ([useBroker] unchanged). The ledger entry and [startedNames] are keyed
-     * by that name, so no bookkeeping moves. A second relay failure is an error, not a third try.
+     * best-effort `msb rm -f` of the failed name (its exit code is only reported; `-f` is what
+     * clears a row stuck in `Starting`), waits [agentRelayRetryDelayMs], and boots again under
+     * the SAME name, spec and launch mode ([useBroker] unchanged). The ledger entry and
+     * [startedNames] are keyed by that name, so no bookkeeping moves. A second relay failure is
+     * an error, not a third try.
+     *
+     * The failure is rare and its cause lives only in the sandbox's own `kernel.log` and
+     * `runtime.log`, which `msb logs --source system` merges and `msb rm -f` deletes. So each
+     * failed attempt's system log is read first (best-effort, bounded by
+     * [agentRelayLogTimeoutSec], never able to block or fail the retry) and, with the outcome of
+     * the retry, written to stderr through [stderrWriter]. The log never goes into an exception:
+     * `GenericContainer` classifies a start failure by matching its cause chain's messages
+     * against port-conflict and name-collision phrases, and a guest log line could contain them.
      */
     private fun bootOnce(handle: Handle, spec: ContainerSpec, useBroker: Boolean = false): Process? {
-        try {
+        val first = try {
             return bootAttempt(handle, spec, useBroker)
         } catch (first: AgentRelayUnavailableException) {
-            runCatching { invoke(MsbCommands.rmForce(spec.name), STOP_TIMEOUT_SEC) }
-            Thread.sleep(AGENT_RELAY_RETRY_DELAY_MS)
-            try {
-                return bootAttempt(handle, spec, useBroker)
-            } catch (second: AgentRelayUnavailableException) {
-                error("msb ${if (spec.checkpointRef != null) "restore" else "run"} for sandbox ${spec.name}: " +
-                    "msb's sandbox process exited before its agent relay came up on both attempts (the " +
-                    "retry ran after `msb rm -f` of the failed sandbox and a short pause).\n" +
-                    "last attempt:\n${second.output}")
-            }
+            first
         }
+        val command = if (spec.checkpointRef != null) "restore" else "run"
+        val name = spec.name
+        // The system log lives in the sandbox directory that `msb rm -f` deletes: read it first.
+        val firstLog = captureSystemLog(name)
+        val rm = describeRmForce(runCatching { invoke(MsbCommands.rmForce(name), STOP_TIMEOUT_SEC) })
+        stderrNote(
+            "${AGENT_RELAY_NOTE}msb $command for sandbox $name exited before its agent relay came up " +
+                "(attempt 1 of 2); 'msb rm -f $name' exited $rm; " +
+                "retrying in ${formatRetryDelay(agentRelayRetryDelayMs)}\n" +
+                agentRelayLogBlock(name, 1, firstLog))
+        Thread.sleep(agentRelayRetryDelayMs)
+        val booted = try {
+            bootAttempt(handle, spec, useBroker)
+        } catch (second: AgentRelayUnavailableException) {
+            // Read before the error leaves: the container layer removes the sandbox as soon as
+            // start() throws.
+            stderrNote(
+                "${AGENT_RELAY_NOTE}msb $command for sandbox $name exited before its agent relay came up " +
+                    "again (attempt 2 of 2); giving up\n" +
+                    agentRelayLogBlock(name, 2, captureSystemLog(name)))
+            error("msb $command for sandbox $name: " +
+                "msb's sandbox process exited before its agent relay came up on both attempts (the " +
+                "retry ran after `msb rm -f` of the failed sandbox and a short pause). " +
+                "msb's system log for each attempt was written to stderr.\n" +
+                "first attempt:\n${first.output}\nafter retry:\n${second.output}")
+        } catch (other: Throwable) {
+            stderrNote("${AGENT_RELAY_NOTE}msb $command for sandbox $name failed on attempt 2 " +
+                "with a different error\n")
+            throw other
+        }
+        stderrNote("${AGENT_RELAY_NOTE}msb $command for sandbox $name booted on attempt 2\n")
+        return booted
     }
+
+    /** `msb logs <name> --source system` with a short timeout, as the text or the reason it
+     * could not be read. Never throws: a failing capture must not block or fail the retry. */
+    private fun captureSystemLog(name: String): SystemLogCapture =
+        runCatching { invoke(MsbCommands.logsSystem(name), agentRelayLogTimeoutSec) }.fold(
+            onSuccess = { r ->
+                val why = oneLine(r.stderr, "")
+                if (r.exitCode == 0) SystemLogCapture.Output(r.stdout)
+                else SystemLogCapture.Unreadable("exit code ${r.exitCode}" + if (why.isEmpty()) "" else ": $why")
+            },
+            onFailure = { SystemLogCapture.Unreadable(oneLine(it.message, it.javaClass.simpleName)) },
+        )
+
+    /** Hands one note to [stderrWriter] in a single call, so concurrent output cannot land inside
+     * it. A failing writer is ignored: the notes are diagnostics, never part of the boot's result. */
+    private fun stderrNote(text: String) { runCatching { stderrWriter(text) } }
 
     /**
      * One boot attempt, dispatched by `spec.checkpointRef`:
@@ -1862,6 +1924,13 @@ private const val INSTALL_LOCK_RETRY_DELAY_MS = 2_000L
 // came up (see [isAgentRelayUnavailable]): room for `msb rm -f` of the failed sandbox to finish
 // releasing its name on a loaded Windows host, still short next to the boot it repeats.
 private const val AGENT_RELAY_RETRY_DELAY_MS = 2_000L
+// The system-log capture that opens that retry sits on the retry's critical path, so it is bounded
+// tighter than LOGS_TIMEOUT_SEC; a log that does not arrive in time is reported as unreadable. At
+// most this many trailing lines of it are written to stderr.
+private const val AGENT_RELAY_LOG_TIMEOUT_SEC = 10L
+private const val AGENT_RELAY_LOG_TAIL_LINES = 200
+// Start of every line the agent-relay retry writes to stderr; CI counts them by this text.
+private const val AGENT_RELAY_NOTE = "rightsize: agent-relay retry: "
 private const val EXEC_TIMEOUT_SEC = 120L
 // How long exec keeps retrying while the guest agent's endpoint has not appeared yet,
 // and how long it pauses between attempts — see [isAgentEndpointNotReady]. Zero cost on
@@ -2115,6 +2184,52 @@ private val RESTORE_MISSING_BINDINGS = Regex("restore\\s+requires\\s+destination
  * a repeat into a plain error. */
 internal class AgentRelayUnavailableException(val output: String) :
     RuntimeException("msb sandbox process exited before its agent relay became available:\n$output")
+
+/** What `msb logs <name> --source system` gave back for [agentRelayLogBlock]: its stdout, or why
+ * there is none. */
+internal sealed class SystemLogCapture {
+    class Output(val text: String) : SystemLogCapture()
+    class Unreadable(val reason: String) : SystemLogCapture()
+}
+
+/**
+ * The stderr block for one failed attempt's system log: the last [AGENT_RELAY_LOG_TAIL_LINES]
+ * lines of [capture], each indented two spaces under a header naming how many of how many are
+ * shown. A capture with no output, or one that could not be read, is the header alone. Every line
+ * ends in `\n`.
+ */
+internal fun agentRelayLogBlock(name: String, attempt: Int, capture: SystemLogCapture): String {
+    val header = "${AGENT_RELAY_NOTE}'msb logs $name --source system' after attempt $attempt"
+    when (capture) {
+        is SystemLogCapture.Unreadable -> return "$header could not be read (${capture.reason})\n"
+        is SystemLogCapture.Output -> {
+            val lines = capture.text.lines().dropLastWhile { it.isBlank() }
+            if (lines.isEmpty()) return "$header produced no output\n"
+            val shown = lines.takeLast(AGENT_RELAY_LOG_TAIL_LINES)
+            return buildString {
+                append("$header (last ${shown.size} of ${lines.size} lines):\n")
+                shown.forEach { append("  ").append(it).append('\n') }
+            }
+        }
+    }
+}
+
+/** How `msb rm -f` ended, for the retry's note: its exit code, or why the invocation never finished. */
+internal fun describeRmForce(result: Result<ExecResult>): String = result.fold(
+    onSuccess = { it.exitCode.toString() },
+    onFailure = { "without finishing (${oneLine(it.message)})" },
+)
+
+/** [ms] as whole seconds (`2 s`), or as milliseconds (`150 ms`, and `0 ms`) when it is under a second
+ * or not a whole number of them. */
+internal fun formatRetryDelay(ms: Long): String = if (ms >= 1_000 && ms % 1_000 == 0L) "${ms / 1_000} s" else "$ms ms"
+
+/** The first non-blank line of [text], trimmed, so a reason fits on the one line it is written to. */
+private fun oneLine(text: String?, fallback: String = "no message"): String =
+    text?.lineSequence()?.map { it.trim() }?.firstOrNull { it.isNotEmpty() } ?: fallback
+
+/** The production [MsbCliBackend] `stderrWriter`: the real stderr, one call per note. */
+private fun writeStderr(text: String) { System.err.print(text) }
 
 /**
  * True if [output] (an `msb run` or `msb restore` invocation's combined stdout/stderr) says the
