@@ -20,6 +20,19 @@ Nothing yet.
   it in the sandbox's own directory and removes it when the sandbox exits. Directories
   left by earlier msb versions are not cleaned up.
 
+### Fixed
+
+- **A Docker image pull that fails partway is now retried once.** Docker answers a pull
+  that dies partway (registry 5xx, rate limit, dropped connection) with HTTP 200 and puts
+  the error in the progress stream. docker-java already raised that as an error, but the
+  Docker backend gave up on the first one, so a registry blip failed the start. An error
+  in the stream, or a daemon 5xx, now gets one retry after 2 seconds; a 4xx (for example,
+  a repository that does not exist) fails at once. The final error names the image,
+  carries Docker's own message (also when the stream sends only `errorDetail`, which
+  docker-java reported as `null`), and says whether the pull was retried. A failed pull
+  now surfaces as `IllegalStateException` with the docker-java exception as its cause;
+  before, it was the docker-java exception itself.
+
 ## [0.7.16] - 2026-10-23
 
 ### Added

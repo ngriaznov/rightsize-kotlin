@@ -2,7 +2,10 @@ package dev.rightsize.docker
 
 import com.github.dockerjava.api.DockerClient
 import com.github.dockerjava.api.async.ResultCallback
+import com.github.dockerjava.api.command.PullImageResultCallback
 import com.github.dockerjava.api.exception.ConflictException
+import com.github.dockerjava.api.exception.DockerClientException
+import com.github.dockerjava.api.exception.DockerException
 import com.github.dockerjava.api.exception.InternalServerErrorException
 import com.github.dockerjava.api.exception.NotFoundException
 import com.github.dockerjava.api.model.AccessMode
@@ -12,6 +15,7 @@ import com.github.dockerjava.api.model.ExposedPort
 import com.github.dockerjava.api.model.Frame
 import com.github.dockerjava.api.model.HostConfig
 import com.github.dockerjava.api.model.PortBinding
+import com.github.dockerjava.api.model.PullResponseItem
 import com.github.dockerjava.api.model.Ports
 import com.github.dockerjava.api.model.StreamType
 import com.github.dockerjava.api.model.Volume
@@ -64,6 +68,9 @@ class DockerBackend : SandboxBackend {
         // can be sizable; generous but bounded, same order of magnitude as MsbCliBackend's own
         // SNAPSHOT_TIMEOUT_SEC.
         const val SAVE_LOAD_TIMEOUT_SEC = 180L
+        // Pause before the one retry of a failed image pull (see pullWithRetry) — long enough for a
+        // registry's transient 5xx or rate-limit blip to clear, short enough not to stall a start.
+        val PULL_RETRY_PAUSE: Duration = Duration.ofSeconds(2)
     }
 
     private val client: DockerClient by lazy {
@@ -435,7 +442,70 @@ class DockerBackend : SandboxBackend {
 
     private fun pullIfMissing(image: String) {
         val present = runCatching { client.inspectImageCmd(image).exec() }.isSuccess
-        if (!present) client.pullImageCmd(image).start().awaitCompletion()
+        if (!present) pullWithRetry(client, image)
+    }
+
+    /**
+     * Pulls [image], retrying once after [PULL_RETRY_PAUSE] when the failure is one a flaky
+     * registry or network produces. Docker answers `POST /images/create` with 200 and reports a
+     * mid-pull failure (registry 5xx, rate limit, dropped connection) as an error object in the
+     * progress stream; docker-java's pull callback raises that from `awaitCompletion()` as a
+     * [DockerClientException]. A daemon 5xx arrives as a [DockerException] with `httpStatus >= 500`
+     * ([InternalServerErrorException] for 500, a bare [DockerException] for 502/503/...). A 4xx
+     * ([NotFoundException] for "repository does not exist", 401, 403, ...) is the registry's
+     * definitive answer and fails at once. Every failure is rethrown naming [image], so a pull
+     * that never landed can't resurface as a misleading "No such image" from `create`. docker-java
+     * judges a pull by its last progress item, which is where Docker's error object lands: the
+     * daemon ends the stream on an error.
+     *
+     * `internal`, not `private`, with [client] and [sleep] as parameters: [DockerPullRetryTest]
+     * drives it against a stub daemon and a recording [sleep] — no real daemon, no real pause.
+     */
+    internal fun pullWithRetry(
+        client: DockerClient,
+        image: String,
+        sleep: (Duration) -> Unit = { Thread.sleep(it.toMillis()) },
+    ) {
+        try {
+            client.pullImageCmd(image).exec(PullCallback()).awaitCompletion()
+        } catch (first: RuntimeException) {
+            if (!isTransientPullFailure(first)) {
+                throw IllegalStateException("docker could not pull image '$image': ${first.message}", first)
+            }
+            sleep(PULL_RETRY_PAUSE)
+            try {
+                client.pullImageCmd(image).exec(PullCallback()).awaitCompletion()
+            } catch (second: RuntimeException) {
+                throw IllegalStateException(
+                    "docker could not pull image '$image' (retried once): ${second.message}", second)
+            }
+        }
+    }
+
+    private fun isTransientPullFailure(e: RuntimeException): Boolean =
+        e is DockerClientException || (e is DockerException && e.httpStatus >= 500)
+
+    /**
+     * docker-java's pull callback, except a failure keeps Docker's message when the error object
+     * carries only `errorDetail`. docker-java builds its message from the deprecated `error` string
+     * alone, so that shape reads "Could not pull image: null".
+     */
+    private class PullCallback : PullImageResultCallback() {
+        @Volatile private var last: PullResponseItem? = null
+
+        override fun onNext(item: PullResponseItem) {
+            last = item
+            super.onNext(item)
+        }
+
+        override fun throwFirstError() {
+            try {
+                super.throwFirstError()
+            } catch (e: DockerClientException) {
+                val detail = last?.takeIf { it.error == null }?.errorDetail?.message
+                throw if (detail.isNullOrEmpty()) e else DockerClientException("Could not pull image: $detail", e)
+            }
+        }
     }
 
     override fun close() {
