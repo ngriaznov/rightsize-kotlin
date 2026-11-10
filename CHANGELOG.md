@@ -47,6 +47,13 @@ Nothing yet.
   new msb before it can be checkpointed; remove it (`msb rm -f <name>`) and the next run
   starts a fresh one.
 
+  **Checkpoints taken with an earlier rightsize are not guaranteed to restore under msb
+  0.7.14.** This release does not migrate or convert them, and exported checkpoint archives
+  are in the same position: take them again with this release. `Checkpoint.find` already
+  drops a named checkpoint whose msb snapshot is gone, so `Checkpoint.find(name) ?: seed()`
+  re-seeds on its own. One that is still there but fails to start can be removed with
+  `Checkpoint.remove(name)` and taken again.
+
 ## [0.7.17] - 2026-10-24
 
 ### Changed
