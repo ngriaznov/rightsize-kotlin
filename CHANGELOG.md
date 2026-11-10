@@ -7,6 +7,10 @@ reaches its first tagged release.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.7.18] - 2026-11-10
+
 ### Added
 
 - **The msb agent-relay boot retry now leaves evidence.** When msb's sandbox process exits
@@ -1188,7 +1192,8 @@ Initial public release.
   exactly once; any other failure, or a second failure after the heal,
   propagates unchanged.
 
-[Unreleased]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.17...HEAD
+[Unreleased]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.18...HEAD
+[0.7.18]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.17...v0.7.18
 [0.7.17]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.16...v0.7.17
 [0.7.16]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.15...v0.7.16
 [0.7.15]: https://github.com/ngriaznov/rightsize-kotlin/compare/v0.7.14...v0.7.15
