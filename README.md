@@ -275,9 +275,10 @@ RIGHTSIZE_BACKEND=microsandbox ./gradlew integrationTest   # needs Apple Silicon
 RIGHTSIZE_BACKEND=docker ./gradlew integrationTest         # needs any Docker-compatible daemon
 ```
 
-CI runs the matrix on Linux (KVM), Windows (WHP), and a Docker-only job. There's
-no macOS job - GitHub's hosted Apple Silicon runners cannot nest virtualization -
-so macOS is verified on real hardware.
+CI runs the matrix on Linux (KVM), Windows (WHP), and a Docker-only job. GitHub's
+hosted Apple Silicon runners cannot nest virtualization, so msb can't boot there: a
+macOS job builds and unit-tests the project and provisions the pinned msb on one
+before every release, and the integration suite is verified on real hardware.
 
 ## Documentation
 

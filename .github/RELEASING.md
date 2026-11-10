@@ -50,6 +50,12 @@ under the verified `dev.rightsize` namespace. Publishing is wired into the build
    ./gradlew publishAggregationToCentralPortal
    ```
 
+   Or from CI: Actions → `release` → Run workflow. The workflow first runs the
+   macOS gate (`macos.yml`, on a hosted Apple Silicon runner): `./gradlew build`
+   and a real provisioning of the pinned msb, which must report its version,
+   ship an arm64 libkrunfw, and be signed with the hypervisor entitlement.
+   Nothing is uploaded unless it passes.
+
    `publishingType` is `USER_MANAGED`: the upload validates and then waits in the
    portal UI. Nothing is public yet.
 6. Review the deployment at central.sonatype.com → Publish, then release it.

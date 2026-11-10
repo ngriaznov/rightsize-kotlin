@@ -1,0 +1,67 @@
+# The macOS gate. release.yml calls this workflow and publishes only if it passes;
+# it also runs on pull requests that change the msb pin, the platform table, or this
+# file, so a pin bump finds out about its macOS assets before a release does.
+#
+# GitHub's hosted Apple Silicon runners are VMs without nested virtualization, so no
+# sandbox can boot here (see the note in ci.yml where an msb-macos job would sit).
+# This job checks everything short of a boot: `./gradlew build` (compile, unit tests,
+# packaging) passes on macOS, and the provisioner downloads the pinned msb's
+# darwin-aarch64 assets, verifies them against the release's checksums.sha256 and
+# installs them (MsbProvisionCheckTest, which also runs `msb --version`, enabled here
+# by RIGHTSIZE_MSB_PROVISION_CHECK). The installed libkrunfw then has to be an arm64
+# Mach-O library, and the msb binary has to carry the hypervisor entitlement, without
+# which no Mac can create a VM.
+name: macos
+
+on:
+  workflow_call:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/macos.yml
+      - backend-microsandbox/src/main/kotlin/dev/rightsize/msb/MsbProvisioner.kt
+      - backend-microsandbox/src/main/kotlin/dev/rightsize/msb/Platform.kt
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    name: macOS (build, unit tests, msb provisioning)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '17' }
+      - uses: gradle/actions/setup-gradle@v4
+      # backend-microsandbox's `test` task points RIGHTSIZE_CACHE_DIR at
+      # build/test-cache/rightsize, so on a fresh checkout the provisioning check is
+      # always a real download. `:examples:test` is the one `test` task that boots a
+      # real sandbox (its example is tagged sandbox-it), which this runner can't; the
+      # release job's own `./gradlew build` still runs it on Linux.
+      - run: ./gradlew build -x :examples:test
+        env:
+          RIGHTSIZE_MSB_PROVISION_CHECK: "1"
+      - name: Check the installed msb
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The install dir is <cache>/msb/<pinned version>/{bin,lib}.
+          msb=$(ls backend-microsandbox/build/test-cache/rightsize/msb/*/bin/msb)
+          version=$(basename "$(dirname "$(dirname "$msb")")")
+          lib="$(dirname "$(dirname "$msb")")/lib/libkrunfw.5.dylib"
+          out=$("$msb" --version)
+          echo "$out"
+          if [[ "$out" != *"$version"* ]]; then
+            echo "::error::expected msb $version, got: $out"; exit 1
+          fi
+          file "$lib"
+          if ! file -b "$lib" | grep -q "Mach-O 64-bit dynamically linked shared library arm64"; then
+            echo "::error::$lib is not an arm64 Mach-O library"; exit 1
+          fi
+          ents=$(codesign -d --entitlements - --xml "$msb" 2>/dev/null || true)
+          if ! grep -q "com.apple.security.hypervisor" <<<"$ents"; then
+            codesign -dvvv "$msb" || true
+            echo "::error::msb $version is not signed with com.apple.security.hypervisor"; exit 1
+          fi
+          echo "msb $version: runs, arm64 libkrunfw, hypervisor entitlement present"
