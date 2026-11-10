@@ -1536,18 +1536,6 @@ class MsbCliBackend private constructor(
     }
 
     /**
-     * True if msb's own diagnostic output for an early-exited `msb run` names a host-port bind
-     * conflict. msb has no structured error for this — only the process's combined stdout/stderr
-     * text — so this is a best-effort message match, same idea as `GenericContainer`'s fallback
-     * classifier, kept local to this backend since the wording is msb-specific.
-     */
-    private fun isPortBindConflict(output: String): Boolean {
-        val m = output.lowercase()
-        return "address already in use" in m || "port is already allocated" in m ||
-            "bind: address already in use" in m || ("already in use" in m && "port" in m)
-    }
-
-    /**
      * True if [output] names a sandbox-name collision — reuse's fresh-create path retries this
      * as an adopt (see [SandboxNameCollisionException]'s doc) instead of an ordinary failure.
      * Unlike [isPortBindConflict]/[isImageCacheCorruption]/[isMsbStateDbError], this phrasing has
@@ -2081,6 +2069,23 @@ internal class MsbInstallLockException(val output: String) :
  * propagates the failure with both attempts' output.
  */
 internal fun isMsbStateDbError(output: String): Boolean = "error: database error:" in output
+
+/**
+ * True if msb's own diagnostic output for an early-exited `msb run` or `msb restore` names a
+ * host-port bind conflict. msb has no structured error for this — only the process's combined
+ * stdout/stderr text — so this is a best-effort message match, same idea as `GenericContainer`'s
+ * fallback classifier, kept local to this backend since the wording is msb-specific.
+ *
+ * Since 0.7.14 msb claims published ports before the VM boots and fails with "failed to publish
+ * tcp port <addr>: <OS error>". On Windows that OS error is WSAEADDRINUSE, which never says "in
+ * use" ("Only one usage of each socket address ... (os error 10048)"), hence its own clause.
+ */
+internal fun isPortBindConflict(output: String): Boolean {
+    val m = output.lowercase()
+    return "address already in use" in m || "port is already allocated" in m ||
+        "bind: address already in use" in m || ("already in use" in m && "port" in m) ||
+        "os error 10048" in m
+}
 
 /**
  * True if [output] (`msb logs <name> --source system`'s stdout) carries the boot-completion

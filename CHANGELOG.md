@@ -19,6 +19,30 @@ reaches its first tagged release.
   an error message. Each msb CI job now reports how often the retry fired and how it ended.
   The retry itself is unchanged.
 
+### Changed
+
+- **The pinned msb is now 0.7.14** (was 0.7.10). The CLI surface this library drives is
+  unchanged. Guests run Linux 6.12.115. msb 0.7.12 fixes two security issues: code in a
+  sandbox could edit its root-disk journal so that, after a restart, the sandbox attached
+  another sandbox's writable disk; and on Linux and macOS, msb's state database, which keeps
+  each sandbox's environment variables, was readable by other local users. One msb change is
+  visible through this library: a host port that is already taken now fails `msb run` and
+  `msb restore` before the VM boots, with an error that names the port, where a restore used
+  to start without that port. A container start that hits a taken port was already retried
+  on new host ports; the backend now also recognises Windows' wording of that error
+  (`os error 10048`), which never says "in use".
+
+  **msb 0.7.11 and 0.7.12 migrate msb's shared state database under `MSB_HOME` on first
+  use.** After that, an older msb binary refuses the same home outright ("database schema is
+  newer than this msb binary"). That includes the msb 0.7.10 that rightsize 0.7.17
+  provisions: on a machine that runs both this release and an older rightsize, give one of
+  them its own `MSB_HOME`, or upgrade the older one. The same applies to `MSB_PATH` pointed at
+  a binary older than 0.7.12. msb 0.7.12 also moves each sandbox's disk records and
+  checkpoints out of the guest's reach. A container that an older rightsize left running for
+  reuse still takes exec and stop, but msb's upgrade notes say it must be restarted under the
+  new msb before it can be checkpointed; remove it (`msb rm -f <name>`) and the next run
+  starts a fresh one.
+
 ## [0.7.17] - 2026-10-24
 
 ### Changed
