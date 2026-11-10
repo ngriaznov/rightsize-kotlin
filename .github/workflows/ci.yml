@@ -181,8 +181,10 @@ jobs:
 
   # No msb-macos job: GitHub's hosted Apple Silicon runners are themselves VMs
   # without nested virtualization, so Hypervisor.framework VM creation fails
-  # (msb: build_microvm VmSetup(VmCreate)). macOS support is verified on real
-  # Apple Silicon hardware; a self-hosted mac runner could restore CI coverage.
+  # (msb: build_microvm VmSetup(VmCreate)). macos.yml covers what a hosted mac
+  # can (build, unit tests, provisioning the pinned msb) and gates every
+  # release; the integration suite is verified on real Apple Silicon hardware,
+  # and a self-hosted mac runner could bring it into CI.
   docker-fallback:
     runs-on: ubuntu-latest
     steps:

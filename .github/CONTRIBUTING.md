@@ -55,8 +55,14 @@ the full matrix (unit, `msb-linux`, `msb-windows`, `docker-fallback`; see
 
 > **macOS in CI:** there is no `msb-macos` job — GitHub's hosted Apple Silicon
 > runners are themselves VMs without nested virtualization, so microVMs cannot
-> boot there (Hypervisor.framework rejects VM creation). macOS support is
-> verified on real Apple Silicon hardware before release.
+> boot there (Hypervisor.framework rejects VM creation). The `macos` workflow
+> (`.github/workflows/macos.yml`) covers what a hosted runner can: `./gradlew
+> build` and a real provisioning of the pinned msb (`MsbProvisionCheckTest`,
+> enabled by `RIGHTSIZE_MSB_PROVISION_CHECK=1`), which must run, ship an arm64
+> libkrunfw, and carry the hypervisor entitlement. The `release` workflow runs
+> it before uploading, and pull requests that touch the msb pin run it too. The
+> integration suite on macOS is verified on real Apple Silicon hardware before
+> release.
 
 
 Useful env vars while developing (full reference in

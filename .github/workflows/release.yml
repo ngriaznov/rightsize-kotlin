@@ -1,7 +1,8 @@
 # Uploads a staged deployment to the Maven Central Portal. Manual trigger only,
 # and USER_MANAGED staging on top of that: after this workflow succeeds, the
 # deployment still has to be released by hand at central.sonatype.com — nothing
-# goes public from CI alone. See .github/RELEASING.md for the full procedure.
+# goes public from CI alone. Nothing is uploaded until the macOS gate (macos.yml)
+# passes. See .github/RELEASING.md for the full procedure.
 name: release
 
 on:
@@ -11,7 +12,15 @@ permissions:
   contents: read
 
 jobs:
+  # Build, unit tests and a real provisioning of the pinned msb on Apple Silicon; see
+  # macos.yml for what it checks and why it boots no sandbox.
+  macos:
+    uses: ./.github/workflows/macos.yml
+    permissions:
+      contents: read
+
   publish-to-central:
+    needs: macos
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
