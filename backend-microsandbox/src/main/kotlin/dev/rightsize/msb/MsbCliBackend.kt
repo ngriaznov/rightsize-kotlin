@@ -2712,7 +2712,21 @@ internal fun parseSnapshotLoadMemberId(output: String): String? {
  * quoting the raw output.
  */
 private fun parseTrailingAbsolutePathLine(output: String): String? {
-    val lastLine = output.lines().map { it.trim() }.lastOrNull { it.isNotEmpty() } ?: return null
+    val lastLine = output.lines().map { it.trim() }.lastOrNull { it.isNotEmpty() }
+        ?.let(::stripWindowsVerbatimPrefix) ?: return null
     val parsed = runCatching { Path.of(lastLine) }.getOrNull() ?: return null
     return lastLine.takeIf { parsed.isAbsolute }
+}
+
+/**
+ * [path] without Windows' extended-length prefix: `\\?\C:\...` becomes `C:\...` and
+ * `\\?\UNC\server\share\...` becomes `\\server\share\...`; any other path comes back unchanged.
+ * On Windows msb 0.8 prints the artifact path of `msb snapshot create` in the prefixed form,
+ * which [Path.of] rejects outright. msb accepts the plain form as input, and the JDK handles
+ * long paths without the prefix. Same rule as the Node and Rust backends.
+ */
+internal fun stripWindowsVerbatimPrefix(path: String): String = when {
+    path.startsWith("\\\\?\\UNC\\") -> "\\\\" + path.removePrefix("\\\\?\\UNC\\")
+    path.startsWith("\\\\?\\") -> path.removePrefix("\\\\?\\")
+    else -> path
 }

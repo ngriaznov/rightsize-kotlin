@@ -639,6 +639,14 @@ class MsbCheckpointTest {
         }
     }
 
+    @Test fun `stripWindowsVerbatimPrefix drops the extended-length prefix msb 0_8 prints on Windows`() {
+        assertEquals("C:\\Users\\r\\checkpoints\\rz-ckpt-x\\snap_ab",
+            stripWindowsVerbatimPrefix("\\\\?\\C:\\Users\\r\\checkpoints\\rz-ckpt-x\\snap_ab"))
+        assertEquals("\\\\server\\share\\ck", stripWindowsVerbatimPrefix("\\\\?\\UNC\\server\\share\\ck"))
+        assertEquals("/cache/checkpoints/rz-ckpt-x/snap_ab", stripWindowsVerbatimPrefix("/cache/checkpoints/rz-ckpt-x/snap_ab"))
+        assertEquals("C:\\ck\\snap_ab", stripWindowsVerbatimPrefix("C:\\ck\\snap_ab"))
+    }
+
     // --- parseSnapshotCreateArtifactPath: pure, no binary needed ---
     //
     // Absolute-path fixtures are built via toAbsolutePath() rather than hand-typed Unix strings
