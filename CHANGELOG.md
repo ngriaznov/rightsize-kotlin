@@ -28,7 +28,9 @@ reaches its first tagged release.
   imported by rightsize 0.7.x, because msb 0.8 archives carry a format extension that msb
   0.7 refuses. Importing an archive now needs a checkpoints directory on a filesystem with
   hard links and atomic directory exchange (the usual Linux and macOS filesystems) or NTFS
-  on Windows.
+  on Windows. On Windows, a checkpoint can no longer be removed while a container restored
+  from it is still running: msb 0.8 fails the removal with `Access is denied. (os error 5)`.
+  Stop those containers first.
 
   **Do not share an `MSB_HOME` between this release and rightsize 0.7.x.** rightsize uses
   msb's default home (`~/.microsandbox`). msb 0.7 refuses to launch a runtime from msb 0.8
