@@ -7,7 +7,35 @@ reaches its first tagged release.
 
 ## [Unreleased]
 
-Nothing yet.
+### Changed
+
+- **The pinned msb is now 0.8.1** (was 0.7.14), and rightsize's version now follows the msb
+  version it pins, so this release is 0.8.1 (msb published no 0.8.0). A fix to rightsize
+  alone ships with the next msb release, under that release's number. msb 0.8 reorganises
+  snapshots into groups of checkpoints, so the checkpoint code drives the new commands:
+  export runs `msb snapshot save <group> --checkpoint <member>`, import runs `msb snapshot
+  load <group> --file <archive>` into a fresh `rz-ckpt-import-...` group, and removal
+  deletes the checkpoint's group when it is the group's only checkpoint, or only the
+  checkpoint otherwise. Taking and restoring a checkpoint, and everything outside
+  checkpoints, work as before. msb 0.8 also brings a newer guest kernel (Linux 6.12.118),
+  answers private reverse lookups and `.local` names with NXDOMAIN through its DNS gateway,
+  and creates its sandbox disks, snapshots and logs readable by their owner only.
+
+  **Checkpoints and archives from earlier releases are not migrated.** A checkpoint taken
+  with rightsize 0.7.x may not restore or be removed cleanly under 0.8.1: take it again with
+  this release. `Checkpoint.find` drops a named checkpoint whose snapshot is gone, so a
+  find-or-seed pattern re-seeds on its own. An archive exported by this release cannot be
+  imported by rightsize 0.7.x, because msb 0.8 archives carry a format extension that msb
+  0.7 refuses. Importing an archive now needs a checkpoints directory on a filesystem with
+  hard links and atomic directory exchange (the usual Linux and macOS filesystems) or NTFS
+  on Windows.
+
+  **Do not share an `MSB_HOME` between this release and rightsize 0.7.x.** rightsize uses
+  msb's default home (`~/.microsandbox`). msb 0.7 refuses to launch a runtime from msb 0.8
+  ("no tested sandbox launch contract"), and msb's upgrade notes warn that older releases
+  may refuse a catalog or snapshots that 0.8 wrote. On a machine that runs both, give one of
+  them its own `MSB_HOME`, or upgrade the older one. `MSB_PATH` must point at msb 0.8.1 or
+  newer.
 
 ## [0.7.18] - 2026-11-10
 

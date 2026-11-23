@@ -145,7 +145,7 @@ rightsize picks a backend automatically; override with
 | Windows without WHP | Docker (auto-fallback)ᵇ |
 | Linux without KVM | Docker (auto-fallback) |
 
-ᵃ Windows msb support is upstream beta (microsandbox 0.7.14). rightsize detects a Windows
+ᵃ Windows msb support is upstream beta (microsandbox 0.8.1). rightsize detects a Windows
 build is available and attempts it; if WHP turns out not to be usable, msb's own `msb doctor`
 names the exact precondition (see ᵇ) instead of a generic failure.
 ᵇ Force with `RIGHTSIZE_BACKEND=docker`, or enable WHP: run `msb doctor --fix` in an
@@ -232,7 +232,8 @@ See [Networking](docs/concepts/networking.md#udp) for the full picture.
   once, SHA-256-verified against the release manifest, and installed atomically under
   `~/.cache/rightsize/` (`%LOCALAPPDATA%\rightsize` on Windows) - the binary lands last,
   so a crashed install is detected and repaired, never half-trusted. A cross-process file
-  lock keeps parallel Gradle workers from racing.
+  lock keeps parallel Gradle workers from racing. rightsize's version is the version of the
+  msb release it pins: rightsize 0.8.1 runs msb 0.8.1.
 - **Attached-mode supervision.** Each container is a held child process supervising its
   microVM; the image's ENTRYPOINT runs exactly as it would under Docker.
 - **Pre-allocated ports.** Host ports are chosen before boot, so brokers like

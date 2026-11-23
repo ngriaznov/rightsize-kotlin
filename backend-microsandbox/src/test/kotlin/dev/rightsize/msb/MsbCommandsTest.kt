@@ -44,7 +44,7 @@ class MsbCommandsTest {
     }
 
     // A checkpointRef-carrying spec is never fed to `run` in practice — MsbCliBackend routes it
-    // to MsbCommands.restore instead (msb 0.7 removed `run --from-snapshot` outright) — but `run`
+    // to MsbCommands.restore instead (msb 0.7 removed `run --from-snapshot`; 0.8.1 accepts it again) — but `run`
     // itself stays pure and simply ignores checkpointRef, always emitting the ordinary image arg.
     @Test fun `run command ignores checkpointRef and always emits the ordinary image arg`() {
         val cmd = MsbCommands.run(spec.copy(checkpointRef = "rz-ckpt-0123456789ab"))
@@ -52,7 +52,7 @@ class MsbCommandsTest {
             "-p", "12345:6379", "-e", "A=1",
             "--mount-file", "/tmp/f.conf:/etc/f.conf:rw,nodev",
             "redis:8.6-alpine", "--", "redis-server", "--port", "6379"), cmd)
-        assertFalse(cmd.contains("--from-snapshot"), "msb 0.7 rejects --from-snapshot outright — run must never emit it")
+        assertFalse(cmd.contains("--from-snapshot"), "run must never emit --from-snapshot; restore owns checkpoint refs")
         assertFalse(cmd.contains("-d"))
     }
 
@@ -310,16 +310,21 @@ class MsbCommandsTest {
             MsbCommands.execWorkload("rz-abc-1", emptyMap(), listOf("serve")))
     }
 
-    @Test fun `snapshot create and snapshot rm`() {
+    @Test fun `snapshot create names the group in its positional`() {
         assertEquals(listOf("snapshot", "create", "--from-sandbox", "rz-abc-1", "rz-ckpt-0123456789ab"),
             MsbCommands.snapshotCreate("rz-abc-1", "rz-ckpt-0123456789ab"))
-        assertEquals(listOf("snapshot", "rm", "rz-ckpt-0123456789ab", "-f"),
-            MsbCommands.snapshotRemove("rz-ckpt-0123456789ab"))
     }
 
-    @Test fun `snapshot rm carries a full path ref verbatim, never reduced to a basename`() {
-        val fullPath = "/home/u/.cache/rightsize/checkpoints/rz-abc-1/snap_0123456789abcdef0123456789abcdef"
-        assertEquals(listOf("snapshot", "rm", fullPath, "-f"), MsbCommands.snapshotRemove(fullPath))
+    @Test fun `snapshot rm of a whole group uses --all and never -f`() {
+        val groupDir = "/home/u/.cache/rightsize/checkpoints/rz-ckpt-0123456789ab"
+        assertEquals(listOf("snapshot", "rm", groupDir, "--all"), MsbCommands.snapshotRemoveGroup(groupDir))
+    }
+
+    @Test fun `snapshot rm of one member names the group dir, --checkpoint and -f`() {
+        val groupDir = "/home/u/.cache/rightsize/checkpoints/rz-ckpt-0123456789ab"
+        assertEquals(
+            listOf("snapshot", "rm", groupDir, "--checkpoint", "snap_0123456789abcdef0123456789abcdef", "-f"),
+            MsbCommands.snapshotRemoveMember(groupDir, "snap_0123456789abcdef0123456789abcdef"))
     }
 
     @Test fun `snapshot inspect carries the ref verbatim`() {
@@ -353,19 +358,23 @@ class MsbCommandsTest {
         MsbCommands::class.java.getMethod("snapshotCreate", String::class.java, String::class.java, Path::class.java)
     }
 
-    @Test fun `snapshot save carries the ref and destination verbatim, never --with-image`() {
-        val fullPath = "/home/u/.cache/rightsize/checkpoints/rz-abc-1/snap_0123456789abcdef0123456789abcdef"
+    @Test fun `snapshot save names the group dir and member, never --with-image`() {
+        val groupDir = "/home/u/.cache/rightsize/checkpoints/rz-abc-1"
         val dest = Path.of("/home/u/archives/rz-abc-1.tar.zst")
-        val cmd = MsbCommands.snapshotExport(fullPath, dest)
-        assertEquals(listOf("snapshot", "save", fullPath, dest.toString()), cmd)
+        val cmd = MsbCommands.snapshotExport(groupDir, "snap_0123456789abcdef0123456789abcdef", dest)
+        assertEquals(listOf("snapshot", "save", groupDir, "--checkpoint", "snap_0123456789abcdef0123456789abcdef",
+            dest.toString()), cmd)
         assertFalse("--with-image" in cmd, "export must never bundle the OCI image")
     }
 
-    @Test fun `snapshot load always carries --dest, never msb's own default snapshots store`() {
+    @Test fun `snapshot load names the group, passes --file and always carries --dest`() {
         val archive = Path.of("/home/u/archives/rz-abc-1.tar.zst")
         val destDir = Path.of("/home/u/.cache/rightsize/checkpoints")
-        assertEquals(listOf("snapshot", "load", archive.toString(), "--dest", destDir.toString()),
-            MsbCommands.snapshotImport(archive, destDir))
+        val cmd = MsbCommands.snapshotImport(archive, "rz-ckpt-import-0123456789ab", destDir)
+        assertEquals(listOf("snapshot", "load", "rz-ckpt-import-0123456789ab", "--file", archive.toString(),
+            "--dest", destDir.toString()), cmd)
+        assertFalse("--maximum-disk-bytes" in cmd)
+        assertFalse("--compatibility" in cmd)
     }
 
     @Test fun `copyTo and copyFrom`() {

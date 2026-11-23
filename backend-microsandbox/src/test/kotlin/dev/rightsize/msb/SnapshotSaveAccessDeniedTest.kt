@@ -112,7 +112,7 @@ class SnapshotSaveAccessDeniedTest {
             """
             |#!/bin/sh
             |if [ "${d}1" = "snapshot" ] && [ "${d}2" = "save" ]; then
-            |  dest="${d}4"
+            |  dest="${d}6"
             |  dir=${d}(dirname "${d}dest")
             |  base=${d}(basename "${d}dest")
             $stageStep|  echo "$stderrLine" 1>&2
@@ -124,6 +124,10 @@ class SnapshotSaveAccessDeniedTest {
         script.toFile().setExecutable(true)
         return script
     }
+
+    /** A member path in the shape msb 0.8 hands out: `<checkpoints>/<group>/snap_<id>`. */
+    private fun memberRef(dir: Path): String =
+        dir.resolve("rz-ckpt-fccd7568").resolve("snap_0123456789abcdef0123456789abcdef").toString()
 
     @Test fun `exportCheckpoint surfaces an unrelated save failure unchanged and salvages nothing`() {
         assumeFalse(Platform.current()?.isWindows == true, "POSIX-only fake binary; see doc comment")
@@ -137,7 +141,7 @@ class SnapshotSaveAccessDeniedTest {
             windowsHost = true,
         )
 
-        val e = assertThrows(IllegalStateException::class.java) { backend.exportCheckpoint("rz-ckpt-fccd7568", dest) }
+        val e = assertThrows(IllegalStateException::class.java) { backend.exportCheckpoint(memberRef(dir), dest) }
 
         assertTrue(e.message!!.contains("error: snapshot not found: rz-ckpt-fccd7568"),
             "the original msb error must surface intact: ${e.message}")
@@ -154,7 +158,7 @@ class SnapshotSaveAccessDeniedTest {
             windowsHost = true,
         )
 
-        backend.exportCheckpoint("rz-ckpt-fccd7568", dest)
+        backend.exportCheckpoint(memberRef(dir), dest)
 
         assertEquals("zstd archive payload", Files.readString(dest),
             "the archive msb had already finished writing must end up at the destination")
@@ -169,7 +173,7 @@ class SnapshotSaveAccessDeniedTest {
             windowsHost = false,
         )
 
-        val e = assertThrows(IllegalStateException::class.java) { backend.exportCheckpoint("rz-ckpt-fccd7568", dest) }
+        val e = assertThrows(IllegalStateException::class.java) { backend.exportCheckpoint(memberRef(dir), dest) }
 
         assertTrue(e.message!!.contains("(os error 5)"), "the original msb error must surface: ${e.message}")
         assertFalse(Files.exists(dest), "an errno 5 on a POSIX host is a different bug and must not be masked")

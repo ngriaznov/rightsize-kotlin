@@ -43,7 +43,7 @@ Both backends support checkpoint/restore today, via different mechanisms:
 | `Checkpoint.ref` shape | `rightsize/checkpoint:<12-hex>` (an image tag) | an absolute path under `<cache-dir>/checkpoints/`, one directory level deeper than the dest-dir/name this library asks for (see below) |
 
 microsandbox's `msb snapshot create` requires the sandbox stopped, so `checkpoint()` there runs
-`msb stop` → `msb snapshot create --from-sandbox <sandbox> <name> --dest-dir <cache-dir>/checkpoints`
+`msb stop` → `msb snapshot create --from-sandbox <sandbox> <group> --dest-dir <cache-dir>/checkpoints`
 → `msb rm <sandbox>` → `msb restore <ref> --name <freshName>` — a FRESHLY GENERATED sandbox name
 (`rz-<runId>-<n>`, the exact same generator/counter an ordinary boot already uses, not a second
 naming scheme), never the original sandbox's own name. Ports/memory limit carry over unchanged,
@@ -112,18 +112,16 @@ are unaffected.
 
 **`ref` is not what this library asks msb to write to.** `--dest-dir` only tells msb where to
 root the artifact — under the rightsize cache directory instead of its own default
-`~/.microsandbox/snapshots/` — and `<name>` only ever shows up in msb's own index (as
-`<sandbox>:<name>` in `snapshot list`) and in `snapshot inspect` output. The actual artifact
-lands at `<dest-dir>/<sandbox>/snap_<32-hex digest>`, a path msb decides on its own — NOT at
-`<dest-dir>/<name>`. `checkpoint()` therefore captures the real artifact path from `snapshot
-create`'s own stdout (msb prints the snapshot ID, then the absolute artifact path, as its last
-line on success) and uses THAT as `Checkpoint.ref`, never the dest-dir/name hint it asked for.
-The snapshot still shows up in `msb snapshot list` — msb keeps a global index regardless of where
-the artifact physically lives — so `Checkpoint.remove` cleans both the index entry and the
-on-disk artifact. Unlike earlier msb releases, a BARE name (or a `group:member` spec) does not
-reliably resolve for `snapshot rm`/`snapshot inspect` as of 0.7.1 — the artifact's own path is
-the one address that reliably works for everything, which is exactly what every ref this library
-mints or captures now is.
+`~/.microsandbox/snapshots/` — and the positional is the name of a new msb snapshot *group*
+(`rz-ckpt-<name>`), which msb creates fresh and refuses to reuse while its directory exists. msb
+names the member inside the group itself, so the artifact lands at
+`<dest-dir>/<group>/snap_<32-hex digest>` — NOT at `<dest-dir>/<name>`. `checkpoint()` therefore
+captures the real artifact path from `snapshot create`'s own stdout (msb prints the snapshot ID,
+then the absolute artifact path, as its last line on success) and uses THAT member path as
+`Checkpoint.ref`, never the dest-dir/name hint it asked for. msb 0.8 addresses a group, never a
+member path, so later calls split the ref: the group directory is its parent, the member its
+basename. `Checkpoint.remove` removes the group, and `hasCheckpoint` is a filesystem check for
+`snapshot.json` inside the member directory.
 
 A checkpoint of a `withTmpfsRoot()` container is refused up front: `checkpoint()` throws
 `TmpfsRootCheckpointException` before `msb stop` even runs, since a tmpfs root lives in guest
@@ -440,27 +438,22 @@ rather not go through the API at all), just no longer the only way to clean one 
 # docker
 docker rmi rightsize/checkpoint:<12-hex-or-name>
 
-# microsandbox — the full artifact path, not just the snapshot name
-msb snapshot rm <cache-dir>/checkpoints/<source-sandbox>/snap_<hex-digest> -f
+# microsandbox — the group directory (the parent of Checkpoint.ref)
+msb snapshot rm <cache-dir>/checkpoints/<group> --all
 ```
 
-`msb snapshot rm` (as of msb 0.7.1) resolves reliably only against the snapshot's own artifact
-path — a bare name or `group:member` spec does not resolve — so pass `Checkpoint.ref` itself,
-`-f` included to skip msb's own confirmation prompt. This is exactly what
-`Checkpoint.remove`/`removeCheckpoint` do internally, plus a best-effort delete of the artifact
-directory if msb's own removal doesn't already take it with it.
-
-**Known limitation: removing the head of several checkpoints from the same source sandbox.** msb
-refuses to remove the NEWEST (head) snapshot created from a given source sandbox while an OLDER
-sibling from the same source still exists (`invalid config: cannot remove current head
-snap_...; first select another snapshot with 'msb snapshot head src:<snapshot>'`) — removing a
-non-head member, or a group's only member, works normally. `Checkpoint.remove`/`removeCheckpoint`
-are best-effort and never inspect msb's exit code, so this refusal is silently absorbed: the
-call returns normally and the snapshot is simply left in place, neither retried nor worked around
-with automatic head rotation. If you checkpoint the same source sandbox by name repeatedly and
-need reliable removal, either remove older siblings first (oldest to newest) or run `msb snapshot
-head src:<snapshot>` by hand to pick a different head before removing the one you actually want
-gone.
+msb 0.8 addresses a snapshot *group*, so `msb snapshot rm` takes the group directory — the parent
+of `Checkpoint.ref` — never the member path (`<group>/snap_<hex-digest>`) itself. `--all` removes
+the whole group, `group.json` included, which frees the group name for the next `checkpoint()` of
+the same name; `--checkpoint snap_<hex-digest> -f` removes one member but leaves the empty group
+directory behind, and msb then refuses a new group of that name. `Checkpoint.remove`/
+`removeCheckpoint` list the group first: when the checkpoint is its only `snap_*` member they run
+`--all`; when the group holds other members (for instance one an earlier release made) they run
+`--checkpoint <member> -f` for just this one, so a checkpoint you did not name is never lost.
+Both are best-effort and never inspect msb's exit code, followed by a best-effort delete of the
+leftover directory if msb's own removal doesn't already take it with it. A group that is already
+gone counts as removed. msb 0.8 no longer refuses to remove a group's current head, so there is
+no head-rotation step to do by hand.
 
 ## Moving checkpoints between machines
 
@@ -529,19 +522,23 @@ The ref a checkpoint restores by is not always the archived one:
 
 | | docker | microsandbox |
 |---|---|---|
-| Import mechanism | `docker load -i <archive>` | `msb snapshot load <archive> --dest <cache-dir>/checkpoints` |
-| Effective ref after import | The original tag, unchanged (`Loaded image: <tag>`) | The LOADED ARTIFACT's own absolute path — the original snapshot name is never preserved |
+| Import mechanism | `docker load -i <archive>` | `msb snapshot load rz-ckpt-import-<12-hex> --file <archive> --dest <cache-dir>/checkpoints` |
+| Effective ref after import | The original tag, unchanged (`Loaded image: <tag>`) | `<cache-dir>/checkpoints/rz-ckpt-import-<12-hex>/snap_<hex>` — the original snapshot name is never preserved |
 
 An imported msb checkpoint therefore shows up in `Checkpoint.find`/`list` with an absolute
 `<cache-dir>/checkpoints/<msb-group>/snap_<hex>` path — the same `<cache-dir>/checkpoints`
-directory a locally created checkpoint's `--dest-dir` writes under (see above), just with msb's
-own choice of group/snapshot naming nested beneath it, since `--dest` is always passed rather
-than left to default to msb's own `~/.microsandbox/snapshots/` store. `snapshot load` prints that
-full path as the LAST line of its stdout on an ordinary success; `fromCheckpoint`, `snapshot rm`,
-and `snapshot inspect` all take it verbatim. Importing an archive whose content already exists on
-the destination is itself a success, not an error — the artifact is already there. That outcome's
-own stdout shape on msb 0.7.1 isn't independently confirmed, so ref parsing tries stdout first and
-falls back to stderr (the shape verified against msb 0.6.8) before giving up.
+directory a locally created checkpoint's `--dest-dir` writes under (see above), since `--dest` is
+always passed rather than left to default to msb's own `~/.microsandbox/snapshots/` store. Every
+import loads into a fresh group named `rz-ckpt-import-` plus 12 random hex characters; msb keeps
+the member's own `snap_<hex>` name and reports it on stdout as `Added: <id>` (or `Reused: <id>`
+when that content is already present in the group, which is a success with exit 0, not an
+error). The ref is built from that line and `snapshot.json` must exist inside it, otherwise
+`importFrom` fails with an error that carries msb's output. Import needs a destination filesystem
+msb can swap directories on atomically; where it can't, msb fails with `atomic snapshot import is
+unavailable`.
+
+Checkpoints and archives made by earlier rightsize releases (msb 0.7.x) are not supported on msb
+0.8.1: take them again.
 
 ### Archive size expectations
 

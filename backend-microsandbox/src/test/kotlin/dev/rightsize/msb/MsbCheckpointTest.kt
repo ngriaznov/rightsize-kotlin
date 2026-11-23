@@ -581,33 +581,6 @@ class MsbCheckpointTest {
         assertDoesNotThrow { backend.removeCheckpoint("rz-ckpt-0123456789ab") }
     }
 
-    @Test fun `removeCheckpoint never throws when msb refuses to remove a head snapshot`(
-        @TempDir tmp: Path,
-    ) {
-        // msb 0.7.1: removing the NEWEST (head) snapshot of a source sandbox while an older
-        // sibling still exists is refused ("invalid config: cannot remove current head ...;
-        // first select another snapshot with 'msb snapshot head src:<snapshot>'"). removeCheckpoint
-        // never inspects the exit code (best-effort, same contract as removeByName) — this pins
-        // that the refusal is neither retried nor worked around with automatic head rotation, it
-        // simply leaves the snapshot in place without throwing.
-        assumeFalse(Platform.current()?.isWindows == true, "POSIX-only fake binary; see doc comment")
-        val callLog = Files.createTempFile("rz-headrefusal-calllog-", "")
-        val script = Files.createTempFile("rz-fake-msb-headrefusal", "").also {
-            Files.writeString(
-                it,
-                "#!/bin/sh\necho \"\$*\" >> \"$callLog\"\n" +
-                    "echo \"invalid config: cannot remove current head snap_0123456789abcdef0123456789abcdef; " +
-                    "first select another snapshot with 'msb snapshot head src:name'\" 1>&2\nexit 1\n",
-            )
-            it.toFile().setExecutable(true)
-        }
-        val backend = MsbCliBackend(script)
-        val artifact = tmp.resolve("snap_0123456789abcdef0123456789abcdef")
-
-        assertDoesNotThrow { backend.removeCheckpoint(artifact.toString()) }
-        assertEquals(listOf("snapshot rm $artifact -f"), Files.readAllLines(callLog).filter { it.isNotBlank() })
-    }
-
     @Test fun `createCheckpoint throws TmpfsRootCheckpointException before touching msb when the spec uses a tmpfs root`() {
         assumeFalse(Platform.current()?.isWindows == true, "POSIX-only fake binary; see doc comment")
         val callLog = Files.createTempFile("rz-tmpfs-guard-calllog-", "")
@@ -822,78 +795,123 @@ class MsbCheckpointTest {
         assertTrue(e.message!!.contains("rz-ckpt-other"), "message must name the ref: ${e.message}")
     }
 
-    // As of msb 0.7.1, a path ref is no longer a pure filesystem check: `--dest-dir` snapshots
-    // are tracked in msb's own index just like any other, and msb resolves `snapshot inspect`
-    // reliably only against the artifact's own path — every ref this backend mints already IS
-    // that path, so hasCheckpoint now calls msb for a path ref exactly like it always has for a
-    // bare one (see MsbCliBackend.hasCheckpoint's doc).
+    @Test fun `hasCheckpoint treats msb 0_8 io-error no-such-file as a miss for a bare name`() {
+        assertTrue(isCheckpointMiss("error: io error: No such file or directory (os error 2)"))
+        assertTrue(isCheckpointMiss("error: snapshot not found: rz-ckpt-x"))
+        assertTrue(isCheckpointMiss("error: io error: The system cannot find the file specified. (os error 2)"),
+            "Windows localizes the OS text between `io error` and the errno")
+        assertFalse(isCheckpointMiss("error: io error: Permission denied (os error 13)"))
+        assumeFalse(Platform.current()?.isWindows == true, "POSIX-only fake binary; see doc comment")
+        val script = Files.createTempFile("rz-fake-msb-hascp-enoent", "").also {
+            Files.writeString(it, "#!/bin/sh\necho \"error: io error: No such file or directory (os error 2)\" 1>&2\nexit 1\n")
+            it.toFile().setExecutable(true)
+        }
+        assertFalse(MsbCliBackend(script).hasCheckpoint("rz-ckpt-nope"))
+    }
 
-    @Test fun `hasCheckpoint for a path ref calls msb snapshot inspect with the full path, not a filesystem check`(
+    // msb 0.8's `snapshot inspect` takes a group, so a member path is refused even for a live
+    // checkpoint. An absolute ref is therefore answered from the filesystem, with no msb call.
+
+    @Test fun `hasCheckpoint for a path ref is true for a live member dir and never calls msb`(
         @TempDir tmp: Path,
     ) {
         assumeFalse(Platform.current()?.isWindows == true, "POSIX-only fake binary; see doc comment")
         val callLog = Files.createTempFile("rz-hascp-path-calllog-", "")
-        val artifact = tmp.resolve("checkpoints").resolve("rz-ckpt-test").resolve("snap_0123456789abcdef0123456789abcdef")
         val script = Files.createTempFile("rz-fake-msb-hascp-path", "").also {
-            Files.writeString(
-                it,
-                """
-                |#!/bin/sh
-                |echo "${'$'}*" >> "$callLog"
-                |if [ "${'$'}1" = "snapshot" ] && [ "${'$'}2" = "inspect" ] && [ "${'$'}3" = "$artifact" ]; then
-                |  exit 0
-                |fi
-                |echo "error: snapshot not found: ${'$'}3" 1>&2
-                |exit 1
-                |""".trimMargin(),
-            )
+            Files.writeString(it, "#!/bin/sh\necho \"${'$'}*\" >> \"$callLog\"\necho boom 1>&2\nexit 1\n")
             it.toFile().setExecutable(true)
         }
-        val backend = MsbCliBackend(script)
-
-        // No filesystem artifact exists at all — proving the answer comes from msb, not a
-        // Files.exists/isDirectory check (the pre-0.7.1 shortcut this test replaces).
-        assertFalse(Files.exists(artifact))
-        assertTrue(backend.hasCheckpoint(artifact.toString()),
-            "hasCheckpoint must call msb snapshot inspect with the full artifact path")
-        assertEquals(listOf("snapshot inspect $artifact"), Files.readAllLines(callLog).filter { it.isNotBlank() })
-    }
-
-    @Test fun `hasCheckpoint for a path ref is false when msb snapshot inspect reports a miss`(
-        @TempDir tmp: Path,
-    ) {
-        assumeFalse(Platform.current()?.isWindows == true, "POSIX-only fake binary; see doc comment")
-        val artifact = tmp.resolve("checkpoints").resolve("rz-ckpt-test").resolve("snap_missing00000000000000000000")
-        val script = Files.createTempFile("rz-fake-msb-hascp-path-miss", "").also {
-            Files.writeString(it, "#!/bin/sh\necho \"error: snapshot not found: \$3\" 1>&2\nexit 1\n")
-            it.toFile().setExecutable(true)
-        }
-        val backend = MsbCliBackend(script)
-        // Even a real, existing artifact directory on disk must not short-circuit the answer.
+        val artifact = tmp.resolve("checkpoints").resolve("rz-ckpt-test").resolve("snap_0123456789abcdef0123456789abcdef")
         Files.createDirectories(artifact)
         Files.writeString(artifact.resolve("snapshot.json"), "{}")
-        assertFalse(backend.hasCheckpoint(artifact.toString()))
+
+        assertTrue(MsbCliBackend(script).hasCheckpoint(artifact.toString()))
+        assertEquals(emptyList<String>(), Files.readAllLines(callLog).filter { it.isNotBlank() },
+            "an absolute ref is a filesystem check; msb must not be spawned")
     }
 
-    @Test fun `removeCheckpoint for a path ref runs snapshot rm with the full path and -f, and clears a leftover artifact dir`(
+    @Test fun `hasCheckpoint for a path ref is false for a missing member dir or one without snapshot json`(
+        @TempDir tmp: Path,
+    ) {
+        val backend = MsbCliBackend(Path.of("/nonexistent/msb"))
+        val missing = tmp.resolve("rz-ckpt-test").resolve("snap_missing00000000000000000000")
+        assertFalse(backend.hasCheckpoint(missing.toString()))
+        Files.createDirectories(missing)
+        assertFalse(backend.hasCheckpoint(missing.toString()), "a member dir without snapshot.json is not a checkpoint")
+    }
+
+    /** Fake msb that records each argv to [callLog] and exits 0 without touching the disk. */
+    private fun recordingFakeMsb(callLog: Path, exitCode: Int = 0): Path =
+        Files.createTempFile("rz-fake-msb-rm", "").also {
+            Files.writeString(it, "#!/bin/sh\necho \"${'$'}*\" >> \"$callLog\"\nexit $exitCode\n")
+            it.toFile().setExecutable(true)
+        }
+
+    private fun member(group: Path, id: String): Path {
+        val dir = group.resolve("snap_$id")
+        Files.createDirectories(dir)
+        Files.writeString(dir.resolve("snapshot.json"), "{}")
+        return dir
+    }
+
+    @Test fun `removeCheckpoint of the only member runs snapshot rm --all on the group dir`(
         @TempDir tmp: Path,
     ) {
         assumeFalse(Platform.current()?.isWindows == true, "POSIX-only fake binary; see doc comment")
         val callLog = Files.createTempFile("rz-rm-calllog-", "")
-        val script = Files.createTempFile("rz-fake-msb-rm", "").also {
-            Files.writeString(it, "#!/bin/sh\necho \"${'$'}*\" >> \"$callLog\"\nexit 0\n")
-            it.toFile().setExecutable(true)
-        }
-        val backend = MsbCliBackend(script)
-        val artifact = tmp.resolve("snap_0123456789abcdef0123456789abcdef")
-        Files.createDirectories(artifact)
-        Files.writeString(artifact.resolve("snapshot.json"), "{}")
+        val group = tmp.resolve("rz-ckpt-one")
+        val artifact = member(group, "0123456789abcdef0123456789abcdef")
+        Files.writeString(group.resolve("group.json"), "{}")
 
-        backend.removeCheckpoint(artifact.toString())
+        MsbCliBackend(recordingFakeMsb(callLog)).removeCheckpoint(artifact.toString())
 
-        assertEquals(listOf("snapshot rm $artifact -f"), Files.readAllLines(callLog).filter { it.isNotBlank() },
-            "msb snapshot rm must be called with the ref's full path and -f, never reduced to a basename")
-        assertFalse(Files.exists(artifact), "a leftover artifact dir (index lost it) must be best-effort deleted")
+        assertEquals(listOf("snapshot rm $group --all"), Files.readAllLines(callLog).filter { it.isNotBlank() },
+            "a single-member group must be removed whole, group.json included")
+    }
+
+    @Test fun `removeCheckpoint with a sibling member runs snapshot rm --checkpoint member -f and keeps the sibling`(
+        @TempDir tmp: Path,
+    ) {
+        assumeFalse(Platform.current()?.isWindows == true, "POSIX-only fake binary; see doc comment")
+        val callLog = Files.createTempFile("rz-rm-calllog-", "")
+        val group = tmp.resolve("some-sandbox")
+        val artifact = member(group, "0123456789abcdef0123456789abcdef")
+        val sibling = member(group, "fedcba9876543210fedcba9876543210")
+
+        // msb exits 1 (stands in for any failure), so the manual fallback runs: member only.
+        MsbCliBackend(recordingFakeMsb(callLog, exitCode = 1)).removeCheckpoint(artifact.toString())
+
+        assertEquals(
+            listOf("snapshot rm $group --checkpoint snap_0123456789abcdef0123456789abcdef -f"),
+            Files.readAllLines(callLog).filter { it.isNotBlank() })
+        assertFalse(Files.exists(artifact), "the named member's leftover dir is cleared by hand")
+        assertTrue(Files.exists(sibling.resolve("snapshot.json")), "a member the caller did not name must survive")
+    }
+
+    @Test fun `removeCheckpoint falls back to deleting the whole group dir when msb fails on a rz-ckpt single-member group`(
+        @TempDir tmp: Path,
+    ) {
+        assumeFalse(Platform.current()?.isWindows == true, "POSIX-only fake binary; see doc comment")
+        val callLog = Files.createTempFile("rz-rm-calllog-", "")
+        val group = tmp.resolve("rz-ckpt-fallback")
+        val artifact = member(group, "0123456789abcdef0123456789abcdef")
+        Files.writeString(group.resolve("group.json"), "{}")
+
+        MsbCliBackend(recordingFakeMsb(callLog, exitCode = 1)).removeCheckpoint(artifact.toString())
+
+        assertFalse(Files.exists(group), "the whole leftover group dir must go, group.json included")
+    }
+
+    @Test fun `removeCheckpoint of a missing group counts as gone and calls no msb`(
+        @TempDir tmp: Path,
+    ) {
+        assumeFalse(Platform.current()?.isWindows == true, "POSIX-only fake binary; see doc comment")
+        val callLog = Files.createTempFile("rz-rm-calllog-", "")
+        val artifact = tmp.resolve("rz-ckpt-gone").resolve("snap_0123456789abcdef0123456789abcdef")
+
+        assertDoesNotThrow { MsbCliBackend(recordingFakeMsb(callLog)).removeCheckpoint(artifact.toString()) }
+
+        assertEquals(emptyList<String>(), Files.readAllLines(callLog).filter { it.isNotBlank() })
     }
 
     @Test fun `removeCheckpoint never recursively deletes a path ref that is not a checkpoint artifact dir`(
@@ -901,14 +919,10 @@ class MsbCheckpointTest {
     ) {
         assumeFalse(Platform.current()?.isWindows == true, "POSIX-only fake binary; see doc comment")
         val callLog = Files.createTempFile("rz-rm-guard-calllog-", "")
-        val script = Files.createTempFile("rz-fake-msb-rm-guard", "").also {
-            Files.writeString(it, "#!/bin/sh\necho \"${'$'}*\" >> \"$callLog\"\nexit 0\n")
-            it.toFile().setExecutable(true)
-        }
-        val backend = MsbCliBackend(script)
+        val backend = MsbCliBackend(recordingFakeMsb(callLog, exitCode = 1))
 
         // No snapshot.json at all: not a checkpoint artifact dir, whatever its basename.
-        val noSnapshotJson = tmp.resolve("rz-ckpt-arbitrary")
+        val noSnapshotJson = tmp.resolve("rz-ckpt-group").resolve("snap_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         Files.createDirectories(noSnapshotJson)
         Files.writeString(noSnapshotJson.resolve("some-other-file"), "not a checkpoint")
         backend.removeCheckpoint(noSnapshotJson.toString())
@@ -916,8 +930,8 @@ class MsbCheckpointTest {
         assertTrue(Files.exists(noSnapshotJson.resolve("some-other-file")), "its contents must be untouched")
 
         // snapshot.json present but the basename doesn't carry a recognized checkpoint-artifact
-        // shape (neither the pre-0.7.1 rz-ckpt- prefix nor the msb-0.7.1 snap_ prefix): still
-        // not this backend's artifact shape.
+        // shape (neither the pre-0.7.1 rz-ckpt- prefix nor the snap_ prefix), in a group that
+        // does not look like one this library made: still not this backend's artifact shape.
         val wrongBasename = tmp.resolve("not-a-checkpoint-dir")
         Files.createDirectories(wrongBasename)
         Files.writeString(wrongBasename.resolve("snapshot.json"), "{}")
@@ -927,21 +941,18 @@ class MsbCheckpointTest {
         assertTrue(Files.exists(wrongBasename.resolve("payload")), "its contents must be untouched")
     }
 
-    @Test fun `removeCheckpoint clears a leftover artifact dir with the msb-0-7-1 snap_ basename shape`(
+    @Test fun `removeCheckpoint never deletes a single-member group dir that is not named rz-ckpt`(
         @TempDir tmp: Path,
     ) {
         assumeFalse(Platform.current()?.isWindows == true, "POSIX-only fake binary; see doc comment")
-        val script = Files.createTempFile("rz-fake-msb-rm-snapshape", "").also {
-            Files.writeString(it, "#!/bin/sh\nexit 0\n")
-            it.toFile().setExecutable(true)
-        }
-        val backend = MsbCliBackend(script)
-        val artifact = tmp.resolve("some-sandbox").resolve("snap_abcdefabcdefabcdefabcdefabcdefab")
-        Files.createDirectories(artifact)
-        Files.writeString(artifact.resolve("snapshot.json"), "{}")
+        val group = tmp.resolve("some-sandbox")   // an earlier release's group, named after a sandbox
+        val artifact = member(group, "abcdefabcdefabcdefabcdefabcdefab")
+        Files.writeString(group.resolve("group.json"), "{}")
 
-        backend.removeCheckpoint(artifact.toString())
+        MsbCliBackend(recordingFakeMsb(Files.createTempFile("rz-rm-calllog-", ""), exitCode = 1))
+            .removeCheckpoint(artifact.toString())
 
-        assertFalse(Files.exists(artifact), "a leftover snap_<hex> artifact dir must be best-effort deleted")
+        assertFalse(Files.exists(artifact), "the member dir itself is cleared")
+        assertTrue(Files.exists(group.resolve("group.json")), "a group this library did not name stays")
     }
 }

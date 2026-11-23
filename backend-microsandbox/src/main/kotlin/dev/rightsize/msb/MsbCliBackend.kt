@@ -10,6 +10,7 @@ import java.io.InputStream
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedDeque
 import java.util.concurrent.CopyOnWriteArrayList
@@ -763,8 +764,8 @@ class MsbCliBackend private constructor(
     /**
      * Revives a restored sandbox's workload once it reaches Running: confirmed empirically
      * against the real msb 0.7.1 binary, `msb restore` brings the sandbox up with only `agentd`
-     * inside — the captured command never re-runs on its own, `msb start` on the same sandbox
-     * boots equally idle, and `msb run` has no snapshot option at 0.7.1 — so this backend has to
+     * inside — the captured command never re-runs on its own and `msb start` on the same sandbox
+     * boots equally idle — so this backend has to
      * start the workload itself, exactly once, right here, or every restored container silently
      * breaks the checkpoint contract (workload running, ports served, wait strategies
      * satisfiable, logs flowing).
@@ -1064,15 +1065,15 @@ class MsbCliBackend private constructor(
      * absolute path (see `GenericContainer.mintCheckpointRef` — the msb backend mints hint paths
      * under the checkpoint cache dir). A path hint's parent directory is created up front and
      * passed to `snapshot create` as `--dest-dir`, with the path's basename as the snapshot
-     * NAME — but as of msb 0.7.1, `--from-sandbox` writes a DISK-scope snapshot's artifact at
-     * `<dest-dir>/<source-sandbox>/snap_<32-hex digest>`, a path msb decides on its own, NOT at
-     * `<dest-dir>/<name>` (verified empirically against the real 0.7.1 binary) — [name] only
-     * ever shows up in msb's own index and in `snapshot inspect` output. This method therefore
-     * CAPTURES the real artifact path from `snapshot create`'s own stdout — msb prints the
-     * snapshot ID, then the absolute artifact path as its LAST stdout line on success — via
+     * GROUP name (msb 0.8 creates a new group of that name and refuses one that already exists)
+     * — but msb names the member inside it itself, so the artifact lands at
+     * `<dest-dir>/<group>/snap_<32-hex digest>`, not at `<dest-dir>/<name>`. This method
+     * therefore CAPTURES the real artifact path from `snapshot create`'s own stdout — msb prints
+     * the snapshot ID, then the absolute artifact path as its LAST stdout line on success — via
      * [parseSnapshotCreateArtifactPath], and that captured path, not [ref], is what flows into
      * `restore`'s positional argument, what this method returns, and what a caller must use for
-     * every later `hasCheckpoint`/`removeCheckpoint` call against this checkpoint. Parsing is
+     * every later `hasCheckpoint`/`removeCheckpoint` call against this checkpoint (its parent
+     * and basename are the group and member those calls hand to msb). Parsing is
      * defensive: the last non-blank line must parse as an absolute path, or this throws quoting
      * the raw output (see the failure list above).
      *
@@ -1096,16 +1097,16 @@ class MsbCliBackend private constructor(
         stop(handle)
         val refPath = Path.of(ref)
         val destDir = if (refPath.isAbsolute) refPath.parent else null
-        val snapshotName = if (refPath.isAbsolute) refPath.fileName.toString() else ref
+        val snapshotGroup = if (refPath.isAbsolute) refPath.fileName.toString() else ref
         destDir?.let { Files.createDirectories(it) }
-        val snap = invoke(MsbCommands.snapshotCreate(oldName, snapshotName, destDir), SNAPSHOT_TIMEOUT_SEC)
+        val snap = invoke(MsbCommands.snapshotCreate(oldName, snapshotGroup, destDir), SNAPSHOT_TIMEOUT_SEC)
         if (snap.exitCode != 0) {
-            error("msb snapshot create --from-sandbox $oldName $snapshotName failed (exit ${snap.exitCode}): " +
+            error("msb snapshot create --from-sandbox $oldName $snapshotGroup failed (exit ${snap.exitCode}): " +
                 "${snap.stderr.trim().ifEmpty { snap.stdout.trim() }} — sandbox $oldName is left " +
                 "stopped; resume it by hand with `msb start $oldName`.")
         }
         val effectiveRef = parseSnapshotCreateArtifactPath(snap.stdout)
-            ?: error("msb snapshot create --from-sandbox $oldName $snapshotName succeeded but its " +
+            ?: error("msb snapshot create --from-sandbox $oldName $snapshotGroup succeeded but its " +
                 "output did not end with an absolute artifact path: '${snap.stdout.trim()}' — sandbox " +
                 "$oldName is left stopped; resume it by hand with `msb start $oldName`.")
         // Persisted against the EFFECTIVE ref (not the input hint) — the exact ref a later
@@ -1344,33 +1345,55 @@ class MsbCliBackend private constructor(
     }
 
     /**
-     * Best-effort `msb snapshot rm <ref> -f` — "not found" is success, same contract as
-     * [removeByName]. Snapshot artifacts are never auto-pruned (see docs/checkpoints.md); this
-     * exists so tests can keep shared CI state clean.
+     * Best-effort snapshot removal — "not found" is success, same contract as [removeByName].
+     * Snapshot artifacts are never auto-pruned (see docs/checkpoints.md); this exists so tests
+     * can keep shared CI state clean.
      *
-     * [ref] flows through VERBATIM — never reduced to a basename. msb 0.7.1 resolves `snapshot
-     * rm` reliably only against the snapshot's own artifact path; a bare name does not resolve
-     * (verified empirically against the real binary — see [MsbCommands.snapshotRemove]'s doc),
-     * so passing a basename here (this method's pre-0.7.1 behavior) would silently no-op against
-     * the real snapshot store. This also covers msb's own refusal to remove the NEWEST (head)
-     * snapshot of a source sandbox while an older sibling still exists — this method never
-     * inspects the exit code (best-effort, same as every other call here), so that refusal is
-     * neither retried nor worked around with automatic head rotation; it simply leaves the
-     * snapshot in place, same as any other removal failure. See docs/checkpoints.md's Cleanup
-     * section.
+     * msb 0.8 addresses a snapshot GROUP, never a member path, so [ref] (the member path
+     * [createCheckpoint] or [importCheckpoint] returned) is split: the group directory is its
+     * parent, the member its basename. The group directory is listed first. If this member is
+     * its only `snap_*` entry, the whole group goes with `snapshot rm <groupDir> --all` — that
+     * also removes `group.json`, which `--checkpoint <member> -f` would leave behind, and a
+     * leftover group would make the next `snapshot create` of the same name fail with
+     * `snapshot already exists`. If the group holds other members (a group shared with
+     * checkpoints this call did not name, such as one made by an earlier release) only this one
+     * is removed, with `snapshot rm <groupDir> --checkpoint <member> -f`. A missing group means
+     * the checkpoint is already gone and no msb call is made. A bare (non-absolute) [ref] names
+     * no group directory this library minted and is left alone.
      *
-     * If [refPath] is still there afterward as a leftover directory (the index lost track of it
-     * independently, or msb's own removal didn't take the directory with it), it's removed by
-     * hand, best-effort — same as the rm call itself, but only after confirming [refPath] is
-     * actually a checkpoint artifact ([isCheckpointArtifactDir]'s shape) rather than an
-     * arbitrary directory some caller-controlled [ref] happens to point at — [ref] is never
-     * validated upstream of this method, and `deleteRecursively()` on an unchecked path is a
-     * data-loss trap.
+     * The exit code is never inspected, so any msb failure (a member a running sandbox still
+     * reads, say) leaves the artifact in place for the manual cleanup below, same as every other
+     * best-effort call here. msb 0.8 no longer refuses to remove a group's head, so there is no
+     * head-rotation case left to handle.
+     *
+     * If the artifact is still there afterward as a leftover directory (msb's own removal didn't
+     * take it with it), it is removed by hand, best-effort: the whole group directory when this
+     * member was its only one and the directory looks like a group this library made
+     * ([isCheckpointGroupDir]), else just the member directory — and only after confirming it is
+     * actually a checkpoint artifact ([isCheckpointArtifactDir]'s shape) rather than an arbitrary
+     * directory some caller-controlled [ref] happens to point at — [ref] is never validated
+     * upstream of this method, and `deleteRecursively()` on an unchecked path is a data-loss trap.
      */
     override fun removeCheckpoint(ref: String) {
-        runCatching { invoke(MsbCommands.snapshotRemove(ref), STOP_TIMEOUT_SEC) }
         val refPath = Path.of(ref)
-        if (refPath.isAbsolute && isCheckpointArtifactDir(refPath)) {
+        if (!refPath.isAbsolute) return
+        val groupDir = refPath.parent ?: return
+        val member = refPath.fileName?.toString() ?: return
+        if (!Files.isDirectory(groupDir)) return   // group missing: already gone
+        val others = runCatching {
+            Files.list(groupDir).use { entries ->
+                entries.map { it.fileName.toString() }
+                    .filter { it.startsWith("snap_") && it != member }
+                    .toList()
+            }
+        }.getOrNull() ?: return   // cannot list: leave it alone rather than guess
+        val onlyMember = others.isEmpty()
+        val argv = if (onlyMember) MsbCommands.snapshotRemoveGroup(groupDir.toString())
+        else MsbCommands.snapshotRemoveMember(groupDir.toString(), member)
+        runCatching { invoke(argv, STOP_TIMEOUT_SEC) }
+        if (onlyMember && isCheckpointGroupDir(groupDir)) {
+            runCatching { groupDir.toFile().deleteRecursively() }
+        } else if (isCheckpointArtifactDir(refPath)) {
             runCatching { refPath.toFile().deleteRecursively() }
         }
     }
@@ -1380,7 +1403,7 @@ class MsbCliBackend private constructor(
      * itself may have written: a directory, containing `snapshot.json`, whose basename starts
      * with `rz-ckpt-` (the shape a path ref's ARTIFACT had before msb 0.7.1's `--from-sandbox`
      * relocated it — still checked for a leftover from an artifact this library minted under an
-     * earlier msb pin) or with `snap_` (the artifact basename msb 0.7.1 itself mints — see
+     * earlier msb pin) or with `snap_` (the member basename msb itself mints — see
      * [MsbCliBackend.createCheckpoint]'s stdout-parsing doc). Guards [removeCheckpoint]'s
      * `deleteRecursively()` against recursively wiping an arbitrary populated directory a
      * caller-supplied [ref] happens to name; requiring `snapshot.json` alongside the basename
@@ -1393,28 +1416,50 @@ class MsbCliBackend private constructor(
             (path.fileName?.toString()?.let { it.startsWith("rz-ckpt-") || it.startsWith("snap_") } == true)
 
     /**
-     * `msb snapshot inspect <ref>`, which exits 0 when the snapshot exists. A non-zero exit is
-     * only "genuinely gone" — and thus only resolves to `false` — when stderr carries msb's own
-     * miss framing (see [isCheckpointMiss]); msb has no separate structured error to distinguish
-     * that from any other inspect failure (a corrupted state database, a permission failure, a
-     * transient hiccup), so per the SPI contract those must never fold into `false` — they throw
-     * instead, carrying stderr (falling back to stdout when empty), the same
-     * substring-classifier discipline [isImageCacheCorruption]/[isMsbStateDbError] already use.
-     * Unlike [removeCheckpoint]'s best-effort `runCatching`, a probe failure here is never
-     * swallowed: [Checkpoint.find]'s stale-entry cleanup calls this to decide whether to delete a
-     * registry entry, and folding a probe failure into `false` would let it permanently orphan a
-     * live checkpoint.
+     * True if [path] looks like a snapshot group directory this library created: its basename
+     * starts with `rz-ckpt-` (the group names [createCheckpoint] and [importCheckpoint] pick),
+     * it holds a `group.json`, and it holds nothing but `group.json`, `group-source.json` and
+     * `snap_*` members. A group made
+     * by another tool or an earlier release (named after a sandbox) fails the name test, so
+     * [removeCheckpoint]'s manual fallback never recursively deletes it.
+     */
+    private fun isCheckpointGroupDir(path: Path): Boolean =
+        Files.isDirectory(path) &&
+            path.fileName?.toString()?.startsWith("rz-ckpt-") == true &&
+            Files.exists(path.resolve("group.json")) &&
+            runCatching {
+                Files.list(path).use { entries ->
+                    entries.allMatch {
+                        val n = it.fileName.toString()
+                        n == "group.json" || n == "group-source.json" || n.startsWith("snap_")
+                    }
+                }
+            }.getOrDefault(false)
+
+    /**
+     * Whether the checkpoint at [ref] exists. An absolute [ref] — the only shape this library
+     * mints, a member path `<checkpoints>/<group>/snap_<id>` — is answered by the filesystem: the
+     * directory exists and holds `snapshot.json`. msb 0.8's `snapshot inspect` takes a group, so
+     * handing it a member path fails with `snapshot not found` for a live checkpoint; no msb call
+     * is made.
      *
-     * Every [ref] shape reaches msb the same way now, verbatim — no filesystem shortcut for a
-     * path ref. Before msb 0.7.1, a path ref's artifact sat exactly at [ref] and a plain
-     * filesystem check sufficed without spawning msb at all; as of 0.7.1, a `--dest-dir` (path
-     * hint) snapshot is tracked in msb's OWN index just like any other (see
-     * [MsbCommands.snapshotCreate]'s doc), so an inspect call is both correct and — per msb 0.7.1
-     * resolving `inspect` reliably only against the artifact's own path (see
-     * [MsbCommands.snapshotInspect]'s doc) — necessary: every ref this backend mints already IS
-     * that path.
+     * A bare-name [ref] still goes to `msb snapshot inspect <ref>`, which exits 0 when it
+     * exists. A non-zero exit is only "genuinely gone" — and thus only resolves to `false` — when
+     * stderr carries msb's own miss framing (see [isCheckpointMiss]); msb has no separate
+     * structured error to distinguish that from any other inspect failure (a corrupted state
+     * database, a permission failure, a transient hiccup), so per the SPI contract those must
+     * never fold into `false` — they throw instead, carrying stderr (falling back to stdout when
+     * empty), the same substring-classifier discipline [isImageCacheCorruption]/
+     * [isMsbStateDbError] already use. Unlike [removeCheckpoint]'s best-effort `runCatching`, a
+     * probe failure here is never swallowed: [Checkpoint.find]'s stale-entry cleanup calls this
+     * to decide whether to delete a registry entry, and folding a probe failure into `false`
+     * would let it permanently orphan a live checkpoint.
      */
     override fun hasCheckpoint(ref: String): Boolean {
+        val refPath = Path.of(ref)
+        if (refPath.isAbsolute) {
+            return Files.isDirectory(refPath) && Files.exists(refPath.resolve("snapshot.json"))
+        }
         val r = invoke(MsbCommands.snapshotInspect(ref), STOP_TIMEOUT_SEC)
         if (r.exitCode == 0) return true
         if (isCheckpointMiss(r.stderr)) return false
@@ -1424,8 +1469,10 @@ class MsbCliBackend private constructor(
 
     /**
      * Backs `Checkpoint.exportTo` (see docs/checkpoints.md's "Moving checkpoints between
-     * machines" section): `msb snapshot save <ref> <dest>` writes [ref]'s `.tar.zst` artifact
-     * to [dest], byte-for-byte what [importCheckpoint]'s `snapshot load` reads back.
+     * machines" section): `msb snapshot save <groupDir> --checkpoint <member> <dest>` writes the
+     * member's `.tar.zst` archive to [dest] — [ref] is the member path, split into its parent
+     * (the group, which is what msb addresses) and basename — byte-for-byte what
+     * [importCheckpoint]'s `snapshot load` reads back.
      *
      * On Windows, a failure carrying the access-denied errno is finished by hand instead of
      * surfaced: msb 0.6.7/0.6.8 writes the whole archive to a staging file next to [dest] and
@@ -1441,79 +1488,59 @@ class MsbCliBackend private constructor(
      * reaching it.
      */
     override fun exportCheckpoint(ref: String, dest: Path) {
-        val r = invoke(MsbCommands.snapshotExport(ref, dest), SNAPSHOT_EXPORT_TIMEOUT_SEC)
+        val refPath = Path.of(ref)
+        val groupDir = refPath.parent
+        val member = refPath.fileName?.toString()
+        require(refPath.isAbsolute && groupDir != null && member != null) {
+            "cannot export checkpoint '$ref': msb 0.8 needs the member path (<group dir>/snap_<id>) this library minted"
+        }
+        val r = invoke(MsbCommands.snapshotExport(groupDir.toString(), member, dest), SNAPSHOT_EXPORT_TIMEOUT_SEC)
         if (r.exitCode == 0) return
         if (windowsHost && isSnapshotSaveAccessDenied(r.stderr) && salvageStagedArchive(dest)) return
-        error("msb snapshot save $ref $dest failed (exit ${r.exitCode}): " +
-            "${r.stderr.trim().ifEmpty { r.stdout.trim() }}")
+        error("msb snapshot save $groupDir --checkpoint $member $dest failed (exit ${r.exitCode}): ${r.stderr.trim()}")
     }
 
     /**
-     * Backs `Checkpoint.importFrom`: `msb snapshot load <src> --dest <checkpoints-dir>` unpacks
-     * [src] into THIS library's own checkpoints directory — `CacheDir.resolve().resolve
-     * ("checkpoints")`, the very directory [MsbCommands.snapshotCreate]'s own `--dest-dir` writes
-     * under (minted by `GenericContainer.mintCheckpointRef`) — rather than msb's own default
+     * Backs `Checkpoint.importFrom`: `msb snapshot load <group> --file <src> --dest
+     * <checkpoints-dir>` unpacks [src] into THIS library's own checkpoints directory —
+     * `CacheDir.resolve().resolve("checkpoints")`, the very directory
+     * [MsbCommands.snapshotCreate]'s own `--dest-dir` writes under (minted by
+     * `GenericContainer.mintCheckpointRef`) — rather than msb's own default
      * `~/.microsandbox/snapshots/` store a bare `snapshot load` would otherwise target, so an
-     * imported artifact and a locally created one now live under the same rightsize-owned tree.
+     * imported artifact and a locally created one live under the same rightsize-owned tree.
      * [checkpointsDir] is created up front (mirroring [createCheckpoint]'s own `--dest-dir`
      * handling) in case this is the first checkpoint operation on this machine.
      *
      * [ref] (the archive's originally recorded ref, possibly from a wholly different machine) is
      * NOT what msb restores from and plays no part in the result — [ref] itself is unused beyond
      * being part of this method's signature (the SPI contract every backend shares; docker's own
-     * [ref] IS its effective ref, unlike this one). On an ORDINARY success, msb 0.7.1 nests the
-     * unpacked artifact under a fresh group/snapshot directory of its own choosing beneath
-     * [checkpointsDir], discarding the original snapshot name entirely, and prints that full
-     * absolute path as the LAST line of stdout (a `group msb-<hex>: head snap_<digest> (...)`
-     * line, then a digest line, then the artifact path — verified empirically against the real
-     * binary). [parseSnapshotLoadArtifactPath] parses that last line the same
-     * defensively-absolute-path way [parseSnapshotCreateArtifactPath] already does for `snapshot
-     * create` — a bad parse here would otherwise silently mint a ref nothing could ever
-     * restore/remove/inspect again, so this throws quoting the raw output instead.
-     *
-     * Importing an archive whose content already exists fails with msb's own `error: snapshot
-     * already exists: <path>` on stderr — for a content-addressed archive that IS success (the
-     * artifact is already present), so [isSnapshotAlreadyExists] treats it as one rather than a
-     * genuine failure; any OTHER non-zero exit surfaces with stderr. What this ALREADY-EXISTS
-     * outcome prints on msb 0.7.1 is NOT independently verified — the only real evidence in this
-     * codebase of msb's already-exists shape is [isSnapshotAlreadyExists]'s own doc comment,
-     * observed verbatim against msb 0.6.8, where the artifact path lived ONLY on stderr (stdout
-     * was not captured/verified that way at all). It is plausible 0.7.1 still prints the full
-     * `group ...`/digest/path summary to stdout before failing, matching the ordinary-success
-     * shape — but it is equally plausible the command short-circuits on the duplicate-content
-     * check before ever printing that summary, leaving stdout empty or partial. Rather than bet
-     * on either shape, this tries [r.stdout] first (via [parseSnapshotLoadArtifactPath], the
-     * bare-artifact-path-as-a-whole-line shape) and, only on the already-exists outcome, falls
-     * back to [r.stderr] via [parseSnapshotAlreadyExistsArtifactPath] — a DIFFERENT parse shape,
-     * because msb's already-exists stderr is a sentence with the path as its trailing token
-     * (`error: snapshot already exists: <path>`, per [isSnapshotAlreadyExists]'s doc), not a
-     * bare path line on its own. This mirrors the pre-0.7.1 code's own `val output = if
-     * (alreadyExists) r.stderr else r.stdout` branch, just tried as a fallback rather than
-     * assumed outright, since which stream carries the path on 0.7.1's already-exists outcome has
-     * not been confirmed against the real binary. Only if NEITHER stream parses does this throw.
-     * The pre-0.7.1 approach of cross-referencing `msb snapshot list --format json` by a parsed
-     * digest-dir basename no longer applies — every ref this library mints today, from both
-     * [createCheckpoint] and this method, is already the absolute path msb itself reported, so
-     * there is nothing left to look up.
+     * [ref] IS its effective ref, unlike this one). The group is a fresh name per import,
+     * `rz-ckpt-import-` plus 12 random lowercase hex characters, so a repeat import never
+     * collides with an earlier one. msb keeps the member's own name (`snap_<id>`) and reports it
+     * on stdout as `Added: <id>` (new) or `Reused: <id>` (content already present, exit 0) — no
+     * path is printed. [parseSnapshotLoadMemberId] reads that line (stdout first, then stderr),
+     * the ref is `<checkpointsDir>/<group>/<id>`, and `snapshot.json` must exist inside it before
+     * the ref is returned: a bad parse would otherwise silently mint a ref nothing could ever
+     * restore/remove again. With no such line, this throws carrying msb's output.
      */
     override fun importCheckpoint(src: Path, ref: String): String {
         val checkpointsDir = CacheDir.resolve().resolve("checkpoints")
         Files.createDirectories(checkpointsDir)
-        val r = invoke(MsbCommands.snapshotImport(src, checkpointsDir), SNAPSHOT_IMPORT_TIMEOUT_SEC)
-        val alreadyExists = r.exitCode != 0 && isSnapshotAlreadyExists(r.stderr)
-        if (r.exitCode != 0 && !alreadyExists) {
-            error("msb snapshot load $src --dest $checkpointsDir failed (exit ${r.exitCode}): " +
-                "${r.stderr.trim().ifEmpty { r.stdout.trim() }}")
+        val group = "rz-ckpt-import-" + UUID.randomUUID().toString().replace("-", "").take(12)
+        val r = invoke(MsbCommands.snapshotImport(src, group, checkpointsDir), SNAPSHOT_IMPORT_TIMEOUT_SEC)
+        val cmd = "msb snapshot load $group --file $src --dest $checkpointsDir"
+        if (r.exitCode != 0) {
+            error("$cmd failed (exit ${r.exitCode}): ${r.stderr.trim()}")
         }
-        val fromStdout = parseSnapshotLoadArtifactPath(r.stdout)
-        val fromStderr = if (alreadyExists) parseSnapshotAlreadyExistsArtifactPath(r.stderr) else null
-        return fromStdout ?: fromStderr
-            ?: error("msb snapshot load $src --dest $checkpointsDir " +
-                (if (alreadyExists)
-                    "reported the snapshot already exists, but neither its stdout nor its stderr ended " +
-                        "with an absolute artifact path: stdout='${r.stdout.trim()}' stderr='${r.stderr.trim()}'"
-                 else
-                    "succeeded, but its stdout did not end with an absolute artifact path: '${r.stdout.trim()}'"))
+        val id = parseSnapshotLoadMemberId(r.stdout) ?: parseSnapshotLoadMemberId(r.stderr)
+            ?: error("$cmd did not report an imported checkpoint (no 'Added:' or 'Reused:' line) — output:\n" +
+                "${r.stdout}${r.stderr}")
+        val imported = checkpointsDir.resolve(group).resolve(id)
+        if (!Files.exists(imported.resolve("snapshot.json"))) {
+            error("$cmd reported $id, but ${imported.resolve("snapshot.json")} does not exist — output:\n" +
+                "${r.stdout}${r.stderr}")
+        }
+        return imported.toString()
     }
 
     /**
@@ -2563,22 +2590,27 @@ internal fun parseNulSeparatedCmdline(output: String): List<String> =
     output.split('\u0000').map { it.trim('\n', '\r') }.filter { it.isNotEmpty() }
 
 /**
- * True if [stderr] (from `msb snapshot inspect <ref>`) names msb's own "no such snapshot"
- * miss, as opposed to some other inspect failure. Observed verbatim against the real msb
- * 0.6.8 binary:
+ * True if [stderr] (from `msb snapshot inspect <ref>` on a bare-name ref) names msb's own "no
+ * such snapshot" miss, as opposed to some other inspect failure. Two shapes, both observed
+ * against real msb binaries:
  *
  * ```
  * error: snapshot not found: rz-ckpt-0123456789ab at /path/to/.microsandbox/snapshots/rz-ckpt-0123456789ab
+ * error: io error: No such file or directory (os error 2)
  * ```
  *
- * Deliberately a substring match on the stable `error: snapshot not found:` framing rather
- * than the full line — the trailing path is host-specific and msb has no structured/typed
- * error for this, the same substring-classifier discipline [isImageCacheCorruption] and
- * [isMsbStateDbError] already use. Any non-zero exit whose stderr does NOT match this is a
- * genuine probe failure, not a miss, and [MsbCliBackend.hasCheckpoint] throws instead of
- * returning `false` for it.
+ * The first is msb 0.6.8's wording; msb 0.8.1 reports a missing group or member as the second
+ * (verified against the 0.8.1 binary). On Windows the middle of that io error is the localized
+ * OS text (`The system cannot find the file specified. (os error 2)`), so the match is `io error`
+ * plus the `(os error 2)` errno, case-insensitively, the same rule the Node and Rust backends
+ * use. Both are substring matches on the stable framing rather than the full line — the
+ * trailing path is host-specific and msb has no structured/typed error for this, the same
+ * substring-classifier discipline [isImageCacheCorruption] and [isMsbStateDbError] already use. Any non-zero exit whose stderr does NOT match is a genuine
+ * probe failure, not a miss, and [MsbCliBackend.hasCheckpoint] throws instead of returning
+ * `false` for it.
  */
-internal fun isCheckpointMiss(stderr: String): Boolean = "error: snapshot not found:" in stderr
+internal fun isCheckpointMiss(stderr: String): Boolean =
+    stderr.lowercase().let { "snapshot not found" in it || ("io error" in it && "(os error 2)" in it) }
 
 /**
  * True if [stderr] (from `msb snapshot save`) carries Windows' access-denied errno — which on
@@ -2635,72 +2667,40 @@ internal fun salvageStagedArchive(dest: Path): Boolean {
 }
 
 /**
- * True if [stderr] (from `msb snapshot load`) names msb's own "already exists" outcome, as
- * opposed to some other import failure. Observed verbatim against the real msb 0.6.8 binary:
- *
- * ```
- * error: snapshot already exists: /path/to/.microsandbox/snapshots/sha256-b9c0448ee9d54e33
- * ```
- *
- * For a content-addressed archive this IS success — the artifact is already present on this
- * host, e.g. a re-run of the same import — so [MsbCliBackend.importCheckpoint] treats it as one
- * rather than as a genuine failure; any exit-nonzero output that does NOT match this wording is
- * a real import failure and surfaces with stderr instead.
- */
-internal fun isSnapshotAlreadyExists(stderr: String): Boolean = "snapshot already exists:" in stderr
-
-/**
  * Parses the absolute snapshot artifact path `msb snapshot create` prints as its own LAST
  * stdout line on success (msb 0.7.1: the snapshot ID line, then the artifact path — verified
  * empirically against the real binary). This IS the checkpoint ref [MsbCliBackend.createCheckpoint]
- * returns. Delegates to [parseTrailingAbsolutePathLine] — the shared parsing core this and
- * [parseSnapshotLoadArtifactPath] both use.
+ * returns. Delegates to [parseTrailingAbsolutePathLine].
  */
 internal fun parseSnapshotCreateArtifactPath(output: String): String? = parseTrailingAbsolutePathLine(output)
 
 /**
- * Parses the absolute snapshot artifact path `msb snapshot load` prints as its own LAST stdout
- * line on an ORDINARY success (msb 0.7.1: a `group msb-<hex>: head snap_<digest> (...)` line, a
- * digest line, then the artifact path — verified empirically against the real binary). This IS
- * the checkpoint ref [MsbCliBackend.importCheckpoint] returns — unlike msb's pre-0.7.1 shape (a
- * bare digest-DIR basename, resolved separately via `snapshot list`, now dead code and removed),
- * the whole line is the ref: an absolute path nested under this library's own checkpoints
- * directory (see [MsbCommands.snapshotImport]'s `--dest`), msb's own choice of group/snapshot
- * naming beneath it. [MsbCliBackend.importCheckpoint] also tries this same parse against stdout
- * on the already-exists-as-success outcome FIRST, in case 0.7.1 still prints the same summary
- * there — but falls back to [parseSnapshotAlreadyExistsArtifactPath] against stderr if it
- * doesn't, since that outcome's own stdout shape isn't independently confirmed (see
- * [MsbCliBackend.importCheckpoint]'s doc). Delegates to [parseTrailingAbsolutePathLine] — the
- * shared parsing core this and [parseSnapshotCreateArtifactPath] both use.
+ * Parses the member id from `msb snapshot load`'s own report (msb 0.8.1): one `Added: <id>` line
+ * for a member it wrote, or `Reused: <id>` for one whose content was already in the group, among
+ * other output (the head update goes to stderr). Searches every line of [output] and returns the
+ * first token after the prefix, or `null` when no such line exists or the token is empty or
+ * would escape the group directory (a path separator or `..`). [MsbCliBackend.importCheckpoint]
+ * tries stdout first, then stderr, and turns `null` from both into a typed error quoting the
+ * raw output.
  */
-internal fun parseSnapshotLoadArtifactPath(output: String): String? = parseTrailingAbsolutePathLine(output)
-
-/**
- * Parses the absolute snapshot artifact path from msb's already-exists STDERR sentence (`error:
- * snapshot already exists: <path>` — observed verbatim against the real msb 0.6.8 binary, see
- * [isSnapshotAlreadyExists]'s doc), used by [MsbCliBackend.importCheckpoint] as the fallback ref
- * source when the already-exists outcome's stdout doesn't itself parse via
- * [parseSnapshotLoadArtifactPath]. UNLIKE that function, the path here is not the WHOLE last
- * line — it's a sentence with the path as its trailing whitespace-separated token — so this
- * takes the last non-blank line's final token (the same `substringAfterLast(' ')` shape the
- * pre-0.7.1 `parseImportedDigestDir` used) and requires THAT token, on its own, to parse as an
- * absolute [Path]. Returns `null` — never throws — for blank input, an empty trailing token, or
- * a token that parses but isn't absolute; [MsbCliBackend.importCheckpoint] turns a `null` here
- * (with a `null` stdout parse too) into a typed error quoting both raw streams.
- */
-internal fun parseSnapshotAlreadyExistsArtifactPath(stderr: String): String? {
-    val lastLine = stderr.lines().map { it.trim() }.lastOrNull { it.isNotEmpty() } ?: return null
-    val token = lastLine.substringAfterLast(' ').trim()
-    if (token.isEmpty()) return null
-    val parsed = runCatching { Path.of(token) }.getOrNull() ?: return null
-    return token.takeIf { parsed.isAbsolute }
+internal fun parseSnapshotLoadMemberId(output: String): String? {
+    for (line in output.lines()) {
+        val t = line.trim()
+        val rest = when {
+            t.startsWith("Added: ") -> t.removePrefix("Added: ")
+            t.startsWith("Reused: ") -> t.removePrefix("Reused: ")
+            else -> continue
+        }
+        val id = rest.trim().substringBefore(' ')
+        if (id.isNotEmpty() && '/' !in id && '\\' !in id && id != "..") return id
+    }
+    return null
 }
 
 /**
- * Shared parsing core for [parseSnapshotCreateArtifactPath] and [parseSnapshotLoadArtifactPath]:
- * both `msb snapshot create` and `msb snapshot load` print the resulting artifact's own absolute
- * path as their LAST stdout line on success, with unrelated informational lines (an ID, a group,
- * a digest) ahead of it — msb never pads that final line with anything else, so requiring the
+ * Parsing core for [parseSnapshotCreateArtifactPath]: `msb snapshot create` prints the resulting
+ * artifact's own absolute path as its LAST stdout line on success, with unrelated informational
+ * lines (an ID) ahead of it — msb never pads that final line with anything else, so requiring the
  * WHOLE line (not just its last whitespace-separated token) to parse as an absolute [Path] is
  * exactly right and never wrongly truncates a path containing a space.
  *
@@ -2708,8 +2708,8 @@ internal fun parseSnapshotAlreadyExistsArtifactPath(stderr: String): String? {
  * could ever restore/remove/inspect again: trims [output], takes the last non-blank line, and
  * requires that whole line to parse as an ABSOLUTE [Path]. Returns `null` — never throws — for
  * blank output, a line [Path.of] itself rejects, or a line that parses but isn't absolute (a
- * relative path, or any other unexpected shape); both callers turn a `null` into a typed error
- * quoting the raw output, via the same `?: error(...)` shape.
+ * relative path, or any other unexpected shape); the caller turns a `null` into a typed error
+ * quoting the raw output.
  */
 private fun parseTrailingAbsolutePathLine(output: String): String? {
     val lastLine = output.lines().map { it.trim() }.lastOrNull { it.isNotEmpty() } ?: return null

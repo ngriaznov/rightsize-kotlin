@@ -56,10 +56,9 @@ object MsbCommands {
     /**
      * `msb restore <ref> --name <name> [-m <mem>M] [-p host:guest]... [--volume host:guest:opts]...`
      * — msb 0.7's dedicated restore command, the sole survivor of what `run --from-snapshot` used
-     * to do. msb 0.7 removed `--from-snapshot` from `run` outright: clap now rejects it as an
-     * unrecognized flag, and `msb run` itself bails "snapshot sources require `msb restore SNAPSHOT
-     * --name NAME`" for a snapshot-shaped source (confirmed against msb's own source at tag v0.7.1
-     * — crates/cli/lib/commands/{run,restore}.rs). [MsbCliBackend] routes here instead of [run]
+     * to do. msb 0.7 removed `--from-snapshot` from `run`; msb 0.8.1 accepts it there again, but
+     * this backend keeps using `restore` — the command that takes the per-restore flags below
+     * (msb's own source, crates/cli/lib/commands/{run,restore}.rs). [MsbCliBackend] routes here instead of [run]
      * whenever [spec]'s `checkpointRef` is set — both [MsbCliBackend.createCheckpoint]'s own
      * re-boot and a `GenericContainer.fromCheckpoint(cp).start()` call reach this the same way.
      *
@@ -217,63 +216,66 @@ object MsbCommands {
     fun rmForce(name: String) = listOf("rm", "-f", name)
     fun ls() = listOf("ls", "--format", "json")
     /**
-     * `msb snapshot create --from-sandbox <sandbox> <name>` requires [sandbox] STOPPED and
-     * writes a DISK-scope snapshot artifact — under [destDir] when given (a path-ref checkpoint
-     * — see [MsbCliBackend.createCheckpoint]), or msb's own default `~/.microsandbox/snapshots/`
-     * store otherwise. [name] is NOT the artifact's on-disk location as of msb 0.7.1: it only
-     * appears in msb's index (as `<sandbox>:<name>` in `snapshot list`) and in `snapshot
-     * inspect` output — the real artifact path is `<dest-dir-or-default>/<sandbox>/snap_<32-hex
-     * digest>`, msb's own choice, which `snapshot create` prints as the LAST line of its stdout
-     * on success (see [MsbCliBackend.createCheckpoint]'s stdout-parsing). [JvmOverloads] keeps
-     * the original 2-arg `(sandbox, name)` JVM descriptor alongside the 3-arg one — [destDir]
-     * getting a default value would otherwise drop that descriptor from a published artifact and
-     * break any compiled-against-the-old-jar caller.
+     * `msb snapshot create --from-sandbox <sandbox> <group>` requires [sandbox] STOPPED and
+     * writes a DISK-scope snapshot into a NEW snapshot group called [group] — under [destDir]
+     * when given (a path-ref checkpoint — see [MsbCliBackend.createCheckpoint]), or msb's own
+     * default `~/.microsandbox/snapshots/` store otherwise. msb names the member itself
+     * (`snap_<32-hex digest>`), so the real artifact path is
+     * `<dest-dir-or-default>/<group>/snap_<id>`, which `snapshot create` prints as the LAST line
+     * of its stdout on success (see [MsbCliBackend.createCheckpoint]'s stdout-parsing). msb 0.8
+     * refuses a [group] whose directory already exists (`snapshot already exists: <group>`),
+     * including one left empty by `snapshot rm --checkpoint` — see [snapshotRemoveGroup].
+     * [JvmOverloads] keeps the original 2-arg `(sandbox, group)` JVM descriptor alongside the
+     * 3-arg one — [destDir] getting a default value would otherwise drop that descriptor from a
+     * published artifact and break any compiled-against-the-old-jar caller.
      */
     @JvmOverloads
-    fun snapshotCreate(sandbox: String, name: String, destDir: Path? = null) =
-        listOf("snapshot", "create", "--from-sandbox", sandbox, name) +
+    fun snapshotCreate(sandbox: String, group: String, destDir: Path? = null) =
+        listOf("snapshot", "create", "--from-sandbox", sandbox, group) +
             (destDir?.let { listOf("--dest-dir", it.toString()) } ?: emptyList())
-    /** `msb snapshot rm <ref> -f` — msb 0.7.1 resolves `snapshot rm` reliably only against the
-     * snapshot's own artifact path (a bare name or a `group:member` spec does not resolve —
-     * verified empirically against the real binary), so [ref] is passed through verbatim, never
-     * reduced to a basename; `-f` skips msb's own removal confirmation. Removing the NEWEST
-     * (head) snapshot of a source sandbox while an OLDER sibling still exists is refused by msb
-     * itself (`invalid config: cannot remove current head ...; first select another snapshot
-     * with 'msb snapshot head src:<snapshot>'`) — [MsbCliBackend.removeCheckpoint] propagates
-     * that refusal as-is rather than attempting any automatic head rotation; see
-     * docs/checkpoints.md's Cleanup section. */
-    fun snapshotRemove(ref: String) = listOf("snapshot", "rm", ref, "-f")
+    /** `msb snapshot rm <groupDir> --all` — removes a whole snapshot group directory (its
+     * `group.json` included), so the group name can be used again. msb 0.8 only addresses a
+     * group (a member path such as `<group>/snap_<id>` is refused), which is why
+     * [MsbCliBackend.removeCheckpoint] derives [groupDir] as the parent of the stored ref. `-f`
+     * conflicts with `--all` and is never sent. */
+    fun snapshotRemoveGroup(groupDir: String) = listOf("snapshot", "rm", groupDir, "--all")
+    /** `msb snapshot rm <groupDir> --checkpoint <member> -f` — removes one member from a group
+     * that holds other members too; `-f` skips msb's own removal confirmation. Used by
+     * [MsbCliBackend.removeCheckpoint] only when the group has another member, since removing
+     * the last member this way would leave the empty group directory behind. */
+    fun snapshotRemoveMember(groupDir: String, member: String) =
+        listOf("snapshot", "rm", groupDir, "--checkpoint", member, "-f")
     /** `msb snapshot inspect <ref>` — its exit code alone is [MsbCliBackend.hasCheckpoint]'s
-     * signal (0 = exists, non-zero = doesn't); see docs/checkpoints.md. As of msb 0.7.1 this
-     * resolves reliably only against the snapshot's own artifact path (name-based resolution
-     * does not — verified empirically against the real binary), which is exactly the shape every
-     * ref this library mints resolves to, whether minted by [MsbCliBackend.createCheckpoint] or
-     * [MsbCliBackend.importCheckpoint] — both now return an absolute artifact path, never a bare
-     * name. [ref] is passed through unchanged either way. */
+     * signal for a bare-name ref (0 = exists, non-zero = doesn't); see docs/checkpoints.md. msb
+     * 0.8 takes a GROUP here, so an absolute member path is refused — [MsbCliBackend.hasCheckpoint]
+     * answers every absolute ref (the only shape this library mints) with a filesystem check
+     * instead. [ref] is passed through unchanged. */
     fun snapshotInspect(ref: String) = listOf("snapshot", "inspect", ref)
 
     /**
-     * `msb snapshot save <ref> <dest>` — writes a `.tar.zst` artifact archive for [ref] to
-     * [dest]; the artifact half of a portable checkpoint archive (see
-     * [MsbCliBackend.exportCheckpoint], docs/checkpoints.md's "Moving checkpoints between
-     * machines" section). Deliberately never `--with-image`: this library doesn't bundle the OCI
-     * image into the archive, so the destination machine pulls it on the restored container's
-     * first boot instead. `--with-image` itself works as of msb 0.7.1; bundling the
-     * image is a roadmap item, not something this library does yet — see docs/roadmap.md.
+     * `msb snapshot save <groupDir> --checkpoint <member> <dest>` — writes a `.tar.zst` artifact
+     * archive of one group member to [dest]; the artifact half of a portable checkpoint archive
+     * (see [MsbCliBackend.exportCheckpoint], docs/checkpoints.md's "Moving checkpoints between
+     * machines" section). [groupDir] and [member] are the parent and basename of the stored ref.
+     * Deliberately never `--with-image`: this library doesn't bundle the OCI image into the
+     * archive, so the destination machine pulls it on the restored container's first boot
+     * instead. `--with-image` itself works as of msb 0.7.1; bundling the image is a roadmap
+     * item, not something this library does yet — see docs/roadmap.md. `--compatibility` is left
+     * at msb's default (`current`).
      */
-    fun snapshotExport(ref: String, dest: Path) = listOf("snapshot", "save", ref, dest.toString())
+    fun snapshotExport(groupDir: String, member: String, dest: Path) =
+        listOf("snapshot", "save", groupDir, "--checkpoint", member, dest.toString())
 
-    /** `msb snapshot load <archive> --dest <destDir>` — unpacks [archive] into [destDir], this
-     * library's own checkpoints directory (`CacheDir.resolve()/checkpoints` — the same directory
-     * [snapshotCreate]'s own `--dest-dir` writes under; see [MsbCliBackend.importCheckpoint]'s
-     * doc), rather than msb's own default `~/.microsandbox/snapshots/` store [destDir]'s absence
-     * would target — [destDir] is therefore ALWAYS passed, never omitted. msb 0.7.1 nests the
-     * unpacked artifact under a fresh group/snapshot directory of its own choosing beneath
-     * [destDir] and discards the original snapshot name entirely, printing the resulting absolute
-     * artifact path as the LAST line of stdout on success (see
-     * [parseSnapshotLoadArtifactPath]). */
-    fun snapshotImport(archive: Path, destDir: Path) =
-        listOf("snapshot", "load", archive.toString(), "--dest", destDir.toString())
+    /** `msb snapshot load <group> --file <archive> --dest <destDir>` — unpacks [archive] into a
+     * member of the new group [group] under [destDir], this library's own checkpoints directory
+     * (`CacheDir.resolve()/checkpoints` — the same directory [snapshotCreate]'s own `--dest-dir`
+     * writes under; see [MsbCliBackend.importCheckpoint]'s doc), rather than msb's own default
+     * `~/.microsandbox/snapshots/` store [destDir]'s absence would target — [destDir] is
+     * therefore ALWAYS passed, never omitted. msb 0.8 keeps the member's own `snap_<id>` name and
+     * prints `Added: <id>` or `Reused: <id>` on stdout, no longer a path (see
+     * [parseSnapshotLoadMemberId]). */
+    fun snapshotImport(archive: Path, group: String, destDir: Path) =
+        listOf("snapshot", "load", group, "--file", archive.toString(), "--dest", destDir.toString())
 
     /**
      * `msb copy -q <src> <name>:<dst>` — copies a host file or directory into the running
@@ -360,7 +362,5 @@ internal object MsbLsJson {
 
 // `MsbSnapshotListJson` (parsing `msb snapshot list --format json` to confirm a digest-dir
 // basename was genuinely registered) and the `snapshot list` command builder it backed were
-// removed here: msb 0.7.1's `snapshot load` prints the LOADED ARTIFACT's own absolute path as its
-// last stdout line, which [MsbCliBackend.importCheckpoint] now takes as the effective ref
-// directly (see [parseSnapshotLoadArtifactPath]) — there is nothing left to cross-reference a
-// digest-dir basename against.
+// removed: `snapshot load` names the member it wrote on stdout (`Added:`/`Reused:`), which
+// [MsbCliBackend.importCheckpoint] turns into the ref directly (see [parseSnapshotLoadMemberId]).

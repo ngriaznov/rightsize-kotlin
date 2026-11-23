@@ -1,181 +1,106 @@
 package dev.rightsize.msb
 
 import dev.rightsize.core.CacheDir
+import org.junit.jupiter.api.Assumptions.assumeFalse
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.Assertions.*
 import java.nio.file.Files
 import java.nio.file.Path
 
 /**
- * Coverage for spec 10's checkpoint-archive handling (see docs/checkpoints.md's "Moving
- * checkpoints between machines" section): the pure output-parsing helper first, then
- * [MsbCliBackend.importCheckpoint]'s end-to-end effective-ref resolution against a fake `msb`
- * binary — output-path parsing, the always-pass `--dest` flag, already-exists-as-success, a
- * non-already-exists failure surfacing stderr, and an unparseable-stdout failure surfacing a
- * clear error — the same fake-binary style [MsbCheckpointTest] uses for `createCheckpoint`. The
- * effective ref is msb 0.7.1's own LOADED ARTIFACT PATH (an absolute path nested under this
- * library's own checkpoints directory), never the archive's originally recorded ref, and never
- * a bare digest-dir name looked up separately via `snapshot list` (msb 0.7.1 dropped that
- * shape — see [parseSnapshotLoadArtifactPath]'s doc).
+ * Coverage for the checkpoint-archive handling (see docs/checkpoints.md's "Moving checkpoints
+ * between machines" section) on msb 0.8.1's snapshot-group CLI: the pure `Added:`/`Reused:`
+ * parser first, then [MsbCliBackend.exportCheckpoint]'s argv and [MsbCliBackend.importCheckpoint]'s
+ * end-to-end ref resolution against a fake `msb` binary — the fresh group name, `--file` and
+ * `--dest` argv, `Added:` and `Reused:` outcomes, a failure surfacing stderr, and a missing
+ * report line surfacing a clear error — the same fake-binary style [MsbCheckpointTest] uses for
+ * `createCheckpoint`. The effective ref is `<checkpoints dir>/<group>/<id>`, never the archive's
+ * originally recorded ref.
  */
 class MsbCheckpointArchiveTest {
 
-    // --- isSnapshotAlreadyExists: pure ---
+    private val id = "snap_0123456789abcdef0123456789abcdef"
 
-    @Test fun `isSnapshotAlreadyExists matches msb's own already-exists wording`() {
-        assertTrue(isSnapshotAlreadyExists(
-            "error: snapshot already exists: /home/x/.microsandbox/snapshots/sha256-b9c0448ee9d54e33"))
+    // --- parseSnapshotLoadMemberId: pure ---
+
+    @Test fun `parseSnapshotLoadMemberId reads an Added line`() {
+        assertEquals(id, parseSnapshotLoadMemberId("Added: $id\n"))
     }
 
-    @Test fun `isSnapshotAlreadyExists is false for an unrelated failure`() {
-        assertFalse(isSnapshotAlreadyExists("error: database error: state database is corrupt"))
+    @Test fun `parseSnapshotLoadMemberId reads a Reused line`() {
+        assertEquals(id, parseSnapshotLoadMemberId("Reused: $id\n"))
     }
 
-    // --- parseSnapshotLoadArtifactPath: pure, no binary needed ---
-    //
-    // Absolute-path fixtures are built via toAbsolutePath() rather than hand-typed Unix strings,
-    // the same reasoning MsbCheckpointTest's parseSnapshotCreateArtifactPath fixtures use (a
-    // leading-slash string isn't absolute on Windows' Path implementation).
-
-    @Test fun `parseSnapshotLoadArtifactPath reads the last non-blank line when it is an absolute path`() {
-        val absolute = Path.of("msb-1a2b3c4d", "snap_0123456789abcdef0123456789abcdef").toAbsolutePath().normalize()
-        val output = "group msb-1a2b3c4d: head snap_0123456789abcdef0123456789abcdef (Initialized)\n" +
-            "digest: sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd\n$absolute"
-        assertEquals(absolute.toString(), parseSnapshotLoadArtifactPath(output))
+    @Test fun `parseSnapshotLoadMemberId searches every line, not just the last`() {
+        assertEquals(id, parseSnapshotLoadMemberId("warning: something\nAdded: $id\ntrailing note\n"))
     }
 
-    @Test fun `parseSnapshotLoadArtifactPath ignores trailing blank lines`() {
-        val absolute = Path.of("msb-1a2b3c4d", "snap_0123456789abcdef0123456789abcdef").toAbsolutePath().normalize()
-        assertEquals(absolute.toString(), parseSnapshotLoadArtifactPath("$absolute\n\n\n"))
+    @Test fun `parseSnapshotLoadMemberId returns null when there is no Added or Reused line`() {
+        assertNull(parseSnapshotLoadMemberId(""))
+        assertNull(parseSnapshotLoadMemberId("group head updated: $id\n"))
+        assertNull(parseSnapshotLoadMemberId("Added:\n"))
     }
 
-    @Test fun `parseSnapshotLoadArtifactPath returns null for blank output`() {
-        assertNull(parseSnapshotLoadArtifactPath(""))
-        assertNull(parseSnapshotLoadArtifactPath("\n\n"))
+    @Test fun `parseSnapshotLoadMemberId rejects an id that would leave the group directory`() {
+        assertNull(parseSnapshotLoadMemberId("Added: ../escape"))
+        assertNull(parseSnapshotLoadMemberId("Added: a/b"))
+        assertNull(parseSnapshotLoadMemberId("Added: .."))
     }
 
-    // Red-proofs the real CI failure the dossier for this migration flagged: the group summary
-    // line's own trailing token, "(Initialized)", is not an absolute path and must never be
-    // mistaken for the artifact ref.
-    @Test fun `parseSnapshotLoadArtifactPath returns null when the last line is not an absolute path`() {
-        assertNull(parseSnapshotLoadArtifactPath(
-            "group msb-1a2b3c4d: head snap_0123456789abcdef0123456789abcdef (Initialized)"))
-        assertNull(parseSnapshotLoadArtifactPath("not a path at all, just words"))
-    }
+    // --- MsbCliBackend.exportCheckpoint argv ---
 
-    // --- parseSnapshotAlreadyExistsArtifactPath: pure, no binary needed ---
-    //
-    // Unlike parseSnapshotLoadArtifactPath, msb's already-exists stderr is a SENTENCE with the
-    // path as its trailing token, not a bare path line — see isSnapshotAlreadyExists's doc for
-    // the verbatim 0.6.8 wording this mirrors.
+    @Test fun `exportCheckpoint splits the member path into group dir and --checkpoint member`() {
+        assumeFalse(Platform.current()?.isWindows == true, "POSIX-only fake binary; see doc comment")
+        val callLog = Files.createTempFile("rz-export-calllog-", "")
+        val script = Files.createTempFile("rz-fake-msb-export", "").also {
+            Files.writeString(it, "#!/bin/sh\necho \"\$*\" >> \"$callLog\"\nexit 0\n")
+            it.toFile().setExecutable(true)
+        }
+        val groupDir = Files.createTempDirectory("rz-export-checkpoints").resolve("rz-ckpt-mysnapshot")
+        val dest = Files.createTempDirectory("rz-export-dest").resolve("artifact")
 
-    @Test fun `parseSnapshotAlreadyExistsArtifactPath reads the trailing token of msb's already-exists sentence`() {
-        val absolute = Path.of("msb-1a2b3c4d", "snap_0123456789abcdef0123456789abcdef").toAbsolutePath().normalize()
-        assertEquals(absolute.toString(),
-            parseSnapshotAlreadyExistsArtifactPath("error: snapshot already exists: $absolute"))
-    }
+        MsbCliBackend(script).exportCheckpoint(groupDir.resolve(id).toString(), dest)
 
-    @Test fun `parseSnapshotAlreadyExistsArtifactPath returns null for blank input`() {
-        assertNull(parseSnapshotAlreadyExistsArtifactPath(""))
-        assertNull(parseSnapshotAlreadyExistsArtifactPath("\n\n"))
-    }
-
-    @Test fun `parseSnapshotAlreadyExistsArtifactPath returns null when the trailing token is not an absolute path`() {
-        assertNull(parseSnapshotAlreadyExistsArtifactPath("error: snapshot already exists"))
-        assertNull(parseSnapshotAlreadyExistsArtifactPath("error: snapshot already exists: relative/path"))
+        assertEquals(listOf("snapshot save $groupDir --checkpoint $id $dest"),
+            Files.readAllLines(callLog).filter { it.isNotBlank() })
     }
 
     // --- MsbCliBackend.importCheckpoint end-to-end, against a fake msb binary ---
 
     /**
-     * Fake `msb` covering `snapshot load` only — every other subcommand is a no-op success, since
-     * [MsbCliBackend.importCheckpoint] never calls them. On an ORDINARY success it prints a
-     * `group <group>: head snap_<digest> (Initialized)` line, a digest line, and the LOADED
-     * ARTIFACT's absolute path — nested under whatever `--dest` the invocation carried — as the
-     * LAST stdout line (verified empirically against the real msb 0.7.1 binary for this branch
-     * only). `snapshot load` exits non-zero with unrelated stderr and no artifact-path line at
-     * all when [importFailFlag] exists.
-     *
-     * When [alreadyExistsFlag] exists, msb's real already-exists stdout shape on 0.7.1 is NOT
-     * independently verified (see [MsbCliBackend.importCheckpoint]'s doc) — so this fixture can
-     * reproduce EITHER of the two plausible shapes via [alreadyExistsPrintsStdout], rather than
-     * baking in the same single assumption the production code would otherwise be tested
-     * tautologically against: `true` (the default) prints the same stdout summary as the
-     * ordinary-success branch before also failing; `false` prints NOTHING on stdout, only msb's
-     * own `error: snapshot already exists: <path>` sentence on stderr — mirroring the one shape
-     * this codebase actually has verbatim evidence for (msb 0.6.8, see
-     * [isSnapshotAlreadyExists]'s doc, where the artifact path lived on stderr only). Either way
-     * `snapshot load` exits non-zero — [isSnapshotAlreadyExists] is what tells this apart from a
-     * genuine failure. Every invocation's full argv is appended to [callLog], so tests can assert
-     * `--dest` was actually passed.
+     * Fake `msb` covering `snapshot load` only; every other subcommand is a no-op success. Reads
+     * `<group> --file <archive> --dest <dir>` from argv. On success it creates
+     * `<dir>/<group>/<id>/snapshot.json` (unless [writeMember] is false) and prints `Added: <id>`
+     * (`Reused: <id>` when [verb] says so, nothing when [verb] is empty) on stdout; the
+     * head-update line goes to stderr, as on msb 0.8.1. Exits non-zero with unrelated stderr when
+     * [failFlag] exists. Every invocation's argv is appended to [callLog].
      */
-    private fun fakeMsbImport(
-        importFailFlag: Path,
-        alreadyExistsFlag: Path,
-        group: String,
-        digest: String,
-        callLog: Path,
-        alreadyExistsPrintsStdout: Boolean = true,
-    ): Path {
+    private fun fakeMsbImport(failFlag: Path, callLog: Path, verb: String = "Added", writeMember: Boolean = true): Path {
         val script = Files.createTempFile("rz-fake-msb-import", "")
         Files.writeString(
             script,
             """
             |#!/bin/sh
             |echo "${'$'}*" >> "$callLog"
-            |cmd="${'$'}1"; shift
-            |if [ "${'$'}cmd" = "snapshot" ]; then
-            |  sub="${'$'}1"; shift
-            |  case "${'$'}sub" in
-            |    load)
-            |      shift   # drop the archive path positional
-            |      dest=""
-            |      while [ "${'$'}#" -gt 0 ]; do
-            |        case "${'$'}1" in
-            |          --dest) dest="${'$'}2"; shift 2 ;;
-            |          *) shift ;;
-            |        esac
-            |      done
-            |      if [ -f "$importFailFlag" ]; then
-            |        echo "error: something else went wrong" 1>&2
-            |        exit 1
-            |      fi
-            |      artifact="${'$'}dest/$group/snap_$digest"
-            |      if [ -f "$alreadyExistsFlag" ]; then
-            |        if [ "$alreadyExistsPrintsStdout" = "true" ]; then
-            |          echo "group $group: head snap_$digest (Initialized)"
-            |          echo "digest: sha256:$digest"
-            |          echo "${'$'}artifact"
-            |        fi
-            |        echo "error: snapshot already exists: ${'$'}artifact" 1>&2
-            |        exit 1
-            |      fi
-            |      echo "group $group: head snap_$digest (Initialized)"
-            |      echo "digest: sha256:$digest"
-            |      echo "${'$'}artifact"
-            |      exit 0
-            |      ;;
-            |    *) exit 0 ;;
-            |  esac
-            |fi
-            |exit 0
-            |""".trimMargin(),
-        )
-        script.toFile().setExecutable(true)
-        return script
-    }
-
-    /** Fake `msb snapshot load` whose stdout ends with a non-absolute-path line — the shape the
-     * migration's own dossier flagged as the real CI failure ("it extracts the literal
-     * '(Initialized)'"). Exits 0: the failure this drives is a parse failure, not an msb one. */
-    private fun fakeMsbImportGarbageStdout(): Path {
-        val script = Files.createTempFile("rz-fake-msb-import-garbage", "")
-        Files.writeString(
-            script,
-            """
-            |#!/bin/sh
             |if [ "${'$'}1" = "snapshot" ] && [ "${'$'}2" = "load" ]; then
-            |  echo "group msb-1a2b3c4d: head snap_0123456789abcdef0123456789abcdef (Initialized)"
+            |  group="${'$'}3"; shift 3
+            |  dest=""
+            |  while [ "${'$'}#" -gt 0 ]; do
+            |    case "${'$'}1" in
+            |      --dest) dest="${'$'}2"; shift 2 ;;
+            |      *) shift ;;
+            |    esac
+            |  done
+            |  if [ -f "$failFlag" ]; then
+            |    echo "error: something else went wrong" 1>&2
+            |    exit 1
+            |  fi
+            |  if [ "$writeMember" = "true" ]; then
+            |    mkdir -p "${'$'}dest/${'$'}group/$id"
+            |    echo '{}' > "${'$'}dest/${'$'}group/$id/snapshot.json"
+            |  fi
+            |  echo "head: ${'$'}group -> $id" 1>&2
+            |  if [ -n "$verb" ]; then echo "$verb: $id"; fi
             |  exit 0
             |fi
             |exit 0
@@ -185,111 +110,84 @@ class MsbCheckpointArchiveTest {
         return script
     }
 
-    @Test fun `importCheckpoint returns the loaded artifact's absolute path and always passes --dest`() {
-        val group = "msb-1a2b3c4d"
-        val digest = "0123456789abcdef0123456789abcdef"
-        val importFailFlag = Files.createTempFile("rz-importfail-", "").also { Files.deleteIfExists(it) }
-        val alreadyExistsFlag = Files.createTempFile("rz-alreadyexists-", "").also { Files.deleteIfExists(it) }
-        val callLog = Files.createTempFile("rz-import-calllog-", "")
-        val backend = MsbCliBackend(fakeMsbImport(importFailFlag, alreadyExistsFlag, group, digest, callLog))
+    private fun noFlag(): Path = Files.createTempFile("rz-importfail-", "").also { Files.deleteIfExists(it) }
 
+    /** Splits the recorded `snapshot load <group> --file <src> --dest <dir>` line; returns the group. */
+    private fun loadedGroup(callLog: Path, src: Path, checkpointsDir: Path): String {
+        val line = Files.readAllLines(callLog).single { it.isNotBlank() }
+        val m = Regex("^snapshot load (rz-ckpt-import-[0-9a-f]{12}) --file ${Regex.escape(src.toString())} " +
+            "--dest ${Regex.escape(checkpointsDir.toString())}$").find(line)
+        assertNotNull(m, "unexpected snapshot load argv: $line")
+        return m!!.groupValues[1]
+    }
+
+    @Test fun `importCheckpoint loads into a fresh rz-ckpt-import group and returns group-slash-id under the checkpoints dir`() {
+        assumeFalse(Platform.current()?.isWindows == true, "POSIX-only fake binary; see doc comment")
+        val callLog = Files.createTempFile("rz-import-calllog-", "")
+        val backend = MsbCliBackend(fakeMsbImport(noFlag(), callLog))
         val src = Files.createTempFile("rz-archive-", ".tar.zst")
+
         val effectiveRef = backend.importCheckpoint(src, "rz-ckpt-mysnapshot")
 
         val checkpointsDir = CacheDir.resolve().resolve("checkpoints")
-        val expectedRef = checkpointsDir.resolve(group).resolve("snap_$digest").toString()
-        assertEquals(expectedRef, effectiveRef,
-            "the effective ref must be the loaded artifact's absolute path, never the archive's original ref")
-        assertEquals(listOf("snapshot load $src --dest $checkpointsDir"), Files.readAllLines(callLog).filter { it.isNotBlank() },
-            "snapshot load must always carry --dest pointing at this library's own checkpoints dir")
+        val group = loadedGroup(callLog, src, checkpointsDir)
+        assertEquals(checkpointsDir.resolve(group).resolve(id).toString(), effectiveRef,
+            "the ref must be <checkpoints>/<group>/<id>, never the archive's original ref")
     }
 
-    @Test fun `importCheckpoint treats msb's already-exists failure as success when stdout carries the artifact path`() {
-        val group = "msb-1a2b3c4d"
-        val digest = "0123456789abcdef0123456789abcdef"
-        val importFailFlag = Files.createTempFile("rz-importfail-", "").also { Files.deleteIfExists(it) }
-        val alreadyExistsFlag = Files.createTempFile("rz-alreadyexists-", "")   // present => already-exists
+    @Test fun `importCheckpoint accepts a Reused line, which msb prints with exit 0 for content already present`() {
+        assumeFalse(Platform.current()?.isWindows == true, "POSIX-only fake binary; see doc comment")
         val callLog = Files.createTempFile("rz-import-calllog-", "")
-        val backend = MsbCliBackend(fakeMsbImport(
-            importFailFlag, alreadyExistsFlag, group, digest, callLog, alreadyExistsPrintsStdout = true))
-
+        val backend = MsbCliBackend(fakeMsbImport(noFlag(), callLog, verb = "Reused"))
         val src = Files.createTempFile("rz-archive-", ".tar.zst")
+
         val effectiveRef = backend.importCheckpoint(src, "rz-ckpt-mysnapshot")
 
-        val expectedRef = CacheDir.resolve().resolve("checkpoints").resolve(group).resolve("snap_$digest").toString()
-        assertEquals(expectedRef, effectiveRef,
-            "an already-exists outcome must resolve the SAME loaded-artifact path, not be treated as a failure")
+        val checkpointsDir = CacheDir.resolve().resolve("checkpoints")
+        assertEquals(checkpointsDir.resolve(loadedGroup(callLog, src, checkpointsDir)).resolve(id).toString(), effectiveRef)
     }
 
-    // Red-proofs the exact gap the review flagged: msb 0.7.1's already-exists stdout shape is
-    // NOT verified, so this must not silently assume the optimistic shape above. If the
-    // already-exists outcome's stdout carries no artifact-path line at all — the one shape this
-    // codebase has verbatim evidence for (msb 0.6.8, path on stderr only, see
-    // isSnapshotAlreadyExists's doc) — importCheckpoint must still succeed by falling back to
-    // parsing stderr, not throw.
-    @Test fun `importCheckpoint falls back to stderr when the already-exists outcome's stdout carries no artifact path`() {
-        val group = "msb-1a2b3c4d"
-        val digest = "0123456789abcdef0123456789abcdef"
-        val importFailFlag = Files.createTempFile("rz-importfail-", "").also { Files.deleteIfExists(it) }
-        val alreadyExistsFlag = Files.createTempFile("rz-alreadyexists-", "")   // present => already-exists
+    @Test fun `importCheckpoint picks a different group for every import`() {
+        assumeFalse(Platform.current()?.isWindows == true, "POSIX-only fake binary; see doc comment")
         val callLog = Files.createTempFile("rz-import-calllog-", "")
-        val backend = MsbCliBackend(fakeMsbImport(
-            importFailFlag, alreadyExistsFlag, group, digest, callLog, alreadyExistsPrintsStdout = false))
-
+        val backend = MsbCliBackend(fakeMsbImport(noFlag(), callLog))
         val src = Files.createTempFile("rz-archive-", ".tar.zst")
-        val effectiveRef = backend.importCheckpoint(src, "rz-ckpt-mysnapshot")
 
-        val expectedRef = CacheDir.resolve().resolve("checkpoints").resolve(group).resolve("snap_$digest").toString()
-        assertEquals(expectedRef, effectiveRef,
-            "an already-exists outcome with an empty stdout must still resolve via stderr, not throw")
+        val first = backend.importCheckpoint(src, "rz-ckpt-mysnapshot")
+        val second = backend.importCheckpoint(src, "rz-ckpt-mysnapshot")
+
+        assertNotEquals(first, second)
     }
 
-    @Test fun `importCheckpoint throws a clear error when the already-exists outcome's stdout and stderr both lack an artifact path`() {
-        val script = Files.createTempFile("rz-fake-msb-import-unparseable-already-exists", "")
-        Files.writeString(
-            script,
-            """
-            |#!/bin/sh
-            |if [ "${'$'}1" = "snapshot" ] && [ "${'$'}2" = "load" ]; then
-            |  echo "error: snapshot already exists: not an absolute path token" 1>&2
-            |  exit 1
-            |fi
-            |exit 0
-            |""".trimMargin(),
-        )
-        script.toFile().setExecutable(true)
-        val backend = MsbCliBackend(script)
+    @Test fun `importCheckpoint surfaces stderr for a failed load`() {
+        assumeFalse(Platform.current()?.isWindows == true, "POSIX-only fake binary; see doc comment")
+        val failFlag = Files.createTempFile("rz-importfail-", "")   // present => failure
+        val backend = MsbCliBackend(fakeMsbImport(failFlag, Files.createTempFile("rz-import-calllog-", "")))
         val src = Files.createTempFile("rz-archive-", ".tar.zst")
 
-        val e = assertThrows(IllegalStateException::class.java) { backend.importCheckpoint(src, "rz-ckpt-mysnapshot") }
-
-        assertTrue(e.message!!.contains("already exists"), "message must say the outcome was already-exists: ${e.message}")
-        assertTrue(e.message!!.contains("neither its stdout nor its stderr"),
-            "message must say what's wrong, not just fail silently or misresolve: ${e.message}")
-    }
-
-    @Test fun `importCheckpoint surfaces stderr for a non-already-exists failure`() {
-        val group = "msb-1a2b3c4d"
-        val digest = "0123456789abcdef0123456789abcdef"
-        val importFailFlag = Files.createTempFile("rz-importfail-", "")   // present => genuine failure
-        val alreadyExistsFlag = Files.createTempFile("rz-alreadyexists-", "").also { Files.deleteIfExists(it) }
-        val callLog = Files.createTempFile("rz-import-calllog-", "")
-        val backend = MsbCliBackend(fakeMsbImport(importFailFlag, alreadyExistsFlag, group, digest, callLog))
-
-        val src = Files.createTempFile("rz-archive-", ".tar.zst")
         val e = assertThrows(IllegalStateException::class.java) { backend.importCheckpoint(src, "rz-ckpt-mysnapshot") }
 
         assertTrue(e.message!!.contains("something else went wrong"), "message must carry msb's stderr: ${e.message}")
     }
 
-    @Test fun `importCheckpoint throws a clear error when snapshot load's stdout does not end with an absolute path`() {
-        val backend = MsbCliBackend(fakeMsbImportGarbageStdout())
+    @Test fun `importCheckpoint throws a clear error carrying msb's output when no Added or Reused line is printed`() {
+        assumeFalse(Platform.current()?.isWindows == true, "POSIX-only fake binary; see doc comment")
+        val backend = MsbCliBackend(fakeMsbImport(noFlag(), Files.createTempFile("rz-import-calllog-", ""), verb = ""))
         val src = Files.createTempFile("rz-archive-", ".tar.zst")
 
         val e = assertThrows(IllegalStateException::class.java) { backend.importCheckpoint(src, "rz-ckpt-mysnapshot") }
 
-        assertTrue(e.message!!.contains("(Initialized)"), "message must quote the unparsed output: ${e.message}")
-        assertTrue(e.message!!.contains("did not end with an absolute artifact path"),
-            "message must say what's wrong, not just fail silently or misresolve: ${e.message}")
+        assertTrue(e.message!!.contains("no 'Added:' or 'Reused:' line"), "message: ${e.message}")
+        assertTrue(e.message!!.contains("head: rz-ckpt-import-"), "message must quote msb's stderr: ${e.message}")
+    }
+
+    @Test fun `importCheckpoint throws when the reported member has no snapshot json on disk`() {
+        assumeFalse(Platform.current()?.isWindows == true, "POSIX-only fake binary; see doc comment")
+        val backend = MsbCliBackend(fakeMsbImport(noFlag(), Files.createTempFile("rz-import-calllog-", ""), writeMember = false))
+        val src = Files.createTempFile("rz-archive-", ".tar.zst")
+
+        val e = assertThrows(IllegalStateException::class.java) { backend.importCheckpoint(src, "rz-ckpt-mysnapshot") }
+
+        assertTrue(e.message!!.contains("snapshot.json does not exist"), "message: ${e.message}")
     }
 }
